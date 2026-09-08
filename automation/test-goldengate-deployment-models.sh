@@ -6854,7 +6854,7 @@ else
   fail "6: envs/dev/efs.tf references \"pipeline\" -- the module key must be derived from deployment ID alone"
 fi
 
-# Final EFS architecture correction, follow-up hardening (reviewer-found tautology fix): the prior version of this block proved desired_ids == canonical_ids by recomputing "canonical - decommission" a second time in Python and comparing against itself -- it never parsed the REAL goldengate_managed_efs_desired_deployments for-comprehension in envs/dev/efs.tf at all, so an in-memory mutation of that local to a hardcoded {} (while canonical stayed non-empty and decommission stayed empty) satisfied every prior check unchanged. This version structurally parses the actual production for-comprehension text (source local, id/value mapping, exclusion filter) via parse_desired_relationship() below, only THEN treats desired == canonical-minus-decommission as a proven semantic consequence of that parsed text, and proves the fix has real teeth by running the same parser against in-memory-only mutated copies of the text (envs/dev/efs.tf itself is never written to) that reproduce the exact tautology the reviewer found.
+# Final EFS architecture correction, second follow-up hardening (reviewer-found comment/string blindness): the prior structural parser matched RAW HCL text with regex, so a commented-out for-comprehension, a commented-out safety condition sitting beside an active `condition = false`, or a commented-out SG gate sitting beside an active canonical-local gate all still satisfied the assertions -- regex has no notion of "this text is inside a # comment". This version routes every check through strip_hcl_comments() below (a small quote-aware state machine, never a naive regex comment stripper that could corrupt a "#" or "//" appearing inside a quoted string) before any structural match or brace-depth extraction runs, so commented-out HCL can never satisfy an assertion, and proves it with in-memory-only reproductions of exactly the three cases the reviewer found (envs/dev/efs.tf itself is never written to).
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   set +e
   LIVE_INVENTORY_OUT="$(PYTHONDONTWRITEBYTECODE=1 python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev managed-efs-inventory 2>&1)"
@@ -6896,8 +6896,52 @@ check("1: the live managed-efs-inventory output is a JSON list of objects, each 
 canonical_ids = sorted(d["deploymentId"] for d in canonical) if canonical is not None else []
 check("2: the live canonical managed-EFS inventory is non-empty", len(canonical_ids) >= 1)
 
+
+# Quote-aware HCL comment stripper: tracks whether the scan position is inside a double-quoted string so a "#" or "//" inside a string literal (e.g. a URL) is never mistaken for a comment start and never corrupts the string's own quoted content; handles "#" line comments, "//" line comments, and "/* */" block comments -- every structural check and brace-depth extraction below runs against this stripped text, never raw HCL text, so commented-out HCL can never satisfy an assertion (the reviewer-found gap this hardening closes).
+def strip_hcl_comments(text):
+    out = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            if c == "\\" and i + 1 < n:
+                out.append(c)
+                out.append(text[i + 1])
+                i += 2
+                continue
+            out.append(c)
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, n)
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 with open("envs/dev/efs.tf") as f:
-    efs_tf = f.read()
+    efs_tf = strip_hcl_comments(f.read())
 
 
 def extract_brace_block(text, open_brace_index):
@@ -6919,7 +6963,7 @@ def find_named_block(text, header_pattern):
     return extract_brace_block(text, m.start(1))
 
 
-# Parses the REAL goldengate_managed_efs_desired_deployments for-comprehension text and proves, structurally, that it iterates the canonical local while preserving the id/value mapping (never a hardcoded/renamed map) and excludes members of the decommission set by name (never a different or missing predicate); returns (parsed-info, None) on a genuine structural match, or (None, reason) otherwise -- callers must never assume the semantic relationship holds unless this returns non-None, so a mutated/broken local fails closed here.
+# Parses the REAL goldengate_managed_efs_desired_deployments for-comprehension text and proves, structurally, that it iterates the canonical local while preserving the id/value mapping (never a hardcoded/renamed map) and excludes members of the decommission set by name (never a different or missing predicate); returns (parsed-info, None) on a genuine structural match, or (None, reason) otherwise -- callers must never assume the semantic relationship holds unless this returns non-None, so a mutated/broken/commented-out local fails closed here. The caller must always pass comment-stripped text -- this function performs no stripping of its own.
 def parse_desired_relationship(text):
     block = find_named_block(text, r"goldengate_managed_efs_desired_deployments\s*=\s*(\{)")
     if block is None:
@@ -6940,32 +6984,32 @@ def parse_desired_relationship(text):
 
 
 real_parse, real_parse_error = parse_desired_relationship(efs_tf)
-check("3: goldengate_managed_efs_desired_deployments is a real for-comprehension over the canonical local preserving id => v and excluding via !contains(local.goldengate_managed_efs_decommission_ids, id) (%s)" % (real_parse_error or "structurally proven"), real_parse is not None)
+check("3: goldengate_managed_efs_desired_deployments is a real (non-commented-out) for-comprehension over the canonical local preserving id => v and excluding via !contains(local.goldengate_managed_efs_decommission_ids, id) (%s)" % (real_parse_error or "structurally proven"), real_parse is not None)
 
 ids_match = re.search(r'goldengate_managed_efs_decommission_ids\s*=\s*toset\(\[(.*?)\]\)', efs_tf, re.S)
 decommission_ids = sorted(re.findall(r'"([^"]+)"', ids_match.group(1))) if ids_match else None
 check("4: envs/dev/efs.tf declares goldengate_managed_efs_decommission_ids = toset([]) for today's steady state", decommission_ids == [])
 
-# Only asserted as a semantic consequence now that check 3 has structurally proven the real comprehension IS canonical-minus-decommission-by-contains -- never an independently test-derived tautology.
+# Only asserted as a semantic consequence now that check 3 has structurally proven the real (non-commented-out) comprehension IS canonical-minus-decommission-by-contains -- never an independently test-derived tautology.
 desired_ids = sorted(set(canonical_ids) - set(decommission_ids or [])) if (real_parse is not None and canonical is not None and decommission_ids is not None) else []
 check("5: today's desired managed-EFS deployment IDs equal the canonical managed-EFS deployment IDs, since the parsed production comprehension excludes only the (empty) decommission set", bool(canonical_ids) and real_parse is not None and desired_ids == canonical_ids)
 
 sg_match = re.search(r'data "aws_security_group" "goldengate_efs_shared" \{(.*?)\n\}', efs_tf, re.S)
 sg_body = sg_match.group(1) if sg_match else ""
 SG_GATE_TEXT = "count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0"
-check("6: the shared EFS SG data source remains gated by the exact production expression: %s" % SG_GATE_TEXT, SG_GATE_TEXT in sg_body)
+check("6: the shared EFS SG data source remains gated by the exact production expression, active (not commented-out): %s" % SG_GATE_TEXT, SG_GATE_TEXT in sg_body)
 
 conceptual_sg_count = 1 if len(desired_ids) > 0 else 0
 check("7: because today's desired inventory is non-empty, the conceptual shared-SG lookup count is 1 today, not 0", conceptual_sg_count == 1)
 
-# Anchored to an actual `condition = ...` line inside terraform_data.goldengate_managed_efs_decommission_contract's own lifecycle block -- never a bare file-wide text search that a matching phrase in an unrelated comment could satisfy.
+# Anchored to an actual, active (not commented-out) `condition = ...` line inside terraform_data.goldengate_managed_efs_decommission_contract's own lifecycle block -- never a bare file-wide text search that a matching phrase in an unrelated or commented-out line could satisfy.
 contract_block = find_named_block(efs_tf, r'resource\s+"terraform_data"\s+"goldengate_managed_efs_decommission_contract"\s*(\{)')
 decommission_guard_present = bool(contract_block) and re.search(r"condition\s*=\s*length\(local\.goldengate_managed_efs_decommission_ids\)\s*==\s*0", contract_block) is not None
-check("8: the stronger Automated Replication Implementation Removal decommission-safety precondition is an actual condition inside terraform_data.goldengate_managed_efs_decommission_contract's lifecycle block, never a file-wide comment match", decommission_guard_present)
+check("8: the stronger Automated Replication Implementation Removal decommission-safety precondition is an actual, active condition inside terraform_data.goldengate_managed_efs_decommission_contract's lifecycle block, never a file-wide or commented-out match", decommission_guard_present)
 
-# --- Negative/teeth proof: every mutation below is an in-memory string transform of the text already loaded from envs/dev/efs.tf -- the file on disk is never opened for writing and is never mutated. ---
+# --- Negative/teeth proof: every mutation below is an in-memory string transform -- envs/dev/efs.tf itself is never opened for writing and is never mutated. ---
 
-# Teeth A: the exact reviewer-found regression -- hardcode the desired local to {} while canonical stays non-empty and decommission stays empty; this precise mutation previously satisfied every prior check 1-10.
+# Teeth A: the exact prior reviewer-found regression -- hardcode the desired local to {} while canonical stays non-empty and decommission stays empty.
 desired_block_real = real_parse["block"] if real_parse is not None else None
 mutated_empty = efs_tf.replace(desired_block_real, "{}", 1) if desired_block_real else efs_tf
 mutated_empty_parse, _ = parse_desired_relationship(mutated_empty)
@@ -6985,21 +7029,38 @@ mutated_sg_canonical = sg_body.replace(
 )
 check("11 (teeth): mutating the SG count gate to reference the canonical (not desired) local is REJECTED by the exact-gate-text assertion", SG_GATE_TEXT not in mutated_sg_canonical)
 
+# Teeth D (reviewer reproduction 1): the desired local's for-comprehension is commented out entirely -- the raw text below still LOOKS like it contains the expected comprehension to a naive regex, but strip_hcl_comments() must remove both "#" lines before parse_desired_relationship() ever sees them.
+teeth_d_raw = "resource \"dummy\" \"dummy\" {\n  goldengate_managed_efs_desired_deployments = {\n    # for id, v in local.goldengate_managed_efs_deployments : id => v\n    # if !contains(local.goldengate_managed_efs_decommission_ids, id)\n  }\n}\n"
+teeth_d_parse, _ = parse_desired_relationship(strip_hcl_comments(teeth_d_raw))
+check("12 (teeth, reviewer repro 1): a desired local whose for-comprehension is entirely commented out is REJECTED after comment-stripping", teeth_d_parse is None)
+
+# Teeth E (reviewer reproduction 2): an active `condition = false` sits beside the expected safety condition, which is present only as a trailing comment.
+teeth_e_raw = "resource \"terraform_data\" \"goldengate_managed_efs_decommission_contract\" {\n  lifecycle {\n    precondition {\n      condition     = false\n      # condition = length(local.goldengate_managed_efs_decommission_ids) == 0\n      error_message = \"x\"\n    }\n  }\n}\n"
+teeth_e_block = find_named_block(strip_hcl_comments(teeth_e_raw), r'resource\s+"terraform_data"\s+"goldengate_managed_efs_decommission_contract"\s*(\{)')
+teeth_e_guard_present = bool(teeth_e_block) and re.search(r"condition\s*=\s*length\(local\.goldengate_managed_efs_decommission_ids\)\s*==\s*0", teeth_e_block) is not None
+check("13 (teeth, reviewer repro 2): an active condition = false plus the expected safety condition present only in a comment is REJECTED after comment-stripping", not teeth_e_guard_present)
+
+# Teeth F (reviewer reproduction 3): the SG data source's canonical-local gate is active while the expected desired-local gate is present only as a leading comment.
+teeth_f_raw = "data \"aws_security_group\" \"goldengate_efs_shared\" {\n  # count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0\n  count = length(local.goldengate_managed_efs_deployments) > 0 ? 1 : 0\n}\n"
+teeth_f_sg_match = re.search(r'data "aws_security_group" "goldengate_efs_shared" \{(.*?)\n\}', strip_hcl_comments(teeth_f_raw), re.S)
+teeth_f_sg_body = teeth_f_sg_match.group(1) if teeth_f_sg_match else ""
+check("14 (teeth, reviewer repro 3): an active canonical-local SG gate plus the expected desired-local gate present only in a comment is REJECTED after comment-stripping", SG_GATE_TEXT not in teeth_f_sg_body)
+
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
 PYEOF
 )"
     while IFS= read -r line; do
       case "$line" in
-        FAIL\ *) fail "12: ${line#FAIL }" ;;
-        OK\ *) pass "12: ${line#OK }" ;;
+        FAIL\ *) fail "13: ${line#FAIL }" ;;
+        OK\ *) pass "13: ${line#OK }" ;;
       esac
     done <<< "$EFS_DESIRED_RELATIONSHIP_CHECK"
   else
-    fail "12: expected the live managed-efs-inventory command to succeed: ${LIVE_INVENTORY_OUT}"
+    fail "13: expected the live managed-efs-inventory command to succeed: ${LIVE_INVENTORY_OUT}"
   fi
 else
-  skip "12: live managed-efs-inventory / desired-EFS relationship check -- python3 unavailable"
+  skip "13: live managed-efs-inventory / desired-EFS relationship check -- python3 unavailable"
 fi
 
 if grep -qE '^\s*data\s+"aws_security_group"\s+"goldengate_efs_shared"' envs/dev/efs.tf 2>/dev/null; then
