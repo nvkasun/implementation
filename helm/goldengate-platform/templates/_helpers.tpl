@@ -19,7 +19,7 @@ goldengate.adcb/environment: {{ required "environment is required." .Values.envi
 {{- end }}
 
 {{- /*
-Fluent Bit (Phase 6A centralized container logging) labels. Distinct
+Fluent Bit (Phase 4 centralized container logging) labels. Distinct
 app.kubernetes.io/name and component from goldengate-platform.labels above:
 this is a distinct workload (the platform chart's only workload) the
 existing "namespaces and shared ServiceAccounts only" identity must never

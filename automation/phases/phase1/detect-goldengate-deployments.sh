@@ -274,7 +274,7 @@ is_goldengate_deployment_values_file() {
   return $?
 }
 
-# HISTORICAL DELETION CONTRACT: classifies content at a specific Git revision (never the working tree), for a removed/renamed candidate or an emptied current file; accepts singleRuntime and legacyPair since a historical legacyPair must remain deletable.
+# HISTORICAL DELETION CONTRACT: classifies content at a specific Git revision (never the working tree), for a removed/renamed candidate or an emptied current file; recognizes singleRuntime and legacyPair for historical deletion classification. Phase 5 refuses legacyPair removal before mutation and requires manual cleanup; recognition does not permit active legacyPair deployment or automatic removal.
 is_goldengate_deployment_values_file_at_ref() {
   local ref="$1"
   local path="$2"
@@ -596,7 +596,7 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
   set -e
 
   if [ "$STATUS" -ne 0 ]; then
-    # GoldenGate Runtime Desired-State Simplification: deployment.enabled=false (or top-level enabled=false) is now a first-class desired-ABSENCE request -- it drives the SAME ownership-safe removal/pruning path (delete_removed_argocd_applications) that a physically-removed descriptor drives, decommissioning the RUNTIME APPLICATION/workload only, while the descriptor (and any managed durable storage it names) is retained. It must never be conflated with physical removal of the descriptor itself, which is the only shape that can make Terraform observe a vanished module instance -- that stays a completely separate reason.
+    # GoldenGate Runtime Desired-State Simplification: deployment.enabled=false is the supported desired-ABSENCE request -- it drives the SAME ownership-safe removal/pruning path (delete_removed_argocd_applications) that a physically-removed descriptor drives, decommissioning the RUNTIME APPLICATION/workload only, while the descriptor (and any managed durable storage it names) is retained. It must never be conflated with physical removal of the descriptor itself, which is the only shape that can make Terraform observe a vanished module instance -- that stays a completely separate reason.
     case "$REASON" in
       deployment.enabled=false*|enabled=false*)
         echo "Deployment disabled (application decommission, descriptor and storage retained): ${CANDIDATE_ID} (${REASON})"

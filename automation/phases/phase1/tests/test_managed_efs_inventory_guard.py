@@ -327,9 +327,9 @@ class CurrentEnvironmentLifecycleStateTests(unittest.TestCase):
         self.assertEqual(orphans, [])
 
 
-class LifecycleAbsentInventoryTests(unittest.TestCase):
-    def test_lifecycle_absent_descriptor_in_expected_prevents_orphan_failure(self):
-        # Mirrors what automation/goldengate-deployment-model.py managed-efs-inventory emits for a managed deployment currently at lifecycle.state=absent -- its EFS is retained, so it must remain "expected" and must not be misclassified as an orphan.
+class RetainedManagedEfsInventoryTests(unittest.TestCase):
+    def test_retained_managed_efs_in_expected_prevents_orphan_failure(self):
+        # Retained managed EFS stays in the expected inventory even when runtime compute is disabled with deployment.enabled=false; this inventory fixture proves that expected storage is not misclassified as an orphan.
         expected = [_expected("gg-decommissioned-app", "dev-gg-decommissioned-app-efs")]
         actual = [_fs("fs-retained", "dev-gg-decommissioned-app-efs", _valid_tags("gg-decommissioned-app"))]
         orphans = guard.check_managed_efs_inventory(expected, actual, "dev")

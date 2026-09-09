@@ -229,7 +229,7 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
     """Exercised against the real, live envs/dev descriptors -- no scratch root. Derives source/target descriptors by role, never by a specific deployment ID, so retiring or onboarding a descriptor never requires editing this class."""
 
     def _active_by_role(self, role):
-        # lifecycle.state=absent can legitimately leave zero active descriptors during a controlled environment decommission; this only validates whichever descriptors ARE active, never their count.
+        # deployment.enabled=false on every descriptor can legitimately leave zero active descriptors during a controlled environment decommission; this only validates whichever descriptors ARE active, never their count.
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         return [d for d in active if d["role"] == role]
@@ -261,7 +261,7 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
         self.assertEqual(actual_registry_ids, expected_active_ids)
 
     def test_registry_carries_ingressEnabled_and_the_canonical_resolved_ingressHost(self):
-        # Real generated monitor registry (never a hand-built dict): both current DEV runtimes must have ingressEnabled=true and an ingressHost matching the same "<deploymentId>.<dnsDomain>" precedence helm/goldengate.runtimeIngressHost implements -- the expected hostname is derived from the real environment.yaml, never hardcoded.
+        # Real generated monitor registry (never a hand-built dict): the active DEV runtimes must have ingressEnabled=true and an ingressHost matching the same "<deploymentId>.<dnsDomain>" precedence helm/goldengate.runtimeIngressHost implements -- the expected hostname is derived from the real environment.yaml, never hardcoded.
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         dns_domain = gdm._environment_derived_values("dev")["DNS_DOMAIN"]
@@ -279,7 +279,7 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
                             by_name["gg-mssql-repltest-01"]["ingressHost"])
 
     def test_managed_efs_inventory_matches_dynamically_derived_managed_set(self):
-        # Self-service: never asserts today's managed count is any particular fixed number -- compares the real cmd_managed_efs_inventory JSON output against a set derived independently from the same scan (efsMode == "managed"), including lifecycle.state=absent descriptors (inactive), exactly like the real command.
+        # Self-service: never asserts today's managed count is any particular fixed number -- compares the real cmd_managed_efs_inventory JSON output against a set derived independently from the same scan (efsMode == "managed"), including deployment.enabled=false descriptors (inactive), exactly like the real command.
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         expected_managed = sorted(
@@ -299,7 +299,7 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
         self.assertEqual(actual_managed, expected_managed)
 
     def test_at_least_one_managed_efs_descriptor_exists(self):
-        # MILESTONE (temporary, not a permanent inventory coupling): proves the first production managed-EFS runtime was successfully onboarded, without naming it or coupling to an exact count. Safe to delete once managed EFS is routine.
+        # Current DEV storage coverage requires at least one managed-EFS descriptor, without naming it or requiring an exact inventory count.
         active, inactive, _invalid = gdm.scan("dev")
         managed = [d for d in active + inactive if d["efsMode"] == "managed"]
         self.assertGreaterEqual(len(managed), 1)

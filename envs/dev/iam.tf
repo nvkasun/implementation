@@ -96,7 +96,7 @@ module "goldengate_platform_logging_role_dev" {
 }
 
 
-# Dedicated IRSA role for the future CloudWatch Observability agent (IAM/Terraform prerequisites only); trust: exactly system:serviceaccount:amazon-cloudwatch:cloudwatch-agent. Publishes ContainerInsights metrics and writes only the pre-created performance log group; never shared with other roles and never writes /adcb/goldengate/dev/* logs.
+# Dedicated IRSA role for the CloudWatch Observability agent (IAM/Terraform prerequisites only); trust: exactly system:serviceaccount:amazon-cloudwatch:cloudwatch-agent. Publishes ContainerInsights metrics and writes only the pre-created performance log group; never shared with other roles and never writes /adcb/goldengate/dev/* logs.
 module "goldengate_cloudwatch_metrics_role_dev" {
   source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-iam-role.git?ref=v2.0.0"
 
