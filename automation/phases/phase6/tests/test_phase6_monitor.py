@@ -123,13 +123,6 @@ def _base_scripted():
     return scripted
 
 
-def _capture_stdout(fn, *args, **kwargs):
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        result = fn(*args, **kwargs)
-    return result, buf.getvalue()
-
-
 def _github_output_pairs(path):
     with open(path) as f:
         lines = [line.rstrip("\n") for line in f if line.strip()]
