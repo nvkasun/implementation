@@ -6350,6 +6350,10 @@ echo "--- Managed EFS decommission: explicit allowlist filters Terraform desired
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   EFS_DECOMMISSION_CHECK="$(python3 -c '
+import json
+from pathlib import Path
+import subprocess
+import sys
 import re
 
 import importlib.util
@@ -6406,8 +6410,41 @@ check("14: goldengate_inventory.tf is untouched -- the canonical local.goldengat
 # Empirical, not just structural: cross-check against the REAL live deployment-model output (point 1: deployment.enabled=true/false alone never removes a descriptor from the CANONICAL inventory; point 4: the decommission set matches exactly, never a superset/subset of, the real managed-EFS deployment IDs -- so this can never silently affect an unrelated managed EFS).
 active, inactive, invalid = gdm.scan("dev")
 check("scan(dev): no invalid descriptors", invalid == [])
-canonical_managed_ids = sorted(d["deploymentId"] for d in (active + inactive) if d["efsMode"] == "managed")
-check("15: the canonical (unfiltered) managed-EFS inventory still contains exactly the same two IDs -- active/inactive status alone never removes a descriptor from it", canonical_managed_ids == ["gg-mssql-repltest-01", "gg-postgresql-repltest-01"])
+# Read persistence intent independently of parsed efsMode; deployment.enabled never filters retained storage.
+expected_managed = []
+for path in sorted(Path("envs/dev").glob("*/values.yaml")):
+    if path.parent.name in gdm.IGNORED_NON_RUNTIME_FOLDER_NAMES:
+        continue
+    doc = gdm.load_yaml_strict(path)
+    persistence = doc.get("persistence") or {}
+    if persistence.get("enabled") is True and persistence.get("provider") == "efs" and (persistence.get("efs") or {}).get("mode") == "managed":
+        expected_managed.append({"deploymentId": path.parent.name, "efsCreationToken": "dev-%s-efs" % path.parent.name})
+
+
+def exact_managed_inventory(rows, expected):
+    if not isinstance(rows, list) or not all(isinstance(row, dict) and set(row) == {"deploymentId", "efsCreationToken"} and all(isinstance(value, str) and value for value in row.values()) for row in rows):
+        return False
+    ids = [row["deploymentId"] for row in rows]
+    tokens = [row["efsCreationToken"] for row in rows]
+    return len(ids) == len(set(ids)) and len(tokens) == len(set(tokens)) and sorted(rows, key=lambda row: row["deploymentId"]) == sorted(expected, key=lambda row: row["deploymentId"])
+
+
+inventory_proc = subprocess.run([sys.executable, "-B", TOOL_PATH, "--environment", "dev", "managed-efs-inventory"], capture_output=True, text=True)
+try:
+    managed_inventory = json.loads(inventory_proc.stdout)
+except ValueError:
+    managed_inventory = None
+canonical_managed_ids = sorted(row["deploymentId"] for row in expected_managed)
+scan_managed = [{"deploymentId": d["deploymentId"], "efsCreationToken": d["efsCreationToken"]} for d in active + inactive if d["efsMode"] == "managed"]
+check("15: canonical managed-EFS CLI and scan exactly match independent folder persistence intent, including inactive descriptors, with unique IDs and deterministic unique tokens", bool(expected_managed) and inventory_proc.returncode == 0 and exact_managed_inventory(managed_inventory, expected_managed) and exact_managed_inventory(scan_managed, expected_managed))
+
+# Exercise the same exact-content comparator with isolated data; existing core tests cover inactive retention and invalid-descriptor fail-closed behavior.
+inventory_fixture = [{"deploymentId": "gg-fixture", "efsCreationToken": "dev-gg-fixture-efs"}]
+check("15a (teeth): missing managed-EFS member is rejected", not exact_managed_inventory([], inventory_fixture))
+check("15b (teeth): unexpected managed-EFS member is rejected", not exact_managed_inventory(inventory_fixture + [{"deploymentId": "gg-extra", "efsCreationToken": "dev-gg-extra-efs"}], inventory_fixture))
+check("15c (teeth): duplicate managed-EFS member is rejected", not exact_managed_inventory(inventory_fixture * 2, inventory_fixture))
+check("15d (teeth): wrong managed-EFS creation token is rejected", not exact_managed_inventory([{**inventory_fixture[0], "efsCreationToken": "wrong"}], inventory_fixture))
+check("15e (teeth): malformed managed-EFS inventory is rejected", all(not exact_managed_inventory(rows, inventory_fixture) for rows in (None, {}, [None], [{"deploymentId": "gg-fixture"}], [{"deploymentId": [], "efsCreationToken": "token"}])))
 check("16: the explicit decommission set is a subset of the real managed-EFS deployment IDs (never a superset that could silently affect an unrelated managed EFS)", set(decommission_ids) <= set(canonical_managed_ids))
 
 by_id = {d["deploymentId"]: d for d in (active + inactive)}
@@ -6427,9 +6464,9 @@ other_sg_refs = [m.start() for m in re.finditer(r"data\.aws_security_group\.gold
 check("22: every reference to data.aws_security_group.goldengate_efs_shared[0] lives inside the module block gated by the same desired-EFS for_each (no unconditional bypass elsewhere in efs.tf)",
       len(other_sg_refs) == 1 and module_match is not None and module_match.start() < other_sg_refs[0] < module_match.end())
 
-# Verify the current (post GoldenGate Runtime Presence Contract Finalization) desired-EFS map enables the SG lookup: the decommission hold on both real deployment IDs was cleared, so both managed EFS filesystems are desired again.
+# Verify canonical-minus-decommission equality and the non-empty SG gate without fixing the number of managed runtimes; the active-HCL parser below independently proves the production relationship and empty-set safety contract.
 real_desired_ids = sorted(set(canonical_managed_ids) - set(decommission_ids))
-check("23: with the real current descriptor state, the desired-EFS map contains both managed-EFS deployments (the decommission hold on them has been cleared), so the SG data-source count evaluates to 1 (SG lookup is active)", real_desired_ids == canonical_managed_ids and len(real_desired_ids) == 2)
+check("23: desired-EFS IDs equal the non-empty canonical managed inventory while the decommission set is empty, so the conceptual shared-SG lookup count is 1", ids_match is not None and decommission_ids == [] and real_desired_ids == canonical_managed_ids and bool(real_desired_ids))
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
@@ -8789,47 +8826,39 @@ def check(label, condition, proc=None, outputs=None):
         failures.append(label + extra)
 
 
-# GoldenGate Runtime Presence Contract Finalization, Defect 1: an environment-wide manual run (deployment_id blank) is no longer an empty-mutation no-op -- it converges the COMPLETE environment from the canonical deployment registry, never Git diff. With CURRENT real DEV source (both real descriptors deployment.enabled=true), Deploy must populate deployment_matrix with both real IDs (deploy=true) and an empty deletion_matrix; Validate must produce the identical membership with deploy=false, still has_changes=true (a non-empty matrix was resolved) but never mutating (deploy flag itself is false, and no deletion evaluation runs in Validate mode). GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 4: expected membership is derived DYNAMICALLY from the canonical model (automation/goldengate-deployment-model.py environment-matrix), never a second hardcoded ["gg-mssql-repltest-01", "gg-postgresql-repltest-01"] literal -- adding a third enabled descriptor must make this test's own expectation grow with it, not fail it. The two current POC IDs are still asserted as MEMBERS (never as the only possible members) so this test still meaningfully exercises today's real repository state.
-CANONICAL_DEPLOY_TRUE = subprocess.run(["python3", "automation/goldengate-deployment-model.py", "--environment", "dev", "environment-matrix", "--deploy", "true"], capture_output=True, text=True)
-CANONICAL_DEPLOY_FALSE = subprocess.run(["python3", "automation/goldengate-deployment-model.py", "--environment", "dev", "environment-matrix", "--deploy", "false"], capture_output=True, text=True)
-if CANONICAL_DEPLOY_TRUE.returncode != 0 or CANONICAL_DEPLOY_FALSE.returncode != 0:
-    failures.append(f"environment-matrix canonical baseline command failed (deploy=true rc={CANONICAL_DEPLOY_TRUE.returncode}, deploy=false rc={CANONICAL_DEPLOY_FALSE.returncode})")
-    CANONICAL_ENABLED_IDS = None
-else:
-    CANONICAL_ENABLED_IDS = sorted(d["deployment_id"] for d in json.loads(CANONICAL_DEPLOY_TRUE.stdout)["deployment_matrix"])
-    CANONICAL_ENABLED_IDS_DEPLOY_FALSE = sorted(d["deployment_id"] for d in json.loads(CANONICAL_DEPLOY_FALSE.stdout)["deployment_matrix"])
-    check("canonical baseline: environment-matrix --deploy true/false resolve the identical membership (only the per-entry deploy flag differs)", CANONICAL_ENABLED_IDS == CANONICAL_ENABLED_IDS_DEPLOY_FALSE)
-    check("canonical baseline: the two current POC IDs are members of the canonical active set (never asserted as the ONLY possible members)", {"gg-mssql-repltest-01", "gg-postgresql-repltest-01"} <= set(CANONICAL_ENABLED_IDS))
+# Compare real environment-wide Deploy/Validate with canonical matrix content, including inactive desired-absence entries; inventory size is never fixed.
+CANONICAL_BY_MODE = {}
+for mode in ("true", "false"):
+    canonical = subprocess.run(["python3", "automation/goldengate-deployment-model.py", "--environment", "dev", "environment-matrix", "--deploy", mode], capture_output=True, text=True)
+    check("canonical environment-matrix succeeds for deploy=" + mode, canonical.returncode == 0)
+    if canonical.returncode != 0:
+        continue
+    expected = json.loads(canonical.stdout)
+    CANONICAL_BY_MODE[mode] = expected
+    expected_matrix = expected["deployment_matrix"]
+    expected_ids = [row["deployment_id"] for row in expected_matrix]
+    check("canonical active membership has unique IDs for deploy=" + mode, len(expected_ids) == len(set(expected_ids)))
+    proc, outputs = run_detect("", mode)
+    matrix = json.loads(outputs.get("deployment_matrix", "null"))
+    deletions = json.loads(outputs.get("deletion_matrix", "null"))
+    check("J/K: real environment-wide detector matches complete canonical matrix content for deploy=" + mode,
+          proc.returncode == 0
+          and matrix == expected_matrix
+          and all(row["deploy"] is (mode == "true") for row in matrix)
+          and deletions == expected["deletion_matrix"]
+          and outputs.get("has_changes") == str(bool(expected_matrix)).lower()
+          and outputs.get("has_deletions") == str(bool(expected["deletion_matrix"])).lower(), proc, outputs)
+if len(CANONICAL_BY_MODE) == 2:
+    check("Deploy/Validate resolve identical active membership and Validate never schedules deletion",
+          sorted(row["deployment_id"] for row in CANONICAL_BY_MODE["true"]["deployment_matrix"])
+          == sorted(row["deployment_id"] for row in CANONICAL_BY_MODE["false"]["deployment_matrix"])
+          and CANONICAL_BY_MODE["false"]["deletion_matrix"] == [])
 
-proc, outputs = run_detect("", "true")
-J_MATRIX = json.loads(outputs.get("deployment_matrix", "null")) if outputs.get("deployment_matrix") else None
-check("J: manual environment-wide Deploy (deployment_id=\x27\x27, INPUT_DEPLOY=true) converges the complete environment: deployment_matrix membership equals the canonical model's own active set (deploy=true), deletion_matrix stays empty",
-      proc.returncode == 0
-      and outputs.get("has_changes") == "true"
-      and J_MATRIX is not None
-      and CANONICAL_ENABLED_IDS is not None
-      and sorted(d["deployment_id"] for d in J_MATRIX) == CANONICAL_ENABLED_IDS
-      and all(d["deploy"] is True for d in J_MATRIX)
-      and outputs.get("has_deletions") == "false"
-      and outputs.get("deletion_matrix") == "[]",
-      proc, outputs)
-
-proc, outputs = run_detect("", "false")
-K_MATRIX = json.loads(outputs.get("deployment_matrix", "null")) if outputs.get("deployment_matrix") else None
-check("K: manual environment-wide Validate (deployment_id=\x27\x27, INPUT_DEPLOY=false) resolves the identical complete-environment membership as the canonical model's own active set, deploy=false, still strictly non-mutating (deletion_matrix stays empty even though the matrix is resolved)",
-      proc.returncode == 0
-      and K_MATRIX is not None
-      and CANONICAL_ENABLED_IDS is not None
-      and sorted(d["deployment_id"] for d in K_MATRIX) == CANONICAL_ENABLED_IDS
-      and all(d["deploy"] is False for d in K_MATRIX)
-      and outputs.get("has_deletions") == "false"
-      and outputs.get("deletion_matrix") == "[]",
-      proc, outputs)
-
-# GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 4 (test 18): add a synthetic THIRD enabled descriptor in an isolated fixture repo and prove the environment-wide matrix automatically includes it -- this test's own logic never hardcodes a count, so it keeps passing unchanged when a real fourth/fifth descriptor is added to the real repository later. The fixture mirrors the full automation/ toolchain and envs/dev/ tree (both real descriptors, environment.yaml, the ignored argocd/goldengate-monitor folders) since the environment-wide path genuinely shells out to automation/goldengate-deployment-model.py (which in turn needs automation/goldengate-environment.py and envs/dev/environment.yaml) -- never a hand-trimmed partial fixture that would fail for reasons unrelated to the behavior under test.
+# Isolate synthetic matrix membership from live runtime folders: copy the toolchain and shared environment config only, then add the explicitly defined fixture descriptors.
 third_scratch_dir = tempfile.mkdtemp(prefix="detect-third-enabled-")
 shutil.copytree(os.path.join(repo_root_for_fixture, "automation"), os.path.join(third_scratch_dir, "automation"))
-shutil.copytree(os.path.join(repo_root_for_fixture, "envs", "dev"), os.path.join(third_scratch_dir, "envs", "dev"))
+os.makedirs(os.path.join(third_scratch_dir, "envs", "dev"))
+shutil.copy2(os.path.join(repo_root_for_fixture, "envs", "dev", "environment.yaml"), os.path.join(third_scratch_dir, "envs", "dev", "environment.yaml"))
 # A full structurally-valid descriptor (real CSI/service/storage/ingress/persistence shape), never a hand-trimmed minimal stub -- built from the real gg-postgresql-repltest-01 descriptor with only the pipeline/ALB-group-order identity changed (both must be unique across descriptors, per the canonical model's own cross-descriptor validation), so parse_descriptor()'s full validation genuinely passes rather than being accidentally short-circuited by an unrelated field error.
 with open(os.path.join(repo_root_for_fixture, "envs", "dev", "gg-postgresql-repltest-01", "values.yaml")) as f:
     THIRD_SYNTHETIC_VALUES_YAML = (
@@ -8843,13 +8872,14 @@ with open(os.path.join(third_scratch_dir, "envs", "dev", "gg-third-synthetic-01"
 
 proc, outputs = run_detect("", "true", cwd=third_scratch_dir)
 THIRD_MATRIX = json.loads(outputs.get("deployment_matrix", "null")) if outputs.get("deployment_matrix") else None
-check("18: a synthetic third enabled descriptor is automatically included in the environment-wide matrix alongside the two real IDs, with NO test-code change required for the count to grow from two to three",
+check("18: the isolated environment-wide Deploy matrix contains exactly the active synthetic fixture, with no real runtime inventory leakage",
       proc.returncode == 0
       and THIRD_MATRIX is not None
-      and sorted(d["deployment_id"] for d in THIRD_MATRIX) == ["gg-mssql-repltest-01", "gg-postgresql-repltest-01", "gg-third-synthetic-01"],
+      and THIRD_MATRIX == [{"environment": "dev", "deployment_id": "gg-third-synthetic-01", "deployment_model": "singleRuntime", "deploy": True}]
+      and outputs.get("deletion_matrix") == "[]",
       proc, outputs)
 
-# GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 4 (test 19): add a synthetic disabled descriptor to the same three-enabled fixture and prove it enters the desired-absence matrix on Deploy, never the reconciliation matrix. deployment.enabled=false is a "turn off, keep the config" mechanism (never a minimal stub) -- even an inactive descriptor is fully validated, so this fixture must be a complete, valid descriptor too, just like the third one above.
+# Add a fully valid disabled descriptor to the isolated fixture: Deploy routes it only to desired absence, while the active fixture remains in reconciliation.
 FOURTH_SYNTHETIC_VALUES_YAML = (
     THIRD_SYNTHETIC_VALUES_YAML
     .replace("repltest-third-synthetic-001", "repltest-fourth-disabled-001")
@@ -8863,15 +8893,23 @@ with open(os.path.join(third_scratch_dir, "envs", "dev", "gg-fourth-disabled-syn
 proc, outputs = run_detect("", "true", cwd=third_scratch_dir)
 FOURTH_DEPLOYMENT_MATRIX = json.loads(outputs.get("deployment_matrix", "null")) if outputs.get("deployment_matrix") else None
 FOURTH_DELETION_MATRIX = json.loads(outputs.get("deletion_matrix", "null")) if outputs.get("deletion_matrix") else None
-check("19: a synthetic disabled descriptor enters the desired-absence (deletion) matrix on Deploy, never the reconciliation matrix, alongside the three still-correctly-enabled descriptors",
+check("19: the isolated disabled fixture enters only the deletion matrix; the active fixture remains exactly once in Deploy",
       proc.returncode == 0
       and FOURTH_DEPLOYMENT_MATRIX is not None
-      and sorted(d["deployment_id"] for d in FOURTH_DEPLOYMENT_MATRIX) == ["gg-mssql-repltest-01", "gg-postgresql-repltest-01", "gg-third-synthetic-01"]
+      and FOURTH_DEPLOYMENT_MATRIX == [{"environment": "dev", "deployment_id": "gg-third-synthetic-01", "deployment_model": "singleRuntime", "deploy": True}]
       and FOURTH_DELETION_MATRIX is not None
       and len(FOURTH_DELETION_MATRIX) == 1
       and FOURTH_DELETION_MATRIX[0]["deployment_id"] == "gg-fourth-disabled-synthetic-01"
       and FOURTH_DELETION_MATRIX[0]["reason"] == "deployment-disabled",
       proc, outputs)
+
+proc, outputs = run_detect("", "false", cwd=third_scratch_dir)
+check("19b: isolated environment-wide Validate includes only the active fixture with deploy=false and never schedules disabled-runtime deletion",
+      proc.returncode == 0
+      and json.loads(outputs.get("deployment_matrix", "null")) == [{"environment": "dev", "deployment_id": "gg-third-synthetic-01", "deployment_model": "singleRuntime", "deploy": False}]
+      and outputs.get("deletion_matrix") == "[]"
+      and outputs.get("has_deletions") == "false", proc, outputs)
+shutil.rmtree(third_scratch_dir)
 
 import tempfile as _tempfile
 scratch_dir = _tempfile.mkdtemp(prefix="detect-manual-disabled-")
@@ -8911,8 +8949,8 @@ PYEOF
   LIVE_UX_FIX_2_DETECT_STATUS=$?
   set -e
   if [ "$LIVE_UX_FIX_2_DETECT_STATUS" -eq 0 ]; then
-    pass "Live Deploy UX Fix 2: J: manual environment-wide Deploy converges the complete environment (both real DEV IDs, deploy=true, deletion_matrix=[])"
-    pass "Live Deploy UX Fix 2: K: manual environment-wide Validate resolves the identical membership, deploy=false, non-mutating"
+    pass "Live Deploy UX Fix 2: J: manual environment-wide Deploy matches complete canonical active and inactive matrix content; isolated synthetic membership is independent of real inventory size"
+    pass "Live Deploy UX Fix 2: K: real and isolated environment-wide Validate resolve active membership with deploy=false and no deletions"
     pass "Live Deploy UX Fix 2: N: manual selected deployment.enabled=false descriptor + Deploy is routed through the safe removal path, never rejected"
     pass "Live Deploy UX Fix 2: N2: manual selected deployment.enabled=false descriptor + Validate is a strict non-mutating no-op"
   else
@@ -13086,7 +13124,7 @@ else
   skip "Phase B3A: structural DAG/workflow checks -- python3/PyYAML unavailable or main workflow missing"
 fi
 
-# 5 (GoldenGate Runtime Desired-State Simplification): current descriptors yield a two-entry active_runtime_matrix -- proven directly by running the real folder-driven registry, never asserted as a fixed string. Both real DEV descriptors are now genuinely active (deployment.enabled=true, no lifecycle block); replication remains disabled independently.
+# Compare the registry with independently classified folder intent: every active runtime appears exactly once, inactive runtimes stay out, and source/target uniqueness applies within each pipeline. Core tests already prove invalid descriptors fail closed and duplicate roles/orders are rejected.
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   ACTIVE_MATRIX_RESULT="$(python3 -c '
 import json
@@ -13102,15 +13140,36 @@ import yaml
 doc = yaml.safe_load(proc.stdout)
 deployments = doc.get("deployments") or []
 matrix = [{"environment": "dev", "deployment_id": d["name"]} for d in deployments]
-expected_ids = {"gg-postgresql-repltest-01", "gg-mssql-repltest-01"}
-actual_ids = {d["deployment_id"] for d in matrix}
-if actual_ids == expected_ids:
+import importlib.util
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("gdm_active_matrix", "automation/goldengate-deployment-model.py")
+gdm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gdm)
+expected_ids, expected_inactive, pipeline_roles = [], [], []
+for path in sorted(Path("envs/dev").glob("*/values.yaml")):
+    if path.parent.name in gdm.IGNORED_NON_RUNTIME_FOLDER_NAMES:
+        continue
+    values = gdm.load_yaml_strict(path)
+    deployment = values["deployment"]
+    if deployment["enabled"] is True:
+        expected_ids.append(path.parent.name)
+        pipeline_roles.append((deployment["pipeline"], deployment["role"]))
+    else:
+        expected_inactive.append(path.parent.name)
+active, inactive, invalid = gdm.scan("dev")
+actual_ids = [d["deployment_id"] for d in matrix]
+if (not invalid and not gdm.validate("dev")
+        and sorted(actual_ids) == sorted(expected_ids)
+        and len(actual_ids) == len(set(actual_ids))
+        and sorted(d["deploymentId"] for d in active) == sorted(expected_ids)
+        and sorted(d["deploymentId"] for d in inactive) == sorted(expected_inactive)
+        and len(pipeline_roles) == len(set(pipeline_roles))):
     print("OK")
 else:
-    print(f"FAIL: expected active_runtime_matrix to contain exactly {expected_ids!r} (both current DEV descriptors are deployment.enabled=true), got {actual_ids!r}")
+    print(f"FAIL: registry/scan must exactly classify active={expected_ids!r}, inactive={expected_inactive!r}, with unique IDs and roles per pipeline; registry={actual_ids!r}, invalid={invalid!r}")
 ' 2>&1)"
   if [ "$ACTIVE_MATRIX_RESULT" = "OK" ]; then
-    pass "Phase B3A: 5: both current DEV descriptors (gg-postgresql-repltest-01/gg-mssql-repltest-01, deployment.enabled=true, no lifecycle block) yield a two-entry active_runtime_matrix"
+    pass "Phase B3A: 5: registry and scan exactly match folder-driven active/inactive membership, with unique runtime IDs and source/target roles per pipeline"
   else
     fail "Phase B3A: 5: ${ACTIVE_MATRIX_RESULT}"
   fi
