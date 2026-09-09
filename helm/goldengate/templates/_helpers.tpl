@@ -27,10 +27,6 @@ per runtime name).
 {{- .Values.deploymentModel -}}
 {{- end }}
 
-{{- define "goldengate.isSingleRuntime" -}}
-{{- eq (include "goldengate.deploymentModel" .) "singleRuntime" -}}
-{{- end }}
-
 {{- /*
 Chart-wide validation: only deploymentModel=singleRuntime is supported.
 Called unconditionally from the very top of runtime-statefulset.yaml (the

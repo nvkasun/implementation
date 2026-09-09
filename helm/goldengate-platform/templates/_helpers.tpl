@@ -1,7 +1,3 @@
-{{- define "goldengate-platform.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
-{{- end }}
-
 {{- /*
 Standard platform-level labels. Deliberately generic (platform-wide, not
 per-runtime): no goldengate.adcb/deployment-id or similar per-runtime

@@ -1,7 +1,3 @@
-{{- define "goldengate-monitor.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
-{{- end }}
-
 {{- define "goldengate-monitor.labels" -}}
 app.kubernetes.io/name: gg-monitor
 app.kubernetes.io/instance: {{ .Release.Name }}
