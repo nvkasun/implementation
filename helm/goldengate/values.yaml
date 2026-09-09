@@ -153,9 +153,6 @@ ingress:
 
   annotations: {}
 
-configJob:
-  enabled: false
-
 monitoring:
   labels:
     enabled: true
