@@ -78,7 +78,6 @@ STATE_BROKEN = "BROKEN"
 
 HELM_REPO_PATH = "helm/goldengate"
 INIT_CONTAINER_NAME = "prepare-u02-permissions"
-RUNTIME_SELECTOR_LABELS_TEMPLATE = {"app.kubernetes.io/name": "goldengate"}
 
 # helm/goldengate/templates/runtime-statefulset.yaml's fixed CSI volume names and driver -- never guessed, never a second desired shape.
 ADMIN_CSI_VOLUME_NAME = "ogg-admin-csi"

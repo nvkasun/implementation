@@ -9,8 +9,6 @@ OVERALL_HEALTHY = "HEALTHY"
 OVERALL_ATTENTION = "ATTENTION"
 OVERALL_LIMITED_VISIBILITY = "LIMITED_VISIBILITY"
 
-_ESCAPED_DASH = html.escape("-")
-
 
 def _esc(value, default="-"):
     return html.escape(default) if value is None else html.escape(str(value))

@@ -302,9 +302,6 @@ def check_phase3_wrapper_reconcile_requires_authorization(wrapper_doc, findings)
         findings.append(f"{PHASE3_WRAPPER_FILENAME} job {PHASE3_RECONCILE_JOB!r}'s if: must require needs.{GOLDENGATE_AUTHORIZATION_JOB}.result == 'success', found: {_job_if(job)!r}")
 
 
-DELETION_JOB = PHASE5_DELETION_JOB
-
-
 def _explicit_success_chain_to(jobs, start, target):
     """True if there is a path from `start` down to `target` via needs: where EVERY hop's own if: explicitly requires needs.<next-hop>.result == 'success' for the next hop toward target -- proving the whole chain fails closed end to end, never merely that `target` happens to appear somewhere in the transitive needs: graph (a bare needs: listing is not sufficient, since GitHub Actions treats a skipped dependency as satisfying it without an explicit result check)."""
     if start == target:

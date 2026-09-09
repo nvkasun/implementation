@@ -243,8 +243,6 @@ def _http_status(url, opener, timeout=5):
 
 _KNOWN_PROCESS_STATUSES = ("RUNNING", "STOPPED", "ABENDED")
 
-_DISCOVERY_STATUSES = ("OK", "EMPTY", "PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE")
-_ENDPOINT_STATUSES = ("OK", "EMPTY", "UNAVAILABLE", "INVALID_RESPONSE")
 _INCOMPLETE_DISCOVERY_STATUSES = ("PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE")
 _VALID_ENDPOINT_STATUSES = ("OK", "EMPTY")
 
@@ -521,8 +519,6 @@ _PMS_PERFORMANCE_NUMERIC_FIELDS = (
     "ioReadBytes", "ioReadCount", "ioWriteBytes", "ioWriteCount",
     "ioOtherBytes", "ioOtherCount", "processStartTime", "processId",
 )
-
-_PMS_SERVICE_HEALTH_FIELDS = ("isHealthy", "criticalResourcesHealthy", "criticalResourcesUnhealthy")
 
 
 def _http_json_bounded(url, opener, timeout=5, max_bytes=PMS_MAX_RESPONSE_BYTES):

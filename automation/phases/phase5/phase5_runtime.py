@@ -248,10 +248,6 @@ def _validate_removal_state_identity(state, environment, deployment_id):
     return efs_mode
 
 
-RECONCILE_COMMANDS = frozenset({
-    "prepare-deployment", "resolve-live-inputs", "validate-local", "publish-chart",
-    "validate-cluster-prerequisites", "reconcile-runtime", "post-deploy-diagnostics",
-})
 REMOVAL_COMMANDS = frozenset({"prepare-removal", "removal-preflight", "remove-runtime", "post-delete-acceptance"})
 
 

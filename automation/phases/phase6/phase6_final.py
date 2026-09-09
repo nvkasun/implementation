@@ -24,12 +24,6 @@ RESULT_JOB_NAMES = (
     "end_to_end_deployment_acceptance",
 )
 
-_LITERAL_BOOLEAN_INPUTS = ("EFFECTIVE_DEPLOY", "HAS_ACTIVE_DEPLOYMENTS", "HAS_CHANGES", "HAS_DELETIONS")
-
-
-class Phase6FinalError(Exception):
-    """A fail-closed Phase 6 final-validation error; main() reports it and exits non-zero."""
-
 
 class _Gate:
     """Accumulates OK/FAIL diagnostic lines and a single failed flag exactly like the prior inline shell's FAILED="true"/require_success()/allow_non_failure() functions -- a thin, directly-testable stand-in for that shell state."""

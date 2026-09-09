@@ -36,9 +36,6 @@ CANONICAL_OUTPUT_KEYS = (
     "storage_transition_violations",
 )
 
-_LITERAL_BOOL_KEYS = ("effective_deploy", "has_active_deployments", "has_changes", "has_deletions", "terraform_governance_override")
-_JSON_ARRAY_KEYS = ("active_runtime_matrix", "deployment_matrix", "deletion_matrix", "storage_transition_violations")
-
 
 class Phase1Error(Exception):
     """A fail-closed Phase 1 error; main() reports it and exits non-zero."""

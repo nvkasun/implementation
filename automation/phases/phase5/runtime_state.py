@@ -81,10 +81,6 @@ STATE_BROKEN = "BROKEN"
 HELM_REPO_PATH = "helm/goldengate"
 
 # Resources whose ownership is verified via the shared goldengate.runtimeLabels helper (app.kubernetes.io/instance == deployment ID, goldengate.adcb/deployment-name == deployment ID, goldengate.adcb/environment == environment).
-_RUNTIME_LABELS_OWNED_KINDS = (
-    "statefulset", "service", "headless_service", "pvc",
-    "admin_secretproviderclass", "certificate_secretproviderclass", "ingress",
-)
 
 # StorageClass is deliberately NOT rendered via goldengate.runtimeLabels (helm/goldengate/templates/efs-storageclass.yaml) -- it uses its own fixed label set with goldengate.adcb/deployment-id (not deployment-name).
 _STORAGECLASS_KIND = "storageclass"
