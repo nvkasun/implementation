@@ -56,7 +56,8 @@ RECONCILE_ALLOWED_STATE_KEYS = frozenset({
 
 REMOVAL_ALLOWED_STATE_KEYS = frozenset({
     "environment", "deployment_id", "deployment_model", "efs_mode", "reason", "runtime_namespace",
-    "argocd_namespace", "argocd_app_name", "ownership_state", "application_found", "footprint_found",
+    "argocd_namespace", "argocd_app_name", "argocd_appset_name", "ownership_state", "application_found",
+    "applicationset_found", "footprint_found",
 })
 
 
@@ -91,6 +92,11 @@ def _canonical_argocd_app_name(environment, deployment_id):
     """ONE canonical derivation of the runtime Argo CD Application name -- reused by prepare-deployment, prepare-removal, and both the reconcile-state/removal-state identity validators below; never independently duplicated. Strips exactly one leading "gg-" from deployment_id (if present) before composing goldengate-<environment>-<suffix>, e.g. gg-postgresql-repltest-01 -> goldengate-dev-postgresql-repltest-01, gg-gg-test -> goldengate-dev-gg-test."""
     app_suffix = deployment_id[len("gg-"):] if deployment_id.startswith("gg-") else deployment_id
     return f"goldengate-{environment}-{app_suffix}"
+
+
+def _canonical_appset_name(environment, deployment_id):
+    """ONE canonical derivation of the runtime ApplicationSet name -- always <application-name>-appset. Mirrored (never imported -- matches this repo's existing self-contained-per-module convention already used for _app_suffix/app_name across runtime_state.py/runtime_acceptance.py/phase5_runtime.py) by automation/phases/phase5/runtime_state.py's own _appset_name() and automation/phases/phase5/runtime_acceptance.py's own copy; test_phase5_runtime.py::ApplicationSetNamingDriftTests proves all three agree for every current real deployment ID."""
+    return f"{_canonical_argocd_app_name(environment, deployment_id)}-appset"
 
 
 def _canonical_chart_version(deployment_id):
@@ -381,13 +387,17 @@ def cmd_ownership_preflight(args):
         raise Phase5Error(f"the GoldenGate runtime ownership classifier produced unparseable output: {exc}") from exc
 
     state = result.get("state")
-    if state not in ("ABSENT", "OWNED", "BROKEN"):
+    if state not in ("ABSENT", "OWNED", "BROKEN", "MIGRATION_CANDIDATE"):
         raise Phase5Error(f"the GoldenGate runtime ownership classifier produced an unrecognized state {state!r}; refusing to proceed.")
     if state == "BROKEN":
         raise Phase5Error(f"GoldenGate runtime ownership-safety state for {deployment_id} is BROKEN -- an existing footprint does not clearly belong to this deployment. This is not auto-repaired here -- investigate the diagnostics above before re-running.")
 
     write_github_output([("state", state)])
-    print(f"OK: GoldenGate runtime ownership-safety state for {deployment_id} is {state}.")
+    if state == "MIGRATION_CANDIDATE":
+        # Phase 5 Runtime Application Self-Healing: a correctly-owned STANDALONE Application already exists with no runtime ApplicationSet yet -- safe to proceed to reconciliation exactly like ABSENT/OWNED (reconcile-runtime applies an ApplicationSet whose generated child is proven field-for-field identical to this already-verified Application), never auto-repaired or adopted here in the preflight step itself.
+        print(f"OK: GoldenGate runtime ownership-safety state for {deployment_id} is MIGRATION_CANDIDATE (correctly-owned standalone Application, no runtime ApplicationSet yet -- reconciliation will create it).")
+    else:
+        print(f"OK: GoldenGate runtime ownership-safety state for {deployment_id} is {state}.")
 
 
 # Deployment-model reuse (never a second independent descriptor parser)
@@ -1530,6 +1540,14 @@ def cmd_validate_cluster_prerequisites(args):
             "Argo CD before this stage runs -- this check is defense in depth against an unexpected mid-DAG loss of the CRD."
         )
     print("Argo CD Application CRD is present.")
+
+    # Phase 5 Runtime Application Self-Healing: reconciliation now applies a runtime ApplicationSet, never a bare Application directly -- this fails closed here, exactly mirroring the existing Application CRD check above (same minimal CRD-presence style, never a duplicate of Phase 3's own full Argo CD installation/readiness implementation), if the ApplicationSet CRD is unavailable. envs/dev/argocd/values.yaml already enables applicationSet.replicas: 1 and the vendored chart bundles the applicationsets.argoproj.io CRD (helm/argocd/charts/argo-cd/templates/crds/crd-applicationset.yaml) plus the argocd-applicationset-controller Deployment -- Phase 3 remains solely responsible for that controller's own installation/readiness; this is defense in depth against an unexpected mid-DAG loss of the CRD, never a second installer.
+    if run(["kubectl", "get", "crd", "applicationsets.argoproj.io"], check=False).returncode != 0:
+        raise Phase5Error(
+            "CRD applicationsets.argoproj.io not found. Argo CD ApplicationSet controller prerequisite is not healthy -- "
+            "refusing to reconcile a runtime ApplicationSet without it."
+        )
+    print("Argo CD ApplicationSet CRD is present.")
     print("OK: live EKS runtime prerequisites validated.")
 
 
@@ -1578,6 +1596,31 @@ def _build_runtime_application_manifest(argocd_app_name, argocd_namespace, envir
             "destination": {"server": "https://kubernetes.default.svc", "namespace": target_namespace},
             "syncPolicy": {"automated": {"prune": True, "selfHeal": True}},
             "revisionHistoryLimit": 10,
+        },
+    }
+
+
+def _build_runtime_applicationset_manifest(appset_name, argocd_namespace, environment, deployment_id, application_manifest):
+    """Phase 5 Runtime Application Self-Healing: wraps the exact current standalone Application contract (application_manifest, produced verbatim by _build_runtime_application_manifest() -- never a second, independently-maintained copy of its fields) as spec.template of a ONE-runtime ApplicationSet. The generator is a single-element `list` generator with one static, empty element -- there is deliberately no {{ }} Go-template substitution anywhere in the template, since every field application_manifest already carries is a concrete, already-resolved literal value by the time this function runs; the generator's only job is to make the controller materialize exactly one child Application, never to parameterize it. spec.template.metadata/spec are application_manifest's OWN metadata/spec dicts, so the generated child is byte-for-byte/field-for-field identical to what direct reconciliation has always produced -- proven directly in tests by comparing this function's output against _build_runtime_application_manifest()'s, never by a parallel reimplementation that could silently drift. spec.syncPolicy is deliberately omitted here (ApplicationSet's own default, distinct from the Application-level syncPolicy already set inside the template): the default lets Kubernetes' own owner-reference garbage collection cascade-delete this ApplicationSet's single generated child Application when the ApplicationSet itself is deleted -- exactly the mechanism the deployment.enabled=false removal path below relies on to remove ApplicationSet ownership before removing the child. Setting preserveResourcesOnDeletion=true would break that removal path by leaving an orphaned, no-longer-self-healing child Application behind and is never set here."""
+    return {
+        "apiVersion": "argoproj.io/v1alpha1",
+        "kind": "ApplicationSet",
+        "metadata": {
+            "name": appset_name,
+            "namespace": argocd_namespace,
+            "labels": {
+                "app.kubernetes.io/name": "goldengate",
+                "app.kubernetes.io/managed-by": "argocd",
+                "goldengate.adcb/environment": environment,
+                "goldengate.adcb/deployment-id": deployment_id,
+            },
+        },
+        "spec": {
+            "generators": [{"list": {"elements": [{}]}}],
+            "template": {
+                "metadata": application_manifest["metadata"],
+                "spec": application_manifest["spec"],
+            },
         },
     }
 
@@ -1647,6 +1690,9 @@ def cmd_reconcile_runtime(args):
 
     if run(["kubectl", "get", "crd", "applications.argoproj.io"], check=False).returncode != 0:
         raise Phase5Error("CRD applications.argoproj.io not found. Argo CD prerequisite is not healthy.")
+    # Phase 5 Runtime Application Self-Healing: reconciliation now owns the runtime's ApplicationSet, not a bare Application -- fails closed here (before any apply) if the ApplicationSet CRD/controller prerequisite is unavailable, exactly like the existing Application CRD check above. cmd_validate_cluster_prerequisites also checks this earlier in the DAG; this is defense in depth against an unexpected mid-DAG loss of the CRD, never a duplicate authority.
+    if run(["kubectl", "get", "crd", "applicationsets.argoproj.io"], check=False).returncode != 0:
+        raise Phase5Error("CRD applicationsets.argoproj.io not found. Argo CD ApplicationSet controller prerequisite is not healthy -- refusing to reconcile a runtime ApplicationSet.")
 
     # Emergency fallback only; long-term auth is handled in-cluster by argocd-ecr-token-sync (IRSA role ARGOCD_ECR_READ_ROLE_ARN).
     if os.environ.get("ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION") == "true":
@@ -1666,17 +1712,20 @@ def cmd_reconcile_runtime(args):
         del password
         print("Argo CD repository credentials Secret applied: argocd-ecr-goldengate-oci")
 
-    manifest = _build_runtime_application_manifest(
+    application_manifest = _build_runtime_application_manifest(
         argocd_app_name, argocd_namespace, environment, deployment_id, helm_chart_ref, chart_version, release_name,
         target_namespace, image_repository, dns_domain, alb_group_name, certificate_arn, admin_secret_name,
         tls_secret_name, aws_region, runtime_service_account_name, resolved_efs_id,
     )
-    manifest_yaml = yaml.safe_dump(manifest, default_flow_style=False, sort_keys=False)
-    run(["kubectl", "apply", "-f", "-"], input_text=manifest_yaml)
+    # Phase 5 Runtime Application Self-Healing: the runtime's OWN ApplicationSet is reconciled here, never a bare Application directly -- application_manifest above remains the single source of truth for the generated child's metadata/spec (byte-for-byte, via _build_runtime_applicationset_manifest()'s template), so this is never a second, independently-maintained Application shape. Idempotent by construction: whether this is a fresh runtime (State ABSENT) or the one-time migration of a pre-existing, already ownership-verified standalone Application (State MIGRATION_CANDIDATE, proven correctly-owned by runtime_ownership_preflight before this job ever ran), applying an ApplicationSet whose generated child is field-for-field identical to the already-correct Application spec is safe either way the installed ApplicationSet controller handles a same-name pre-existing resource -- it is never treated as a destructive replace, and this code never deletes/recreates the existing Application itself to "migrate" it.
+    appset_name = _canonical_appset_name(environment, deployment_id)
+    appset_manifest = _build_runtime_applicationset_manifest(appset_name, argocd_namespace, environment, deployment_id, application_manifest)
+    appset_manifest_yaml = yaml.safe_dump(appset_manifest, default_flow_style=False, sort_keys=False)
+    run(["kubectl", "apply", "-f", "-"], input_text=appset_manifest_yaml)
     run(["kubectl", "annotate", "application", argocd_app_name, "-n", argocd_namespace, "argocd.argoproj.io/refresh=hard", "--overwrite"])
 
     _wait_for_runtime_argo_application(argocd_app_name, argocd_namespace, timeout_seconds=1200, interval_seconds=30)
-    print("OK: GoldenGate runtime Argo CD Application reconciled.")
+    print("OK: GoldenGate runtime ApplicationSet reconciled and its generated Argo CD Application is Synced and Healthy.")
 
 
 # Phase 5B, step 7: post-deploy-diagnostics (AWS credentials required, Deploy only, non-authoritative)
@@ -1735,11 +1784,12 @@ def cmd_prepare_removal(args):
     runtime_namespace = require_env("RUNTIME_NAMESPACE")
     argocd_namespace = require_env("ARGOCD_NAMESPACE")
     argocd_app_name = _canonical_argocd_app_name(environment, deployment_id)
+    argocd_appset_name = _canonical_appset_name(environment, deployment_id)
 
     update_state(args.state_path, {
         "environment": environment, "deployment_id": deployment_id, "deployment_model": deployment_model,
         "efs_mode": efs_mode, "reason": reason, "runtime_namespace": runtime_namespace,
-        "argocd_namespace": argocd_namespace, "argocd_app_name": argocd_app_name,
+        "argocd_namespace": argocd_namespace, "argocd_app_name": argocd_app_name, "argocd_appset_name": argocd_appset_name,
     }, REMOVAL_ALLOWED_STATE_KEYS)
     print(f"OK: removal prepared for {deployment_id} (reason={reason}, efs_mode={efs_mode or '<none>'}).")
 
@@ -1764,12 +1814,12 @@ def _load_runtime_state_module():
 
 
 def _validate_runtime_state_classifier_output(result):
-    """Strict schema validation of a runtime_state.py classifier result -- used BEFORE it is trusted for any removal-preflight or post-delete-acceptance decision. Requires: result is a JSON object; state is exactly one of ABSENT/OWNED/BROKEN; checks is a JSON object; checks.application_found is a literal JSON boolean (never a truthiness-coerced string/int -- bool("false") is True in Python, so this is checked with isinstance, never bool(...)); checks.footprint_found is a JSON object containing EXACTLY the canonical runtime_state.RUNTIME_FOOTPRINT_KEYS key set, every value a literal JSON boolean. Raises Phase5Error on any deviation -- a malformed/incomplete classifier shape must never be silently treated as "everything reads as absent". Returns (state, application_found, footprint_found) only once every check has passed."""
+    """Strict schema validation of a runtime_state.py classifier result -- used BEFORE it is trusted for any removal-preflight or post-delete-acceptance decision. Requires: result is a JSON object; state is exactly one of ABSENT/OWNED/BROKEN/MIGRATION_CANDIDATE; checks is a JSON object; checks.application_found and checks.applicationset_found are each a literal JSON boolean (never a truthiness-coerced string/int -- bool("false") is True in Python, so this is checked with isinstance, never bool(...)); checks.footprint_found is a JSON object containing EXACTLY the canonical runtime_state.RUNTIME_FOOTPRINT_KEYS key set, every value a literal JSON boolean. Raises Phase5Error on any deviation -- a malformed/incomplete classifier shape must never be silently treated as "everything reads as absent". Returns (state, application_found, applicationset_found, footprint_found) only once every check has passed."""
     if not isinstance(result, dict):
         raise Phase5Error(f"runtime ownership classifier output is a {type(result).__name__}, expected a JSON object.")
 
     state = result.get("state")
-    if state not in ("ABSENT", "OWNED", "BROKEN"):
+    if state not in ("ABSENT", "OWNED", "BROKEN", "MIGRATION_CANDIDATE"):
         raise Phase5Error(f"runtime ownership classifier produced an unrecognized or missing state {state!r}; refusing to proceed.")
 
     checks = result.get("checks")
@@ -1779,6 +1829,10 @@ def _validate_runtime_state_classifier_output(result):
     application_found = checks.get("application_found")
     if not isinstance(application_found, bool):
         raise Phase5Error(f"runtime ownership classifier checks.application_found is {application_found!r} ({type(application_found).__name__}), expected a literal JSON boolean.")
+
+    applicationset_found = checks.get("applicationset_found")
+    if not isinstance(applicationset_found, bool):
+        raise Phase5Error(f"runtime ownership classifier checks.applicationset_found is {applicationset_found!r} ({type(applicationset_found).__name__}), expected a literal JSON boolean.")
 
     footprint_found = checks.get("footprint_found")
     if not isinstance(footprint_found, dict):
@@ -1795,7 +1849,7 @@ def _validate_runtime_state_classifier_output(result):
         if not isinstance(value, bool):
             raise Phase5Error(f"runtime ownership classifier checks.footprint_found[{key!r}] is {value!r} ({type(value).__name__}), expected a literal JSON boolean.")
 
-    return state, application_found, footprint_found
+    return state, application_found, applicationset_found, footprint_found
 
 
 # Phase 5C, step 2: removal-preflight (AWS credentials required)
@@ -1825,33 +1879,39 @@ def cmd_removal_preflight(args):
     except json.JSONDecodeError as exc:
         raise Phase5Error(f"the GoldenGate runtime ownership classifier produced unparseable output: {exc}") from exc
 
-    # Strict schema validation BEFORE anything is persisted -- application_found/footprint_found are never truthiness-coerced (bool("false") is True in Python), and an incomplete footprint_found can never be silently treated as "everything absent".
-    ownership_state, application_found, footprint_found = _validate_runtime_state_classifier_output(result)
+    # Strict schema validation BEFORE anything is persisted -- application_found/applicationset_found/footprint_found are never truthiness-coerced (bool("false") is True in Python), and an incomplete footprint_found can never be silently treated as "everything absent".
+    ownership_state, application_found, applicationset_found, footprint_found = _validate_runtime_state_classifier_output(result)
     if ownership_state == "BROKEN":
-        raise Phase5Error(f"GoldenGate runtime ownership-safety state for {deployment_id} is BROKEN -- an existing Argo CD Application/footprint does not clearly belong to this deployment (foreign or ambiguous ownership). Refusing to patch finalizers or delete anything.")
+        raise Phase5Error(f"GoldenGate runtime ownership-safety state for {deployment_id} is BROKEN -- an existing Argo CD ApplicationSet/Application/footprint does not clearly belong to this deployment (foreign or ambiguous ownership). Refusing to patch finalizers or delete anything.")
 
+    # Phase 5 Runtime Application Self-Healing: MIGRATION_CANDIDATE (a correctly-owned standalone Application with no runtime ApplicationSet yet) is exactly as safe to remove as OWNED -- there is simply no ApplicationSet to remove first, so cmd_remove_runtime below deletes only the standalone Application, matching this deployment's pre-feature removal behavior exactly.
     update_state(args.state_path, {
         "ownership_state": ownership_state,
         "application_found": application_found,
+        "applicationset_found": applicationset_found,
         "footprint_found": footprint_found,
     }, REMOVAL_ALLOWED_STATE_KEYS)
     if ownership_state == "ABSENT":
         print(f"Nothing exists for {deployment_id} -- the removal steps below will each independently no-op.")
     else:
-        print(f"{deployment_id} is OWNED -- safe to proceed with removal.")
+        print(f"{deployment_id} is {ownership_state} -- safe to proceed with removal (runtime ApplicationSet present: {applicationset_found}).")
 
 
 # Phase 5C, step 3: remove-runtime (AWS credentials required)
 
 def _validate_removal_mutation_state(state):
-    """Mutation-boundary defense in depth, applied BEFORE any cluster connection or mutating kubectl call: strict schema+semantic validation of the persisted removal state, so state-file corruption, an unexpected future producer regression, or a manually edited/malformed state file can never fall back on truthiness coercion (bool("false") is True in Python) to authorize an Argo CD Application patch/delete. Reuses the same canonical runtime_state.RUNTIME_FOOTPRINT_KEYS schema removal-preflight already enforces -- never a second, independently-drifting key list. Returns (ownership_state, application_found, argocd_app_name, argocd_namespace) only once every check has passed."""
+    """Mutation-boundary defense in depth, applied BEFORE any cluster connection or mutating kubectl call: strict schema+semantic validation of the persisted removal state, so state-file corruption, an unexpected future producer regression, or a manually edited/malformed state file can never fall back on truthiness coercion (bool("false") is True in Python) to authorize an Argo CD ApplicationSet/Application patch/delete. Reuses the same canonical runtime_state.RUNTIME_FOOTPRINT_KEYS schema removal-preflight already enforces -- never a second, independently-drifting key list. Returns (ownership_state, application_found, applicationset_found, argocd_app_name, argocd_namespace) only once every check has passed."""
     ownership_state = state.get("ownership_state")
-    if ownership_state not in ("ABSENT", "OWNED"):
-        raise Phase5Error(f"removal state ownership_state is {ownership_state!r}, expected ABSENT or OWNED -- refusing to mutate anything.")
+    if ownership_state not in ("ABSENT", "OWNED", "MIGRATION_CANDIDATE"):
+        raise Phase5Error(f"removal state ownership_state is {ownership_state!r}, expected ABSENT, OWNED, or MIGRATION_CANDIDATE -- refusing to mutate anything.")
 
     application_found = state.get("application_found")
     if not isinstance(application_found, bool):
         raise Phase5Error(f"removal state application_found is {application_found!r} ({type(application_found).__name__}), expected a literal boolean -- refusing to mutate anything.")
+
+    applicationset_found = state.get("applicationset_found")
+    if not isinstance(applicationset_found, bool):
+        raise Phase5Error(f"removal state applicationset_found is {applicationset_found!r} ({type(applicationset_found).__name__}), expected a literal boolean -- refusing to mutate anything.")
 
     footprint_found = state.get("footprint_found")
     if not isinstance(footprint_found, dict):
@@ -1868,8 +1928,11 @@ def _validate_removal_mutation_state(state):
         if not isinstance(value, bool):
             raise Phase5Error(f"removal state footprint_found[{key!r}] is {value!r} ({type(value).__name__}), expected a literal boolean -- refusing to mutate anything.")
 
-    if ownership_state == "ABSENT" and application_found:
-        raise Phase5Error("removal state is internally inconsistent (ownership_state=ABSENT but application_found=true) -- refusing to mutate anything.")
+    if ownership_state == "ABSENT" and (application_found or applicationset_found):
+        raise Phase5Error("removal state is internally inconsistent (ownership_state=ABSENT but application_found/applicationset_found=true) -- refusing to mutate anything.")
+
+    if ownership_state == "MIGRATION_CANDIDATE" and applicationset_found:
+        raise Phase5Error("removal state is internally inconsistent (ownership_state=MIGRATION_CANDIDATE but applicationset_found=true -- MIGRATION_CANDIDATE means no ApplicationSet exists yet) -- refusing to mutate anything.")
 
     argocd_app_name = state.get("argocd_app_name")
     if not isinstance(argocd_app_name, str) or not argocd_app_name:
@@ -1879,7 +1942,7 @@ def _validate_removal_mutation_state(state):
     if not isinstance(argocd_namespace, str) or not argocd_namespace:
         raise Phase5Error(f"removal state argocd_namespace is {argocd_namespace!r}, expected a non-empty string -- refusing to mutate anything.")
 
-    return ownership_state, application_found, argocd_app_name, argocd_namespace
+    return ownership_state, application_found, applicationset_found, argocd_app_name, argocd_namespace
 
 
 def cmd_remove_runtime(args):
@@ -1887,42 +1950,54 @@ def cmd_remove_runtime(args):
     deployment_id = require_deployment_id_arg(args.deployment_id)
     state = load_state(args.state_path)
 
-    # Both validated BEFORE any cluster connection or mutating call is ever issued -- a malformed OR cross-runtime state file results in ZERO Kubernetes calls: static identity binding (environment/deployment_id/canonical Application name/canonical Argo+runtime namespaces/deployment model/reason/efs_mode), extended (never replaced) by the already-approved ownership/application_found/footprint schema check.
+    # Both validated BEFORE any cluster connection or mutating call is ever issued -- a malformed OR cross-runtime state file results in ZERO Kubernetes calls: static identity binding (environment/deployment_id/canonical Application name/canonical Argo+runtime namespaces/deployment model/reason/efs_mode), extended (never replaced) by the already-approved ownership/application_found/applicationset_found/footprint schema check.
     _validate_removal_state_identity(state, environment, deployment_id)
-    ownership_state, application_found, _state_argocd_app_name, _state_argocd_namespace = _validate_removal_mutation_state(state)
+    ownership_state, application_found, applicationset_found, _state_argocd_app_name, _state_argocd_namespace = _validate_removal_mutation_state(state)
 
     # Only the freshly-recomputed canonical values are ever used for the mutation target itself -- never merely the (already-proven-matching) state-sourced copies.
     argocd_app_name = _canonical_argocd_app_name(environment, deployment_id)
+    argocd_appset_name = _canonical_appset_name(environment, deployment_id)
     argocd_namespace = require_env("ARGOCD_NAMESPACE")
 
-    # Uses removal-preflight's own already-authoritative checks.application_found -- never a second, redundant "kubectl get application" to decide absence. If preflight already proved the Application absent, this step no-ops without touching the cluster at all.
-    if not application_found:
-        print(f"Argo CD Application {argocd_app_name} was not found by the removal-preflight classifier -- nothing to delete (no redundant re-inspection performed).")
+    if not application_found and not applicationset_found:
+        print(f"Neither Argo CD ApplicationSet {argocd_appset_name} nor Application {argocd_app_name} were found by the removal-preflight classifier -- nothing to delete (no redundant re-inspection performed).")
         return
 
     _connect_to_eks()
 
-    patch_proc = run(["kubectl", "patch", "application", argocd_app_name, "-n", argocd_namespace, "--type", "merge",
-                       "-p", json.dumps({"metadata": {"finalizers": ["resources-finalizer.argocd.argoproj.io"]}})], check=False)
-    if patch_proc.returncode != 0:
-        raise Phase5Error(f"failed to patch finalizers on Argo CD Application {argocd_app_name}: {((patch_proc.stderr or '') + (patch_proc.stdout or '')).strip()}")
+    # Phase 5 Runtime Application Self-Healing removal ordering: the runtime ApplicationSet's OWN ownership of this runtime is removed BEFORE the generated child Application is touched -- deleting the ApplicationSet first guarantees the controller can never recreate the child in the window between deleting the child and deleting its owner. Uses removal-preflight's own already-authoritative checks.applicationset_found -- never a second, redundant "kubectl get applicationset" to decide absence.
+    if applicationset_found:
+        delete_appset_proc = run(["kubectl", "delete", "applicationset", argocd_appset_name, "-n", argocd_namespace, "--wait=true", "--timeout=5m"], check=False)
+        if delete_appset_proc.returncode != 0:
+            raise Phase5Error(f"failed to delete Argo CD ApplicationSet {argocd_appset_name}: {((delete_appset_proc.stderr or '') + (delete_appset_proc.stdout or '')).strip()}")
+        print(f"Argo CD ApplicationSet {argocd_appset_name} deleted -- self-healing ownership of {deployment_id} removed before its generated Application is touched.")
 
-    delete_proc = run(["kubectl", "delete", "application", argocd_app_name, "-n", argocd_namespace, "--wait=true", "--timeout=10m"], check=False)
-    if delete_proc.returncode != 0:
-        raise Phase5Error(f"failed to delete Argo CD Application {argocd_app_name}: {((delete_proc.stderr or '') + (delete_proc.stdout or '')).strip()}")
+    # Uses removal-preflight's own already-authoritative checks.application_found -- never a second, redundant "kubectl get application" to decide absence. If preflight already proved the Application absent (already cascade-deleted by the ApplicationSet removal above, or never existed for a fresh/ABSENT runtime), this step no-ops without touching the cluster at all. If preflight proved it present, it is explicitly patched+deleted here regardless of whether the ApplicationSet's own owner-reference cascade already removed it -- kubectl delete on an already-gone resource is a normal, tolerated NotFound, never treated as this step's own failure, since the ApplicationSet deletion above is the sole authority for "self-healing ownership removed", not this delete's exit code.
+    if application_found:
+        patch_proc = run(["kubectl", "patch", "application", argocd_app_name, "-n", argocd_namespace, "--type", "merge",
+                           "-p", json.dumps({"metadata": {"finalizers": ["resources-finalizer.argocd.argoproj.io"]}})], check=False)
+        if patch_proc.returncode != 0 and "(NotFound)" not in (patch_proc.stderr or ""):
+            raise Phase5Error(f"failed to patch finalizers on Argo CD Application {argocd_app_name}: {((patch_proc.stderr or '') + (patch_proc.stdout or '')).strip()}")
 
-    print(f"Argo CD Application {argocd_app_name} deleted. Argo CD will cascade-delete its managed resources.")
+        delete_proc = run(["kubectl", "delete", "application", argocd_app_name, "-n", argocd_namespace, "--wait=true", "--timeout=10m"], check=False)
+        if delete_proc.returncode != 0 and "(NotFound)" not in (delete_proc.stderr or ""):
+            raise Phase5Error(f"failed to delete Argo CD Application {argocd_app_name}: {((delete_proc.stderr or '') + (delete_proc.stdout or '')).strip()}")
+        print(f"Argo CD Application {argocd_app_name} deleted. Argo CD will cascade-delete its managed resources.")
+
     print("The shared runtime namespace is never deleted by this workflow -- singleRuntime does not own it. The retained /u02 PersistentVolumeClaim (Prune=false), any EFS filesystem, and Secrets Manager secrets are never deleted here either.")
 
 
 # Phase 5C, step 4: post-delete-acceptance (AWS credentials required)
 
 def _post_delete_positively_absent(result, retained_pvc_expected):
-    """Positive structural AND semantic proof of runtime-compute absence -- NEVER merely `state != BROKEN` (an OWNED state can legitimately mean the Application still exists and is correctly owned, which must NOT be accepted as deletion-complete), and NEVER inferred from a malformed/incomplete classifier shape (see _validate_runtime_state_classifier_output, the structural layer this function builds on). After structural validation, exactly two semantic shapes are ever accepted as deletion-complete: (1) state=ABSENT with every canonical footprint key false, or (2) state=OWNED with application_found=false, retained_pvc_expected=true, footprint["pvc"]=true, and every other footprint key false (the classifier has already proven the retained PVC belongs to this exact deployment) -- every other shape, including OWNED with zero footprint and ABSENT with any footprint present, fails."""
+    """Positive structural AND semantic proof of runtime-compute absence -- NEVER merely `state != BROKEN` (an OWNED state can legitimately mean the Application/ApplicationSet still exist and are correctly owned, which must NOT be accepted as deletion-complete), and NEVER inferred from a malformed/incomplete classifier shape (see _validate_runtime_state_classifier_output, the structural layer this function builds on). Requires applicationset_found=false unconditionally -- a dangling ApplicationSet left behind by an incomplete removal would defeat the entire point of removing self-healing ownership before intentional deletion, regardless of what state/footprint otherwise look like. After structural validation, exactly two semantic shapes are ever accepted as deletion-complete: (1) state=ABSENT with every canonical footprint key false, or (2) state=OWNED with application_found=false, retained_pvc_expected=true, footprint["pvc"]=true, and every other footprint key false (the classifier has already proven the retained PVC belongs to this exact deployment) -- every other shape, including OWNED with zero footprint, ABSENT with any footprint present, and MIGRATION_CANDIDATE (which can only occur when application_found=true, already rejected below), fails."""
     try:
-        state, application_found, footprint_found = _validate_runtime_state_classifier_output(result)
+        state, application_found, applicationset_found, footprint_found = _validate_runtime_state_classifier_output(result)
     except Phase5Error as exc:
         return False, str(exc)
+
+    if applicationset_found:
+        return False, "applicationset_found is not confirmed false"
 
     if application_found:
         return False, "application_found is not confirmed false"
@@ -1943,7 +2018,7 @@ def _post_delete_positively_absent(result, retained_pvc_expected):
             return False, "OWNED state without a retained PVC present is not a recognized deletion-complete shape"
         return True, None
 
-    # state == "BROKEN" -- the only remaining value the structural validator allows -- is never a recognized deletion-complete shape, regardless of footprint content.
+    # state == "BROKEN" here (MIGRATION_CANDIDATE is structurally impossible to reach this far -- it requires application_found=true, already rejected above) is never a recognized deletion-complete shape, regardless of footprint content.
     present = sorted(key for key, value in footprint_found.items() if value)
     return (False, f"classifier state is BROKEN (footprint still present: {present})") if present else (False, "classifier state is BROKEN")
 

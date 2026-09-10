@@ -119,6 +119,22 @@ def _app_obj(healthy=True, repo_url=None, dest_ns=RUNTIME_NAMESPACE, release_nam
     }
 
 
+def _appset_obj(app_name=APP_NAME, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, dest_ns=RUNTIME_NAMESPACE, repo_url=None):
+    """A correctly-owned runtime ApplicationSet -- spec.template mirrors _build_runtime_applicationset_manifest()'s own shape (template.metadata.name/spec.destination.namespace/spec.source.repoURL), never a second, independently-invented shape."""
+    return {
+        "metadata": {"labels": {"goldengate.adcb/environment": environment, "goldengate.adcb/deployment-id": deployment_id}},
+        "spec": {
+            "template": {
+                "metadata": {"name": app_name},
+                "spec": {
+                    "source": {"repoURL": repo_url if repo_url is not None else f"oci://{ECR_REGISTRY}/{runtime_acceptance.HELM_REPO_PATH}"},
+                    "destination": {"namespace": dest_ns},
+                },
+            },
+        },
+    }
+
+
 def _pod_volumes(u02_claim_name="default", u02_empty_dir=False, u03_empty_dir=True,
                   include_admin_csi=True, admin_driver="secrets-store.csi.k8s.io", admin_spc="default", admin_read_only=True,
                   include_certificate_csi=True, certificate_driver="secrets-store.csi.k8s.io", certificate_spc="default", certificate_read_only=True,
@@ -296,6 +312,7 @@ def _ingress_obj(host=None, group_name=ALB_GROUP_NAME, group_order="112", cert_a
 
 
 def _populate_healthy_cluster(cluster):
+    cluster.put("applicationset", f"{APP_NAME}-appset", ARGOCD_NAMESPACE, _appset_obj())
     cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
     cluster.put("statefulset", DEPLOYMENT_ID, RUNTIME_NAMESPACE, _sts_obj())
     cluster.put("storageclass", SC_NAME, None, _storageclass_obj())
@@ -341,6 +358,21 @@ class RuntimeAcceptanceClassifierTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
         self.assertTrue(any("does not exist" in r and "Application" in r for r in result["reasons"]))
+
+    def test_2b_applicationset_missing_is_broken_even_when_child_application_is_healthy(self):
+        # Phase 5 Runtime Application Self-Healing (required test case 17): "ApplicationSet exists" is never accepted as runtime health on its own, but the converse must also hold -- a Synced/Healthy child Application is never accepted as runtime health when its OWNING ApplicationSet is missing (e.g. an operator deleted the ApplicationSet directly, or a pre-migration standalone Application never got one at all).
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.objects.pop(("applicationset", f"{APP_NAME}-appset", ARGOCD_NAMESPACE))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
+        self.assertTrue(any("ApplicationSet" in r and "does not exist" in r for r in result["reasons"]))
+
+    def test_2c_applicationset_foreign_label_is_broken_even_when_child_application_is_healthy(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("applicationset", f"{APP_NAME}-appset", ARGOCD_NAMESPACE, _appset_obj(deployment_id="gg-some-other-deployment"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
+        self.assertTrue(any("ApplicationSet" in r and "goldengate.adcb/deployment-id" in r for r in result["reasons"]))
 
     def test_3_application_not_synced_is_broken(self):
         cluster = _populate_healthy_cluster(FakeCluster())
@@ -966,6 +998,18 @@ class RuntimeAcceptanceExternalClaimTests(unittest.TestCase):
 
     def _populate(self, cluster, claim_name=EXTERNAL_CLAIM_NAME):
         app_name = EXTERNAL_CLAIM_APP_NAME
+        cluster.put("applicationset", f"{app_name}-appset", ARGOCD_NAMESPACE, {
+            "metadata": {"labels": {"goldengate.adcb/environment": ENVIRONMENT, "goldengate.adcb/deployment-id": EXTERNAL_CLAIM_DEPLOYMENT_ID}},
+            "spec": {
+                "template": {
+                    "metadata": {"name": app_name},
+                    "spec": {
+                        "source": {"repoURL": f"oci://{ECR_REGISTRY}/{runtime_acceptance.HELM_REPO_PATH}"},
+                        "destination": {"namespace": RUNTIME_NAMESPACE},
+                    },
+                },
+            },
+        })
         cluster.put("application", app_name, ARGOCD_NAMESPACE, {
             "metadata": {"labels": {"goldengate.adcb/environment": ENVIRONMENT, "goldengate.adcb/deployment-id": EXTERNAL_CLAIM_DEPLOYMENT_ID}},
             "status": {"sync": {"status": "Synced"}, "health": {"status": "Healthy"}},

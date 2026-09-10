@@ -92,10 +92,45 @@ def _app_suffix(deployment_id):
     return deployment_id
 
 
+def _appset_name(app_name):
+    """ONE canonical ApplicationSet name derivation -- always <application-name>-appset, mirrored (never imported, matching this file's existing self-contained convention already used for _app_suffix/app_name) by automation/phases/phase5/runtime_state.py's own _appset_name() and automation/phases/phase5/phase5_runtime.py's own _canonical_appset_name(); test_phase5_runtime.py::ApplicationSetNamingDriftTests proves all three agree for every current real deployment ID."""
+    return f"{app_name}-appset"
+
+
+def _check_applicationset(run, reasons, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry, app_name):
+    """Phase 5 Runtime Application Self-Healing: an enabled runtime is not accepted as healthy merely because its generated child Application is Synced/Healthy -- the runtime's OWN ApplicationSet must also exist and be correctly owned, or the self-healing guarantee this feature exists to provide is not actually in place, even if the child happens to be healthy right now (e.g. immediately after a one-time migration that has not yet been proven, or after an operator deleted the ApplicationSet directly). Never accepts "ApplicationSet exists" alone as runtime health -- this check is always run alongside, never instead of, _check_application's own Synced/Healthy verification below."""
+    appset_name = _appset_name(app_name)
+    expected_repo_url = f"oci://{ecr_registry}/{HELM_REPO_PATH}"
+
+    found, obj = get_json(run, "applicationset", appset_name, argocd_namespace)
+    if not found:
+        reasons.append(f"ApplicationSet {appset_name} does not exist in {argocd_namespace}")
+        return
+
+    labels = (obj.get("metadata") or {}).get("labels") or {}
+    if labels.get("goldengate.adcb/environment") != environment:
+        reasons.append(f"ApplicationSet {appset_name} label goldengate.adcb/environment={labels.get('goldengate.adcb/environment')!r}, expected {environment!r}")
+    if labels.get("goldengate.adcb/deployment-id") != deployment_id:
+        reasons.append(f"ApplicationSet {appset_name} label goldengate.adcb/deployment-id={labels.get('goldengate.adcb/deployment-id')!r}, expected {deployment_id!r}")
+
+    template = ((obj.get("spec") or {}).get("template")) or {}
+    template_metadata = template.get("metadata") or {}
+    template_spec = template.get("spec") or {}
+
+    if template_metadata.get("name") != app_name:
+        reasons.append(f"ApplicationSet {appset_name} spec.template.metadata.name={template_metadata.get('name')!r}, expected {app_name!r}")
+    if ((template_spec.get("destination") or {})).get("namespace") != runtime_namespace:
+        reasons.append(f"ApplicationSet {appset_name} spec.template.spec.destination.namespace={((template_spec.get('destination') or {})).get('namespace')!r}, expected {runtime_namespace!r}")
+    if ((template_spec.get("source") or {})).get("repoURL") != expected_repo_url:
+        reasons.append(f"ApplicationSet {appset_name} spec.template.spec.source.repoURL={((template_spec.get('source') or {})).get('repoURL')!r}, expected {expected_repo_url!r}")
+
+
 def _check_application(run, reasons, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry):
     app_suffix = _app_suffix(deployment_id)
     app_name = f"goldengate-{environment}-{app_suffix}"
     expected_repo_url = f"oci://{ecr_registry}/{HELM_REPO_PATH}"
+
+    _check_applicationset(run, reasons, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry, app_name)
 
     found, obj = get_json(run, "application", app_name, argocd_namespace)
     if not found:

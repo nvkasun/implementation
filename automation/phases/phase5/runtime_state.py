@@ -76,6 +76,8 @@ def describe_deployment(environment, deployment_id):
 STATE_ABSENT = "ABSENT"
 STATE_OWNED = "OWNED"
 STATE_BROKEN = "BROKEN"
+# Phase 5 Runtime Application Self-Healing: an existing, correctly-owned STANDALONE Application (no runtime ApplicationSet yet) is never silently folded into OWNED -- OWNED means "the ApplicationSet-owned self-healing shape is already in place", which a pre-feature standalone Application is not. MIGRATION_CANDIDATE is a distinct, explicit fourth state so callers must handle the one-time migration deliberately (create the runtime's ApplicationSet with a generated child spec proven byte-for-byte equal to the existing standalone Application) rather than proceeding as if nothing needs to change.
+STATE_MIGRATION_CANDIDATE = "MIGRATION_CANDIDATE"
 
 # Current Helm/main-workflow naming contract (helm/goldengate/templates/_helpers.tpl, 00-main-goldengate-orchestrator.yaml) -- verified against the real vendored chart, never guessed.
 HELM_REPO_PATH = "helm/goldengate"
@@ -97,6 +99,11 @@ def _app_suffix(deployment_id):
     if deployment_id.startswith("gg-"):
         return deployment_id[len("gg-"):]
     return deployment_id
+
+
+def _appset_name(app_name):
+    """ONE canonical ApplicationSet name derivation -- always <application-name>-appset, mirrored (never imported, matching this file's existing self-contained convention already used for _app_suffix/app_name) by automation/phases/phase5/phase5_runtime.py's _canonical_appset_name() and automation/phases/phase5/runtime_acceptance.py's own copy; a dedicated drift test in automation/phases/phase5/tests/test_phase5_runtime.py proves all three agree."""
+    return f"{app_name}-appset"
 
 
 def _expected_footprint_names(environment, deployment_id, runtime_namespace):
@@ -148,8 +155,69 @@ def _ownership_reason(resource_label, obj, environment, deployment_id):
     return None
 
 
+def _check_application_ownership(app_obj, app_name, environment, deployment_id, runtime_namespace, expected_repo_url):
+    """Factored out of classify() so both the no-ApplicationSet path (a still-present standalone Application) and the ApplicationSet-owned path (verifying its generated child) run the exact same Application-identity checks -- never two independently-drifting copies. Returns a list of reason strings (empty means the Application's own identity is fully compatible with this deployment); deliberately never checks status.sync.status/status.health.status/spec.source.targetRevision here -- this remains a pre-reconciliation ownership-safety check, not a readiness classifier."""
+    reasons = []
+    labels = ((app_obj.get("metadata") or {}).get("labels")) or {}
+    actual_env_label = labels.get("goldengate.adcb/environment")
+    actual_id_label = labels.get("goldengate.adcb/deployment-id")
+    if actual_env_label != environment:
+        reasons.append(f"Application {app_name} label goldengate.adcb/environment={actual_env_label!r}, expected {environment!r}")
+    if actual_id_label != deployment_id:
+        reasons.append(f"Application {app_name} label goldengate.adcb/deployment-id={actual_id_label!r}, expected {deployment_id!r}")
+
+    spec = app_obj.get("spec") or {}
+    destination = spec.get("destination") or {}
+    source = spec.get("source") or {}
+    helm_source = source.get("helm") or {}
+
+    actual_dest_ns = destination.get("namespace")
+    if actual_dest_ns != runtime_namespace:
+        reasons.append(f"Application {app_name} destination.namespace={actual_dest_ns!r}, expected {runtime_namespace!r}")
+
+    actual_repo_url = source.get("repoURL")
+    if actual_repo_url != expected_repo_url:
+        reasons.append(f"Application {app_name} source.repoURL={actual_repo_url!r}, expected {expected_repo_url!r}")
+
+    actual_release_name = helm_source.get("releaseName")
+    if actual_release_name != deployment_id:
+        reasons.append(f"Application {app_name} source.helm.releaseName={actual_release_name!r}, expected {deployment_id!r}")
+
+    return reasons
+
+
+def _check_applicationset_ownership(appset_obj, appset_name, app_name, environment, deployment_id, runtime_namespace, expected_repo_url):
+    """Verifies the runtime ApplicationSet itself is genuinely this deployment's own -- expected name (via the caller), namespace label match, environment/deployment-id labels, and (where visible) the generated-Application identity/destination/repo declared inside spec.template -- never merely "an ApplicationSet with this name exists". A foreign/mislabeled ApplicationSet, or one whose template would generate a DIFFERENT Application than this deployment's own canonical name/namespace/repo, is BROKEN, exactly like a foreign standalone Application always has been."""
+    reasons = []
+    labels = ((appset_obj.get("metadata") or {}).get("labels")) or {}
+    actual_env_label = labels.get("goldengate.adcb/environment")
+    actual_id_label = labels.get("goldengate.adcb/deployment-id")
+    if actual_env_label != environment:
+        reasons.append(f"ApplicationSet {appset_name} label goldengate.adcb/environment={actual_env_label!r}, expected {environment!r}")
+    if actual_id_label != deployment_id:
+        reasons.append(f"ApplicationSet {appset_name} label goldengate.adcb/deployment-id={actual_id_label!r}, expected {deployment_id!r}")
+
+    template = ((appset_obj.get("spec") or {}).get("template")) or {}
+    template_metadata = template.get("metadata") or {}
+    template_spec = template.get("spec") or {}
+
+    actual_template_name = template_metadata.get("name")
+    if actual_template_name != app_name:
+        reasons.append(f"ApplicationSet {appset_name} spec.template.metadata.name={actual_template_name!r}, expected {app_name!r}")
+
+    actual_template_dest_ns = ((template_spec.get("destination") or {})).get("namespace")
+    if actual_template_dest_ns != runtime_namespace:
+        reasons.append(f"ApplicationSet {appset_name} spec.template.spec.destination.namespace={actual_template_dest_ns!r}, expected {runtime_namespace!r}")
+
+    actual_template_repo_url = ((template_spec.get("source") or {})).get("repoURL")
+    if actual_template_repo_url != expected_repo_url:
+        reasons.append(f"ApplicationSet {appset_name} spec.template.spec.source.repoURL={actual_template_repo_url!r}, expected {expected_repo_url!r}")
+
+    return reasons
+
+
 def classify(run, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry, retained_pvc_expected=False):
-    """Returns the stable {"state", "environment", "deployment_id", "namespace", "reasons", "checks"} shape. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT. Raises ValueError if the folder-driven model itself is inconsistent (invalid descriptors/cross-descriptor problems elsewhere) -- a configuration error, never ABSENT/OWNED/BROKEN cluster state. retained_pvc_expected (default False, byte-for-byte unchanged default behavior) is an OPTIONAL, EXPLICIT deletion-context hint for Phase 5C removal callers only: when the deployment's own descriptor still exists, "Application absent + only the retained PVC" is already recognized as safe via declares_chart_owned_persistence below and this hint changes nothing; it matters only for a PHYSICALLY REMOVED descriptor (no envs/<environment>/<deployment_id>/values.yaml exists any more), where declares_chart_owned_persistence can never be computed -- when the caller has independently validated (from a Phase 1 deletion_matrix entry) that the prior valid descriptor declared EFS persistence, passing retained_pvc_expected=True lets this classifier recognize the same "Application absent, ONLY the retained PVC exists" shape as safe, while the PVC's own ownership labels are still verified unconditionally below regardless of this hint -- a foreign/mislabeled PVC under the expected name is never silently adopted."""
+    """Returns the stable {"state", "environment", "deployment_id", "namespace", "reasons", "checks"} shape, state one of ABSENT/OWNED/BROKEN/MIGRATION_CANDIDATE. Raises ClassifierInspectionError if Kubernetes access itself could not be trusted -- callers must let that propagate as a hard failure, never a downgrade to ABSENT. Raises ValueError if the folder-driven model itself is inconsistent (invalid descriptors/cross-descriptor problems elsewhere) -- a configuration error, never a cluster state. retained_pvc_expected (default False, byte-for-byte unchanged default behavior) is an OPTIONAL, EXPLICIT deletion-context hint for Phase 5C removal callers only: when the deployment's own descriptor still exists, "Application absent + only the retained PVC" is already recognized as safe via declares_chart_owned_persistence below and this hint changes nothing; it matters only for a PHYSICALLY REMOVED descriptor (no envs/<environment>/<deployment_id>/values.yaml exists any more), where declares_chart_owned_persistence can never be computed -- when the caller has independently validated (from a Phase 1 deletion_matrix entry) that the prior valid descriptor declared EFS persistence, passing retained_pvc_expected=True lets this classifier recognize the same "Application absent, ONLY the retained PVC exists" shape as safe, while the PVC's own ownership labels are still verified unconditionally below regardless of this hint -- a foreign/mislabeled PVC under the expected name is never silently adopted. Phase 5 Runtime Application Self-Healing: the runtime ApplicationSet is now the PRIMARY ownership signal -- when it exists and is correctly owned (_check_applicationset_ownership passes), the generated child Application's own absence is a RECOVERABLE OWNED state (the ApplicationSet controller is expected to recreate it on its own, so this classifier must never treat "Application absent, ApplicationSet owns it" as an orphan-footprint BROKEN condition the way it always has for a bare standalone Application); when the ApplicationSet is absent but a standalone Application exists and passes the exact same ownership checks a real OWNED Application always has, that is MIGRATION_CANDIDATE, not OWNED -- a caller must explicitly perform the one-time migration (create the ApplicationSet with a generated child spec proven byte-for-byte equal to the existing Application) rather than treating "nothing to do" as the safe interpretation; a foreign/mislabeled ApplicationSet, or a foreign child Application existing under the expected name despite a correctly-owned ApplicationSet, both remain BROKEN, exactly as a foreign standalone Application always has been."""
     # Confirms the folder-driven model is internally consistent before any cluster call -- fails closed if ANY descriptor in the environment is invalid, the same guard the reconcile path already relies on. Deliberately does NOT require THIS deployment_id's own descriptor to still be present: this classifier is also reused for a PHYSICALLY REMOVED descriptor's leftover live resources (GoldenGate Runtime Presence Contract Finalization -- ownership-safe delete, deletion_matrix reason=physical-removal), where by design no envs/<environment>/<deployment_id>/values.yaml exists any more; the caller (delete_removed_argocd_applications) already independently proved this ID was a genuine GoldenGate deployment before it ever reached this classifier.
     descriptor = None
     try:
@@ -160,10 +228,14 @@ def classify(run, environment, deployment_id, argocd_namespace, runtime_namespac
 
     app_suffix = _app_suffix(deployment_id)
     app_name = f"goldengate-{environment}-{app_suffix}"
+    appset_name = _appset_name(app_name)
     expected_repo_url = f"oci://{ecr_registry}/{HELM_REPO_PATH}"
 
     reasons = []
     checks = {}
+
+    appset_found, appset_obj = get_json(run, "applicationset", appset_name, argocd_namespace)
+    checks["applicationset_found"] = appset_found
 
     app_found, app_obj = get_json(run, "application", app_name, argocd_namespace)
     checks["application_found"] = app_found
@@ -177,51 +249,43 @@ def classify(run, environment, deployment_id, argocd_namespace, runtime_namespac
 
     any_footprint_found = any(found for found, _obj in footprint.values())
 
-    # ABSENT: no owning Application and no meaningful expected-name footprint at all -- safe to create from nothing. Any one of these existing without the Application means this classifier must not silently adopt orphaned/partial state.
-    if not app_found and not any_footprint_found:
+    # ABSENT: no ApplicationSet, no owning Application, and no meaningful expected-name footprint at all -- safe to create from nothing.
+    if not appset_found and not app_found and not any_footprint_found:
         return {"state": STATE_ABSENT, "environment": environment, "deployment_id": deployment_id, "namespace": runtime_namespace, "reasons": [], "checks": checks}
 
-    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: the u02 PVC is intentionally retained across Application deletion (Prune=false, see helm/goldengate/templates/runtime-pvc.yaml) -- "Application absent, ONLY the retained PVC exists" is the expected, SAFE shape of a disabled-then-re-enableable runtime, never an unexplained orphan on its own. Every OTHER compute/workload footprint kind (StatefulSet/Service/headless Service/StorageClass/SecretProviderClasses/admin Secret) is still pruned/cascade-deleted as normal and remains exactly as unsafe as before when found without an owning Application. "Chart-owned" persistence means the descriptor both declares EFS persistence (efsMode is not None) AND the chart actually creates its own PVC rather than referencing a pre-existing one via runtime.storage.u02.existingClaim (pvcClaimName empty) -- the SAME condition helm/goldengate/templates/runtime-pvc.yaml itself renders on.
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: the u02 PVC is intentionally retained across Application deletion (Prune=false, see helm/goldengate/templates/runtime-pvc.yaml) -- "Application absent, ONLY the retained PVC exists" is the expected, SAFE shape of a disabled-then-re-enableable runtime, never an unexplained orphan on its own. Every OTHER compute/workload footprint kind (StatefulSet/Service/headless Service/StorageClass/SecretProviderClasses/admin Secret) is still pruned/cascade-deleted as normal and remains exactly as unsafe as before when found without an owning Application AND without an owning ApplicationSet. "Chart-owned" persistence means the descriptor both declares EFS persistence (efsMode is not None) AND the chart actually creates its own PVC rather than referencing a pre-existing one via runtime.storage.u02.existingClaim (pvcClaimName empty) -- the SAME condition helm/goldengate/templates/runtime-pvc.yaml itself renders on.
     declares_chart_owned_persistence = bool(descriptor and descriptor.get("efsMode") and not descriptor.get("pvcClaimName"))
     pvc_found, _pvc_obj = footprint[_PVC_KIND]
     non_pvc_footprint_found = any(found for label, (found, _obj) in footprint.items() if label != _PVC_KIND)
 
-    if not app_found:
-        if non_pvc_footprint_found:
-            owned_names = [label for label, (found, _obj) in footprint.items() if found and label != _PVC_KIND]
-            reasons.append(f"Application {app_name} does not exist in {argocd_namespace} but expected-name runtime resource(s) already exist: {owned_names!r}")
-        elif pvc_found and not declares_chart_owned_persistence and not retained_pvc_expected:
-            reasons.append(f"Application {app_name} does not exist in {argocd_namespace} but a retained persistence PVC exists although this deployment's descriptor does not declare chart-owned EFS persistence -- not the recognized retained-persistence footprint, treated as an unexplained orphan")
-        # else: Application absent, ONLY the retained PVC exists, and either this deployment's descriptor legitimately declares chart-owned EFS persistence OR the caller passed the explicit retained_pvc_expected hint (a physically-removed descriptor whose prior valid revision declared EFS persistence, per a validated Phase 1 deletion_matrix entry) -- the recognized "disabled/removed runtime, durable /u02 data retained for a future re-enable" shape. Its own ownership labels are still verified unconditionally below, exactly like every other footprint kind -- a foreign/mislabeled PVC under the expected name is never silently adopted.
-    else:
-        labels = ((app_obj.get("metadata") or {}).get("labels")) or {}
-        actual_env_label = labels.get("goldengate.adcb/environment")
-        actual_id_label = labels.get("goldengate.adcb/deployment-id")
-        if actual_env_label != environment:
-            reasons.append(f"Application {app_name} label goldengate.adcb/environment={actual_env_label!r}, expected {environment!r}")
-        if actual_id_label != deployment_id:
-            reasons.append(f"Application {app_name} label goldengate.adcb/deployment-id={actual_id_label!r}, expected {deployment_id!r}")
+    appset_owned = False
+    if appset_found:
+        appset_reasons = _check_applicationset_ownership(appset_obj, appset_name, app_name, environment, deployment_id, runtime_namespace, expected_repo_url)
+        if appset_reasons:
+            # State #4: a foreign/mislabeled ApplicationSet exists under the expected name -- BROKEN regardless of anything else below; never silently ignored in favor of the (possibly absent) Application/footprint.
+            reasons.extend(appset_reasons)
+        else:
+            appset_owned = True
 
-        spec = app_obj.get("spec") or {}
-        destination = spec.get("destination") or {}
-        source = spec.get("source") or {}
-        helm_source = source.get("helm") or {}
+    if appset_owned:
+        # State #2/#3: the ApplicationSet itself is correctly owned. The generated child Application's presence/absence is verified, but its ABSENCE is a recoverable OWNED condition (the ApplicationSet controller is expected to recreate it), never an orphan-footprint BROKEN one -- this is the entire self-healing point of this feature. A child that DOES exist under the expected name must still be genuinely this deployment's own (State #7: a foreign/unrelated child under the expected name remains BROKEN).
+        if app_found:
+            reasons.extend(_check_application_ownership(app_obj, app_name, environment, deployment_id, runtime_namespace, expected_repo_url))
+        # Footprint ownership-label checks still apply unconditionally below; the "orphan non-PVC footprint without an owning Application" rule from the no-ApplicationSet path is deliberately NOT applied here -- a correctly-owned ApplicationSet is itself the authoritative ownership signal for any leftover-from-last-sync compute footprint while the child Application is being recreated.
+    elif not appset_found:
+        # No ApplicationSet at all: preserve the exact pre-feature ownership-safety behavior for the Application/footprint, with ONE addition -- a standalone Application that passes every existing ownership check is MIGRATION_CANDIDATE, never silently treated as the fully self-healing OWNED shape (State #6).
+        if not app_found:
+            if non_pvc_footprint_found:
+                owned_names = [label for label, (found, _obj) in footprint.items() if found and label != _PVC_KIND]
+                reasons.append(f"Application {app_name} does not exist in {argocd_namespace} but expected-name runtime resource(s) already exist: {owned_names!r}")
+            elif pvc_found and not declares_chart_owned_persistence and not retained_pvc_expected:
+                reasons.append(f"Application {app_name} does not exist in {argocd_namespace} but a retained persistence PVC exists although this deployment's descriptor does not declare chart-owned EFS persistence -- not the recognized retained-persistence footprint, treated as an unexplained orphan")
+            # else: Application and ApplicationSet both absent, ONLY the retained PVC exists, and either this deployment's descriptor legitimately declares chart-owned EFS persistence OR the caller passed the explicit retained_pvc_expected hint -- the recognized "disabled/removed runtime, durable /u02 data retained for a future re-enable" shape. Its own ownership labels are still verified unconditionally below, exactly like every other footprint kind -- a foreign/mislabeled PVC under the expected name is never silently adopted.
+        else:
+            reasons.extend(_check_application_ownership(app_obj, app_name, environment, deployment_id, runtime_namespace, expected_repo_url))
+    # else: appset_found but NOT appset_owned -- appset_reasons above already guarantees BROKEN; the Application/footprint are not independently re-classified in this branch.
 
-        actual_dest_ns = destination.get("namespace")
-        if actual_dest_ns != runtime_namespace:
-            reasons.append(f"Application {app_name} destination.namespace={actual_dest_ns!r}, expected {runtime_namespace!r}")
-
-        actual_repo_url = source.get("repoURL")
-        if actual_repo_url != expected_repo_url:
-            reasons.append(f"Application {app_name} source.repoURL={actual_repo_url!r}, expected {expected_repo_url!r}")
-
-        actual_release_name = helm_source.get("releaseName")
-        if actual_release_name != deployment_id:
-            reasons.append(f"Application {app_name} source.helm.releaseName={actual_release_name!r}, expected {deployment_id!r}")
-
-        # Deliberately NOT checked here: status.sync.status / status.health.status / spec.source.targetRevision. This is a pre-reconciliation ownership-safety classifier, not a readiness classifier -- an OutOfSync/Progressing/Degraded Application that otherwise clearly belongs to this deployment is exactly what MAIN is about to reconcile, not an ownership conflict. Post-reconciliation health is runtime_acceptance.py's job.
-
-    # Any expected-name resource that currently exists must carry compatible ownership, regardless of whether the Application itself was found -- this is what actually distinguishes a safe partial-OWNED footprint (this deployment's own prior partial rollout) from a foreign/orphaned collision.
+    # Any expected-name resource that currently exists must carry compatible ownership, regardless of whether the Application/ApplicationSet was found -- this is what actually distinguishes a safe partial-OWNED footprint (this deployment's own prior partial rollout) from a foreign/orphaned collision.
     for label, (found, obj) in footprint.items():
         if not found or label == _ADMIN_SECRET_KIND:
             continue
@@ -229,7 +293,16 @@ def classify(run, environment, deployment_id, argocd_namespace, runtime_namespac
         if reason:
             reasons.append(reason)
 
-    state = STATE_BROKEN if reasons else STATE_OWNED
+    # State resolution: any accumulated reason -> BROKEN, regardless of source (foreign ApplicationSet, foreign Application, foreign footprint). Otherwise: appset_owned -> OWNED (State #2/#3, the self-healing shape is already in place, including the recoverable "child temporarily missing" case); no ApplicationSet but a standalone Application was found clean -> MIGRATION_CANDIDATE (State #6); every other clean shape (no ApplicationSet, no Application, only a legitimately-retained PVC, or truly nothing) -> OWNED, matching this classifier's pre-feature behavior for those disabled/removed shapes.
+    if reasons:
+        state = STATE_BROKEN
+    elif appset_owned:
+        state = STATE_OWNED
+    elif not appset_found and app_found:
+        state = STATE_MIGRATION_CANDIDATE
+    else:
+        state = STATE_OWNED
+
     return {"state": state, "environment": environment, "deployment_id": deployment_id, "namespace": runtime_namespace, "reasons": reasons, "checks": checks}
 
 

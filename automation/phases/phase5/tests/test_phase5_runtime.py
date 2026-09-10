@@ -150,9 +150,9 @@ def _complete_footprint(**overrides):
     return footprint
 
 
-def _classifier_result(state, application_found, **footprint_overrides):
-    """A complete, schema-valid runtime_state.py classifier result shape."""
-    return {"state": state, "checks": {"application_found": application_found, "footprint_found": _complete_footprint(**footprint_overrides)}}
+def _classifier_result(state, application_found, applicationset_found=False, **footprint_overrides):
+    """A complete, schema-valid runtime_state.py classifier result shape. applicationset_found defaults to False -- every existing call site here exercises a layer other than ApplicationSet-aware ownership itself (ownership_preflight state handling, post-delete-absence proof, cross-runtime state binding), and False is the semantically correct value for all of them (in particular, post-delete-acceptance's own retained-PVC fixtures represent the real desired end-state where the ApplicationSet has already been removed)."""
+    return {"state": state, "checks": {"application_found": application_found, "applicationset_found": applicationset_found, "footprint_found": _complete_footprint(**footprint_overrides)}}
 
 
 def _canonical_argocd_app_name(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID):
@@ -1638,7 +1638,7 @@ class RemovalPreflightTests(TempStateCase):
     def test_31_incomplete_footprint_mapping_fails_before_mutation(self):
         scripted = ScriptedRun()
         scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps({"state": "ABSENT", "checks": {"application_found": False, "footprint_found": {"statefulset": False}}})))
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps({"state": "ABSENT", "checks": {"application_found": False, "applicationset_found": False, "footprint_found": {"statefulset": False}}})))
         with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
             with self.assertRaises(phase5_runtime.Phase5Error):
                 _run_quiet(phase5_runtime.cmd_removal_preflight, self.args)
@@ -1653,10 +1653,11 @@ class RemovalPreflightTests(TempStateCase):
 
 
 class RemoveRuntimeTests(TempStateCase):
-    def _set_state(self, ownership_state, application_found, footprint_found=None):
+    def _set_state(self, ownership_state, application_found, footprint_found=None, applicationset_found=False):
         phase5_runtime.update_state(self.state_path, {
             **_removal_state_fixture(),
             "ownership_state": ownership_state, "application_found": application_found,
+            "applicationset_found": applicationset_found,
             "footprint_found": _complete_footprint() if footprint_found is None else footprint_found,
         }, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
 
@@ -1743,9 +1744,10 @@ class ClassifierOutputSchemaTests(unittest.TestCase):
     """Issue 2: _validate_runtime_state_classifier_output() must never let a malformed/incomplete classifier shape be silently treated as "everything reads as absent"."""
 
     def test_11_complete_absent_classifier_result_passes_structural_schema(self):
-        state, application_found, footprint_found = phase5_runtime._validate_runtime_state_classifier_output(_classifier_result("ABSENT", False))
+        state, application_found, applicationset_found, footprint_found = phase5_runtime._validate_runtime_state_classifier_output(_classifier_result("ABSENT", False))
         self.assertEqual(state, "ABSENT")
         self.assertIs(application_found, False)
+        self.assertIs(applicationset_found, False)
         self.assertEqual(set(footprint_found), RUNTIME_FOOTPRINT_KEYS)
 
     def test_12_missing_checks_fails(self):
@@ -1835,13 +1837,20 @@ class ClassifierOutputSchemaTests(unittest.TestCase):
 class PostDeletePositiveProofTests(unittest.TestCase):
     def test_140_application_still_exists_state_owned_must_not_pass(self):
         """Confirmed reproduction of the current bug: Application exists, labels/destination/repoURL/releaseName all correct, classifier state=OWNED. `state != BROKEN` would incorrectly pass this -- the fixed positive-proof check must not."""
-        result = {"state": "OWNED", "checks": {"application_found": True, "footprint_found": {"statefulset": True, "service": True, "headless_service": True, "pvc": False, "storageclass": True, "admin_secretproviderclass": True, "certificate_secretproviderclass": True, "ingress": False, "admin_secret": True}}}
+        result = {"state": "OWNED", "checks": {"application_found": True, "applicationset_found": False, "footprint_found": {"statefulset": True, "service": True, "headless_service": True, "pvc": False, "storageclass": True, "admin_secretproviderclass": True, "certificate_secretproviderclass": True, "ingress": False, "admin_secret": True}}}
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=False)
         self.assertFalse(ok)
         self.assertIn("application_found", why)
 
+    def test_140b_applicationset_still_exists_must_not_pass(self):
+        # Phase 5 Runtime Application Self-Healing: a dangling ApplicationSet left behind by an incomplete removal must never be accepted as deletion-complete, even when the Application/footprint are otherwise fully absent -- it would immediately recreate the child.
+        result = {"state": "OWNED", "checks": {"application_found": False, "applicationset_found": True, "footprint_found": {"statefulset": False, "service": False, "headless_service": False, "pvc": True, "storageclass": False, "admin_secretproviderclass": False, "certificate_secretproviderclass": False, "ingress": False, "admin_secret": False}}}
+        ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=True)
+        self.assertFalse(ok)
+        self.assertIn("applicationset_found", why)
+
     def test_141_all_absent_no_pvc_passes(self):
-        result = {"state": "ABSENT", "checks": {"application_found": False, "footprint_found": {"statefulset": False, "service": False, "headless_service": False, "pvc": False, "storageclass": False, "admin_secretproviderclass": False, "certificate_secretproviderclass": False, "ingress": False, "admin_secret": False}}}
+        result = {"state": "ABSENT", "checks": {"application_found": False, "applicationset_found": False, "footprint_found": {"statefulset": False, "service": False, "headless_service": False, "pvc": False, "storageclass": False, "admin_secretproviderclass": False, "certificate_secretproviderclass": False, "ingress": False, "admin_secret": False}}}
         ok, why = phase5_runtime._post_delete_positively_absent(result, retained_pvc_expected=False)
         self.assertTrue(ok, why)
 
@@ -2149,7 +2158,7 @@ class RemovalMutationStateTests(TempStateCase):
     def _persist(self, **fields):
         base = {
             **_removal_state_fixture(),
-            "ownership_state": "OWNED", "application_found": True, "footprint_found": _complete_footprint(),
+            "ownership_state": "OWNED", "application_found": True, "applicationset_found": False, "footprint_found": _complete_footprint(),
         }
         base.update(fields)
         phase5_runtime.update_state(self.state_path, base, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
@@ -2391,8 +2400,11 @@ class CrossRuntimeReconcileStateTests(unittest.TestCase):
             self.assertEqual(len(apply_calls), 1)
             self.assertEqual(len(annotate_calls), 1)
             import yaml as _yaml
+            # Phase 5 Runtime Application Self-Healing: reconciliation now applies the runtime's ApplicationSet, never a bare Application -- its OWN name is the canonical Application name plus "-appset", and its spec.template is the exact generated-child shape (metadata.name is the canonical Application name).
             manifest = _yaml.safe_load(apply_calls[0]["input_text"])
-            self.assertEqual(manifest["metadata"]["name"], _canonical_argocd_app_name())
+            self.assertEqual(manifest["kind"], "ApplicationSet")
+            self.assertEqual(manifest["metadata"]["name"], phase5_runtime._canonical_appset_name(ENVIRONMENT, DEPLOYMENT_ID))
+            self.assertEqual(manifest["spec"]["template"]["metadata"]["name"], _canonical_argocd_app_name())
 
 
 class CrossRuntimeRemovalStateTests(unittest.TestCase):
@@ -2417,7 +2429,7 @@ class CrossRuntimeRemovalStateTests(unittest.TestCase):
         self._removal_preflight_fails_zero_calls(deployment_id="gg-mssql-repltest-01")
 
     def _remove_runtime_fails_zero_calls(self, **state_overrides):
-        state = {**_removal_state_fixture(**state_overrides), "ownership_state": "OWNED", "application_found": True, "footprint_found": _complete_footprint()}
+        state = {**_removal_state_fixture(**state_overrides), "ownership_state": "OWNED", "application_found": True, "applicationset_found": False, "footprint_found": _complete_footprint()}
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             phase5_runtime.update_state(state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
@@ -2455,7 +2467,8 @@ class CrossRuntimeRemovalStateTests(unittest.TestCase):
         self._removal_preflight_fails_zero_calls(reason="physical-removal", efs_mode="managed")
 
     def test_32_valid_canonical_owned_application_true_exact_patch_delete_still_occurs(self):
-        state = {**_removal_state_fixture(), "ownership_state": "OWNED", "application_found": True, "footprint_found": _complete_footprint()}
+        # No ApplicationSet in this fixture (applicationset_found=False) -- a runtime removed before ever being migrated to the self-healing ApplicationSet shape must still have its standalone Application patched+deleted exactly as before.
+        state = {**_removal_state_fixture(), "ownership_state": "OWNED", "application_found": True, "applicationset_found": False, "footprint_found": _complete_footprint()}
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             phase5_runtime.update_state(state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
@@ -2466,13 +2479,36 @@ class CrossRuntimeRemovalStateTests(unittest.TestCase):
             scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
             with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 _run_quiet(phase5_runtime.cmd_remove_runtime, args)
+            appset_delete_calls = [c for c in scripted.calls if c["argv"][:3] == ["kubectl", "delete", "applicationset"]]
             patch_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "patch"]]
             delete_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"]]
+            self.assertEqual(appset_delete_calls, [], "no ApplicationSet exists yet for this runtime -- removal must never invent one to delete")
             self.assertEqual(len(patch_calls), 1)
             self.assertEqual(len(delete_calls), 1)
 
+    def test_32b_owned_applicationset_removes_appset_before_child_application(self):
+        # Phase 5 Runtime Application Self-Healing removal ordering (required test case 11): the ApplicationSet is deleted BEFORE the child Application is patched/deleted -- proven by exact call order, never merely "both eventually happened".
+        state = {**_removal_state_fixture(), "ownership_state": "OWNED", "application_found": True, "applicationset_found": True, "footprint_found": _complete_footprint()}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            phase5_runtime.update_state(state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = ScriptedRun()
+            scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+            scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
+            scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
+            scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+                _run_quiet(phase5_runtime.cmd_remove_runtime, args)
+            mutation_calls = [c["argv"] for c in scripted.calls if c["argv"][:2] in (["kubectl", "delete"], ["kubectl", "patch"])]
+            appset_delete_idx = next(i for i, argv in enumerate(mutation_calls) if argv[:3] == ["kubectl", "delete", "applicationset"])
+            app_patch_idx = next(i for i, argv in enumerate(mutation_calls) if argv[:2] == ["kubectl", "patch"])
+            app_delete_idx = next(i for i, argv in enumerate(mutation_calls) if argv[:3] == ["kubectl", "delete", "application"])
+            self.assertLess(appset_delete_idx, app_patch_idx, "the ApplicationSet must be deleted before the child Application is patched")
+            self.assertLess(appset_delete_idx, app_delete_idx, "the ApplicationSet must be deleted before the child Application is deleted")
+
     def test_33_valid_canonical_absent_application_false_no_application_mutation(self):
-        state = {**_removal_state_fixture(), "ownership_state": "ABSENT", "application_found": False, "footprint_found": _complete_footprint()}
+        state = {**_removal_state_fixture(), "ownership_state": "ABSENT", "application_found": False, "applicationset_found": False, "footprint_found": _complete_footprint()}
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             phase5_runtime.update_state(state_path, state, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
@@ -2495,6 +2531,107 @@ class CrossRuntimeRemovalStateTests(unittest.TestCase):
                 _run_quiet(phase5_runtime.cmd_post_delete_acceptance, args)
             classifier_call = next(c["argv"] for c in scripted.calls if str(phase5_runtime.RUNTIME_STATE_TOOL) in c["argv"])
             self.assertIn("--retained-pvc-expected", classifier_call)
+
+
+class ApplicationSetNamingDriftTests(unittest.TestCase):
+    """Phase 5 Runtime Application Self-Healing: ONE canonical ApplicationSet name derivation is mirrored (never imported, matching this repo's existing self-contained-per-module convention) across phase5_runtime.py/runtime_state.py/runtime_acceptance.py -- this proves all three agree for every currently active real deployment ID, so a future edit to one copy that silently drifts from the others is caught here, never live."""
+
+    def test_all_three_appset_name_derivations_agree_for_every_active_real_deployment(self):
+        def _load(name, path):
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        gdm = _load("goldengate_deployment_model", REPO_ROOT / "automation" / "goldengate-deployment-model.py")
+        gdm.REPO_ROOT = REPO_ROOT
+        runtime_state = phase5_runtime._load_runtime_state_module()
+        runtime_acceptance = _load("runtime_acceptance", REPO_ROOT / "automation" / "phases" / "phase5" / "runtime_acceptance.py")
+
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertTrue(active or inactive, "expected at least one real envs/dev/<id>/values.yaml descriptor to exist")
+
+        for descriptor in active + inactive:
+            deployment_id = descriptor["deploymentId"]
+            from_phase5 = phase5_runtime._canonical_appset_name(ENVIRONMENT, deployment_id)
+            app_name_for_runtime_state = f"goldengate-{ENVIRONMENT}-{runtime_state._app_suffix(deployment_id)}"
+            from_runtime_state = runtime_state._appset_name(app_name_for_runtime_state)
+            app_name_for_runtime_acceptance = f"goldengate-{ENVIRONMENT}-{runtime_acceptance._app_suffix(deployment_id)}"
+            from_runtime_acceptance = runtime_acceptance._appset_name(app_name_for_runtime_acceptance)
+            self.assertEqual(from_phase5, from_runtime_state, f"appset name drift for {deployment_id!r} between phase5_runtime.py and runtime_state.py")
+            self.assertEqual(from_phase5, from_runtime_acceptance, f"appset name drift for {deployment_id!r} between phase5_runtime.py and runtime_acceptance.py")
+            self.assertEqual(from_phase5, f"{phase5_runtime._canonical_argocd_app_name(ENVIRONMENT, deployment_id)}-appset")
+
+
+class GeneratedChildApplicationEquivalenceTests(unittest.TestCase):
+    """Phase 5 Runtime Application Self-Healing: the ApplicationSet's generated child must be semantically equal to today's standalone _build_runtime_application_manifest() contract -- proven here by direct field comparison of the two functions' own real output, never by a parallel reimplementation that could silently drift."""
+
+    def _sample_application_manifest(self):
+        return phase5_runtime._build_runtime_application_manifest(
+            argocd_app_name="goldengate-dev-oracle-payments-01", argocd_namespace="argocd", environment="dev",
+            deployment_id="gg-oracle-payments-01", helm_chart_ref=f"oci://{ECR_REGISTRY}/helm/goldengate",
+            chart_version="0.1.42-gg-oracle-payments-01", release_name="gg-oracle-payments-01",
+            target_namespace="goldengate-dev", image_repository=f"{ECR_REGISTRY}/aws-cloud-factory-goldengate-oracle",
+            dns_domain="goldengate-dev.adcbmis.local", alb_group_name="goldengate-dev-shared",
+            certificate_arn=f"arn:aws:acm:eu-west-1:{WORKLOAD_ACCOUNT_ID}:certificate/abc-123",
+            admin_secret_name="dev/goldengate/source/admin", tls_secret_name="dev/goldengate/tls-certificate",
+            aws_region="eu-west-1", runtime_service_account_name="gg-runtime-sa", resolved_efs_id="fs-0123456789abcdef0",
+        )
+
+    def test_appset_template_is_field_for_field_identical_to_standalone_application(self):
+        application_manifest = self._sample_application_manifest()
+        appset_name = phase5_runtime._canonical_appset_name("dev", "gg-oracle-payments-01")
+        appset_manifest = phase5_runtime._build_runtime_applicationset_manifest(appset_name, "argocd", "dev", "gg-oracle-payments-01", application_manifest)
+
+        self.assertEqual(appset_manifest["kind"], "ApplicationSet")
+        self.assertEqual(appset_manifest["metadata"]["name"], appset_name)
+        self.assertEqual(appset_manifest["metadata"]["namespace"], "argocd")
+        # The generated child's OWN metadata/spec are the exact same dict objects _build_runtime_application_manifest() produced -- never a re-derived/re-typed copy that could drift field-by-field.
+        self.assertIs(appset_manifest["spec"]["template"]["metadata"], application_manifest["metadata"])
+        self.assertIs(appset_manifest["spec"]["template"]["spec"], application_manifest["spec"])
+        self.assertEqual(appset_manifest["spec"]["template"]["metadata"]["name"], "goldengate-dev-oracle-payments-01")
+        self.assertEqual(appset_manifest["spec"]["template"]["spec"]["syncPolicy"], {"automated": {"prune": True, "selfHeal": True}})
+        self.assertEqual(appset_manifest["spec"]["template"]["spec"]["revisionHistoryLimit"], 10)
+
+    def test_appset_generator_produces_exactly_one_element(self):
+        application_manifest = self._sample_application_manifest()
+        appset_manifest = phase5_runtime._build_runtime_applicationset_manifest("goldengate-dev-oracle-payments-01-appset", "argocd", "dev", "gg-oracle-payments-01", application_manifest)
+        generators = appset_manifest["spec"]["generators"]
+        self.assertEqual(len(generators), 1)
+        self.assertEqual(len(generators[0]["list"]["elements"]), 1)
+
+    def test_appset_sync_policy_is_not_set_so_owner_reference_cascade_deletion_applies(self):
+        # Phase 5 Runtime Application Self-Healing removal ordering relies on Kubernetes' own owner-reference garbage collection cascading from the deleted ApplicationSet to its single generated child -- preserveResourcesOnDeletion=true (or any other syncPolicy override) would break that removal path.
+        application_manifest = self._sample_application_manifest()
+        appset_manifest = phase5_runtime._build_runtime_applicationset_manifest("goldengate-dev-oracle-payments-01-appset", "argocd", "dev", "gg-oracle-payments-01", application_manifest)
+        self.assertNotIn("syncPolicy", appset_manifest["spec"])
+
+
+class ApplicationSetPrerequisiteTests(unittest.TestCase):
+    """Phase 5 Runtime Application Self-Healing (required test case 16): cluster prerequisite validation and reconciliation itself must fail closed if the ApplicationSet CRD/controller is unavailable, exactly like the existing applications.argoproj.io CRD check."""
+
+    def test_validate_cluster_prerequisites_fails_closed_when_applicationset_crd_missing(self):
+        scripted = _base_prereq_scripted()
+        scripted.when(_starts_with("kubectl", "get", "crd", "applicationsets.argoproj.io"), FakeProc(1, "", 'Error from server (NotFound): customresourcedefinitions.apiextensions.k8s.io "applicationsets.argoproj.io" not found'))
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+        self.assertIn("applicationsets.argoproj.io", str(ctx.exception))
+
+    def test_reconcile_runtime_fails_closed_when_applicationset_crd_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            _full_reconcile_state(state_path)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = _reconcile_scripted_ok()
+            scripted.when(_starts_with("kubectl", "get", "crd", "applicationsets.argoproj.io"), FakeProc(1, "", 'Error from server (NotFound): customresourcedefinitions.apiextensions.k8s.io "applicationsets.argoproj.io" not found'))
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch(ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION="false"):
+                with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                    _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
+            self.assertIn("applicationsets.argoproj.io", str(ctx.exception))
+            self.assertEqual([c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]], [], "no ApplicationSet may be applied once the CRD check has failed")
 
 
 class ChartVersionAndPackageBindingTests(unittest.TestCase):
@@ -2883,20 +3020,23 @@ class ReconcileMutationPayloadTests(unittest.TestCase):
         self.assertEqual([c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]], [])
 
     def test_44_valid_canonical_state_builds_exact_application(self):
+        # Phase 5 Runtime Application Self-Healing: the applied manifest is now the runtime's ApplicationSet -- its spec.template is the exact generated-child Application shape (metadata.name/spec.source.targetRevision unchanged from the pre-feature contract).
         scripted = self._run_reconcile(expect_error=False)
         apply_calls = [c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]]
         self.assertEqual(len(apply_calls), 1)
         import yaml as _yaml
         manifest = _yaml.safe_load(apply_calls[0]["input_text"])
-        self.assertEqual(manifest["metadata"]["name"], _canonical_argocd_app_name())
-        self.assertEqual(manifest["spec"]["source"]["targetRevision"], CHART_VERSION)
+        self.assertEqual(manifest["kind"], "ApplicationSet")
+        self.assertEqual(manifest["metadata"]["name"], phase5_runtime._canonical_appset_name(ENVIRONMENT, DEPLOYMENT_ID))
+        self.assertEqual(manifest["spec"]["template"]["metadata"]["name"], _canonical_argocd_app_name())
+        self.assertEqual(manifest["spec"]["template"]["spec"]["source"]["targetRevision"], CHART_VERSION)
 
     def test_45_application_uses_freshly_canonical_values_not_unvalidated_state_copies(self):
         scripted = self._run_reconcile(expect_error=False)
         apply_calls = [c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]]
         import yaml as _yaml
         manifest = _yaml.safe_load(apply_calls[0]["input_text"])
-        params = {p["name"]: p["value"] for p in manifest["spec"]["source"]["helm"]["parameters"]}
+        params = {p["name"]: p["value"] for p in manifest["spec"]["template"]["spec"]["source"]["helm"]["parameters"]}
         self.assertEqual(params["runtime.csi.admin.objectName"], "dev/goldengate/source/admin")
         self.assertEqual(params["ingress.hostDomain"], "goldengate-dev.adcbmis.local")
         self.assertEqual(params["ingress.alb.certificateArn"], f"arn:aws:acm:eu-west-1:{WORKLOAD_ACCOUNT_ID}:certificate/abc-123")

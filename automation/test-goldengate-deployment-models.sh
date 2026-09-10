@@ -3081,7 +3081,7 @@ def classify_state(state_word, deployment_model="singleRuntime"):
                 return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
             if str(phase5_runtime.RUNTIME_STATE_TOOL) in argv:
                 complete_footprint = {k: False for k in phase5_runtime._load_runtime_state_module().RUNTIME_FOOTPRINT_KEYS}
-                return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"state": state_word, "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": [], "checks": {"application_found": False, "footprint_found": complete_footprint}}), "stderr": ""})()
+                return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"state": state_word, "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": [], "checks": {"application_found": False, "applicationset_found": False, "footprint_found": complete_footprint}}), "stderr": ""})()
             return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
         args = type("Args", (), {"environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "state_path": state_path})()
@@ -16261,7 +16261,7 @@ def cmd_source(name):
 prepare_removal_src = cmd_source("cmd_prepare_removal")
 remove_runtime_src = cmd_source("cmd_remove_runtime")
 mutation_state_src = cmd_source("_validate_removal_mutation_state")
-results.append(("U: BROKEN removal state cannot mutate (mutation-boundary validation requires ownership_state in ABSENT/OWNED before remove-runtime ever mutates)", 'ownership_state not in ("ABSENT", "OWNED")' in mutation_state_src and "_validate_removal_mutation_state" in remove_runtime_src))
+results.append(("U: BROKEN removal state cannot mutate (mutation-boundary validation requires ownership_state in ABSENT/OWNED/MIGRATION_CANDIDATE before remove-runtime ever mutates)", 'ownership_state not in ("ABSENT", "OWNED", "MIGRATION_CANDIDATE")' in mutation_state_src and "_validate_removal_mutation_state" in remove_runtime_src))
 results.append(("V: legacyPair cannot mutate (prepare-removal fails closed before any mutation)", 'deployment_model != "singleRuntime"' in prepare_removal_src))
 results.append(("W: managed physical-removal cannot mutate (prepare-removal fails closed before any mutation)", 'reason == "physical-removal" and efs_mode == "managed"' in prepare_removal_src))
 
@@ -16295,7 +16295,7 @@ with mock.patch.object(phase5_runtime, "run", fake_run), mock.patch.dict(os.envi
         phase5_runtime.update_state(state_path, {
             "environment": "dev", "deployment_id": "gg-oracle-payments-01", "deployment_model": "singleRuntime",
             "efs_mode": "", "reason": "deployment-disabled", "runtime_namespace": "goldengate-dev",
-            "ownership_state": "OWNED", "application_found": True, "footprint_found": complete_footprint_for_removal,
+            "ownership_state": "OWNED", "application_found": True, "applicationset_found": False, "footprint_found": complete_footprint_for_removal,
             "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
         }, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
         args.state_path = state_path
@@ -16453,7 +16453,7 @@ def complete_footprint(**overrides):
 
 
 def classifier_result(state, application_found, **footprint_overrides):
-    return {"state": state, "checks": {"application_found": application_found, "footprint_found": complete_footprint(**footprint_overrides)}}
+    return {"state": state, "checks": {"application_found": application_found, "applicationset_found": False, "footprint_found": complete_footprint(**footprint_overrides)}}
 
 
 # Confirmed reproduction: old malformed examples that incorrectly returned success.
@@ -16573,7 +16573,7 @@ def complete_footprint(**overrides):
 
 
 def classifier_result(state, application_found, **footprint_overrides):
-    return {"state": state, "checks": {"application_found": application_found, "footprint_found": complete_footprint(**footprint_overrides)}}
+    return {"state": state, "checks": {"application_found": application_found, "applicationset_found": False, "footprint_found": complete_footprint(**footprint_overrides)}}
 
 
 # --- A/C: post-delete ABSENT success requires every footprint value false; OWNED with zero footprint is never accepted. ---
@@ -16625,7 +16625,7 @@ def remove_runtime_with_state(state_overrides):
     base_state = {
         "environment": "dev", "deployment_id": "gg-oracle-payments-01", "deployment_model": "singleRuntime",
         "efs_mode": "", "reason": "deployment-disabled", "runtime_namespace": "goldengate-dev",
-        "ownership_state": "OWNED", "application_found": True, "footprint_found": complete_footprint(),
+        "ownership_state": "OWNED", "application_found": True, "applicationset_found": False, "footprint_found": complete_footprint(),
         "argocd_app_name": "goldengate-dev-oracle-payments-01", "argocd_namespace": "argocd",
     }
     base_state.update(state_overrides)

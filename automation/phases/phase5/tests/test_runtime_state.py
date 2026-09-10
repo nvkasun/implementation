@@ -111,6 +111,31 @@ def _named_obj(name, labels):
     return {"metadata": {"name": name, "labels": labels}}
 
 
+APPSET_NAME = f"{APP_NAME}-appset"
+
+
+def _appset_obj(appset_name=APPSET_NAME, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, template_name=APP_NAME, dest_ns=RUNTIME_NAMESPACE, repo_url=None):
+    """A correctly-owned runtime ApplicationSet -- spec.template mirrors _build_runtime_applicationset_manifest()'s own shape (template.metadata.name/spec.destination.namespace/spec.source.repoURL), never a second, independently-invented shape."""
+    return {
+        "metadata": {
+            "name": appset_name,
+            "labels": {
+                "goldengate.adcb/environment": environment,
+                "goldengate.adcb/deployment-id": deployment_id,
+            },
+        },
+        "spec": {
+            "template": {
+                "metadata": {"name": template_name},
+                "spec": {
+                    "source": {"repoURL": repo_url if repo_url is not None else f"oci://{ECR_REGISTRY}/{runtime_state.HELM_REPO_PATH}"},
+                    "destination": {"namespace": dest_ns},
+                },
+            },
+        },
+    }
+
+
 def _populate_owned_footprint(cluster, deployment_id=DEPLOYMENT_ID, environment=ENVIRONMENT):
     """Populates every expected-name resource with correctly-owned labels (footprint fully present, matching a prior successful reconciliation)."""
     cluster.put("statefulset", deployment_id, RUNTIME_NAMESPACE, _named_obj(deployment_id, _runtime_labels(deployment_id, environment)))
@@ -162,15 +187,17 @@ class RuntimeStateClassifierTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
 
-    def test_5_correct_app_no_workload_resources_yet_is_owned(self):
+    def test_5_correct_appset_and_app_no_workload_resources_yet_is_owned(self):
         cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
         cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
         result = _classify(cluster)
         self.assertEqual(result["state"], runtime_state.STATE_OWNED)
         self.assertEqual(result["reasons"], [])
 
-    def test_6_correct_app_workload_not_ready_is_still_owned(self):
+    def test_6_correct_appset_and_app_workload_not_ready_is_still_owned(self):
         cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
         cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
         not_ready_sts = _named_obj(DEPLOYMENT_ID, _runtime_labels())
         not_ready_sts["status"] = {"readyReplicas": 0}
@@ -178,16 +205,18 @@ class RuntimeStateClassifierTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], runtime_state.STATE_OWNED)
 
-    def test_7_correct_app_outofsync_is_still_owned(self):
+    def test_7_correct_appset_and_app_outofsync_is_still_owned(self):
         cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
         app = _app_obj()
         app["status"] = {"sync": {"status": "OutOfSync"}, "health": {"status": "Healthy"}}
         cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, app)
         result = _classify(cluster)
         self.assertEqual(result["state"], runtime_state.STATE_OWNED)
 
-    def test_8_correct_app_health_degraded_is_still_owned(self):
+    def test_8_correct_appset_and_app_health_degraded_is_still_owned(self):
         cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
         app = _app_obj()
         app["status"] = {"sync": {"status": "Synced"}, "health": {"status": "Degraded"}}
         cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, app)
@@ -409,21 +438,21 @@ class RuntimeStateClassifierTests(unittest.TestCase):
         # Defense-in-depth: every OTHER existing test in this file calls classify() via _classify() (which never passes retained_pvc_expected), and the new parameter defaults to False -- confirms the default keyword value itself, not merely test behavior.
         self.assertEqual(runtime_state.classify.__defaults__[-1], False)
 
-    def test_24_app_found_retained_pvc_owned_is_still_owned(self):
-        # Sanity: the Application-found path is entirely unaffected by the Gap 5 retained-PVC change -- a correctly-owned PVC alongside a correctly-owned Application remains OWNED exactly as before.
+    def test_24_app_found_retained_pvc_owned_is_migration_candidate(self):
+        # Phase 5 Runtime Application Self-Healing: the Application-found-but-no-ApplicationSet-yet path is entirely unaffected by the Gap 5 retained-PVC change -- a correctly-owned PVC alongside a correctly-owned standalone Application is MIGRATION_CANDIDATE (no runtime ApplicationSet exists yet), not OWNED.
         cluster = FakeCluster()
         cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
         cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
         result = _classify(cluster)
-        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+        self.assertEqual(result["state"], runtime_state.STATE_MIGRATION_CANDIDATE)
         self.assertEqual(result["reasons"], [])
 
-    def test_full_owned_footprint_with_correct_app_is_owned(self):
+    def test_full_owned_footprint_with_correct_app_no_appset_is_migration_candidate(self):
         cluster = FakeCluster()
         cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
         _populate_owned_footprint(cluster)
         result = _classify(cluster)
-        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+        self.assertEqual(result["state"], runtime_state.STATE_MIGRATION_CANDIDATE)
         self.assertEqual(result["reasons"], [])
 
     def test_admin_secret_presence_alone_is_never_a_foreign_ownership_reason(self):
@@ -432,7 +461,7 @@ class RuntimeStateClassifierTests(unittest.TestCase):
         cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
         cluster.put("secret", f"{DEPLOYMENT_ID}-admin", RUNTIME_NAMESPACE, {"metadata": {"name": f"{DEPLOYMENT_ID}-admin"}})
         result = _classify(cluster)
-        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+        self.assertEqual(result["state"], runtime_state.STATE_MIGRATION_CANDIDATE)
 
     def test_unknown_deployment_id_never_forces_configuration_error(self):
         # GoldenGate Runtime Presence Contract Finalization: this classifier is reused for a PHYSICALLY REMOVED descriptor too (ownership-safe delete, deletion_matrix reason=physical-removal), where by design no envs/dev/<id>/values.yaml exists any more -- an unknown deployment ID must never itself force a configuration error; it proceeds straight to cluster-based classification (ABSENT here, since nothing exists on the cluster for it either).
@@ -472,6 +501,113 @@ class RuntimeStateClassifierTests(unittest.TestCase):
                 runtime_namespace=RUNTIME_NAMESPACE,
                 ecr_registry=ECR_REGISTRY,
             )
+
+
+class ApplicationSetOwnershipTests(unittest.TestCase):
+    """Phase 5 Runtime Application Self-Healing: covers every required ApplicationSet-aware ownership state (1-7 from the task's own state matrix). Every fixture models exactly the shape _build_runtime_applicationset_manifest()/_check_applicationset_ownership() actually produce/verify -- never an invented shape."""
+
+    def test_1_appset_absent_app_absent_no_footprint_is_absent(self):
+        # Restates State #1 explicitly under this class's own name for the ApplicationSet feature, even though RuntimeStateClassifierTests.test_1 already covers the same fixture -- this class is the single place every required state (1-7) is enumerated together.
+        cluster = FakeCluster()
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_ABSENT)
+        self.assertFalse(result["checks"]["applicationset_found"])
+
+    def test_2_owned_appset_correct_child_is_owned(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
+        self.assertTrue(result["checks"]["applicationset_found"])
+        self.assertTrue(result["checks"]["application_found"])
+
+    def test_3_owned_appset_child_missing_is_recoverable_owned(self):
+        # State #3: the ApplicationSet controller is expected to recreate the child on its own -- this is the entire self-healing point of the feature, never treated as an orphan-footprint BROKEN condition.
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
+        self.assertTrue(result["checks"]["applicationset_found"])
+        self.assertFalse(result["checks"]["application_found"])
+
+    def test_3b_owned_appset_child_missing_leftover_compute_footprint_is_still_recoverable_owned(self):
+        # The same recoverable shape as test_3, but with leftover compute footprint from the last successful sync still present while the child Application is being recreated -- a correctly-owned ApplicationSet is itself the authoritative ownership signal here, never re-classified as an orphan.
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        _populate_owned_footprint(cluster)
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
+
+    def test_4_foreign_appset_wrong_deployment_id_label_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj(deployment_id="gg-some-other-deployment"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("ApplicationSet" in r and "goldengate.adcb/deployment-id" in r for r in result["reasons"]))
+
+    def test_4b_foreign_appset_wrong_environment_label_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj(environment="sit"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("ApplicationSet" in r and "goldengate.adcb/environment" in r for r in result["reasons"]))
+
+    def test_4c_appset_template_wrong_destination_namespace_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj(dest_ns="some-other-namespace"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("spec.template.spec.destination.namespace" in r for r in result["reasons"]))
+
+    def test_4d_appset_template_wrong_repo_url_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj(repo_url="oci://wrong.example.com/helm/goldengate"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("spec.template.spec.source.repoURL" in r for r in result["reasons"]))
+
+    def test_4e_appset_template_wrong_generated_name_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj(template_name="some-other-app-name"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("spec.template.metadata.name" in r for r in result["reasons"]))
+
+    def test_5_appset_absent_app_absent_non_pvc_footprint_is_broken(self):
+        # State #5: restates the pre-feature "no owner, orphaned footprint" BROKEN shape explicitly under this class, proving the ApplicationSet feature never weakens it.
+        cluster = FakeCluster()
+        cluster.put("statefulset", DEPLOYMENT_ID, RUNTIME_NAMESPACE, _named_obj(DEPLOYMENT_ID, _runtime_labels()))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertFalse(result["checks"]["applicationset_found"])
+
+    def test_6_appset_absent_standalone_app_correct_is_migration_candidate(self):
+        cluster = FakeCluster()
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_MIGRATION_CANDIDATE)
+        self.assertEqual(result["reasons"], [])
+        self.assertFalse(result["checks"]["applicationset_found"])
+        self.assertTrue(result["checks"]["application_found"])
+
+    def test_6b_appset_absent_standalone_app_foreign_is_broken_not_migration_candidate(self):
+        # A foreign/mislabeled standalone Application must never be classified as a migration candidate -- MIGRATION_CANDIDATE requires the exact same ownership proof a real OWNED Application has always required.
+        cluster = FakeCluster()
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(deployment_id="gg-some-other-deployment"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+
+    def test_7_owned_appset_foreign_child_under_expected_name_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(deployment_id="gg-some-other-deployment"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("Application" in r and "goldengate.adcb/deployment-id" in r for r in result["reasons"]))
 
 
 class RuntimeStateNoMutationSourceSweepTests(unittest.TestCase):
