@@ -102,9 +102,27 @@ class FakeCluster:
         return 0, json.dumps({"items": items}), ""
 
 
-def _app_obj(healthy=True, repo_url=None, dest_ns=RUNTIME_NAMESPACE, release_name=DEPLOYMENT_ID, env_label=ENVIRONMENT, id_label=DEPLOYMENT_ID):
+DEFAULT_APPSET_UID = "appset-fixture-uid-0001"
+
+
+def _app_obj(healthy=True, repo_url=None, dest_ns=RUNTIME_NAMESPACE, release_name=DEPLOYMENT_ID, env_label=ENVIRONMENT, id_label=DEPLOYMENT_ID,
+             owner_appset_name=f"{APP_NAME}-appset", owner_appset_uid=DEFAULT_APPSET_UID, owner_controller=True,
+             owner_kind="ApplicationSet", owner_api_version="argoproj.io/v1alpha1", include_owner_ref=True, extra_owner_refs=None):
+    """include_owner_ref defaults to True, pointing at (f"{APP_NAME}-appset", DEFAULT_APPSET_UID) with controller=True -- exactly matching _appset_obj()'s own defaults, so _populate_healthy_cluster()'s "AppSet + child" pair is a correctly-owned pair by default and every existing acceptance test needs no per-test wiring."""
+    metadata = {"labels": {"goldengate.adcb/environment": env_label, "goldengate.adcb/deployment-id": id_label}}
+    owner_refs = list(extra_owner_refs) if extra_owner_refs else []
+    if include_owner_ref:
+        owner_refs.append({
+            "apiVersion": owner_api_version,
+            "kind": owner_kind,
+            "name": owner_appset_name,
+            "uid": owner_appset_uid,
+            "controller": owner_controller,
+        })
+    if owner_refs:
+        metadata["ownerReferences"] = owner_refs
     return {
-        "metadata": {"labels": {"goldengate.adcb/environment": env_label, "goldengate.adcb/deployment-id": id_label}},
+        "metadata": metadata,
         "status": {
             "sync": {"status": "Synced" if healthy else "OutOfSync"},
             "health": {"status": "Healthy" if healthy else "Degraded"},
@@ -119,10 +137,13 @@ def _app_obj(healthy=True, repo_url=None, dest_ns=RUNTIME_NAMESPACE, release_nam
     }
 
 
-def _appset_obj(app_name=APP_NAME, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, dest_ns=RUNTIME_NAMESPACE, repo_url=None):
-    """A correctly-owned runtime ApplicationSet -- spec.template mirrors _build_runtime_applicationset_manifest()'s own shape (template.metadata.name/spec.destination.namespace/spec.source.repoURL), never a second, independently-invented shape."""
+def _appset_obj(app_name=APP_NAME, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, dest_ns=RUNTIME_NAMESPACE, repo_url=None, uid=DEFAULT_APPSET_UID):
+    """A correctly-owned runtime ApplicationSet -- spec.template mirrors _build_runtime_applicationset_manifest()'s own shape (template.metadata.name/spec.destination.namespace/spec.source.repoURL), never a second, independently-invented shape. uid defaults to DEFAULT_APPSET_UID, matching _app_obj()'s own default ownerReference target."""
+    metadata = {"labels": {"goldengate.adcb/environment": environment, "goldengate.adcb/deployment-id": deployment_id}}
+    if uid is not None:
+        metadata["uid"] = uid
     return {
-        "metadata": {"labels": {"goldengate.adcb/environment": environment, "goldengate.adcb/deployment-id": deployment_id}},
+        "metadata": metadata,
         "spec": {
             "template": {
                 "metadata": {"name": app_name},
@@ -373,6 +394,34 @@ class RuntimeAcceptanceClassifierTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
         self.assertTrue(any("ApplicationSet" in r and "goldengate.adcb/deployment-id" in r for r in result["reasons"]))
+
+    def test_2d_healthy_child_correct_appset_correct_owner_ref_is_healthy(self):
+        # ApplicationSet Controller Readiness + Child ownerReference correction (required test case): the baseline positive case, stated explicitly here even though test_1 already exercises the same default fixture -- a Synced/Healthy child under a correctly-owned ApplicationSet, carrying the exact controller ownerReference back to it, is HEALTHY.
+        cluster = _populate_healthy_cluster(FakeCluster())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_acceptance.STATE_HEALTHY)
+        self.assertEqual(result["reasons"], [])
+
+    def test_2e_healthy_child_missing_owner_ref_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(include_owner_ref=False))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
+        self.assertTrue(any("no controller ownerReference" in r for r in result["reasons"]))
+
+    def test_2f_healthy_child_wrong_owner_ref_uid_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(owner_appset_uid="totally-different-uid"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
+        self.assertTrue(any("controller ownerReference uid=" in r for r in result["reasons"]))
+
+    def test_2g_healthy_child_wrong_owner_ref_name_is_broken(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(owner_appset_name="some-other-appset"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
+        self.assertTrue(any("controller ownerReference name=" in r for r in result["reasons"]))
 
     def test_3_application_not_synced_is_broken(self):
         cluster = _populate_healthy_cluster(FakeCluster())
@@ -998,8 +1047,9 @@ class RuntimeAcceptanceExternalClaimTests(unittest.TestCase):
 
     def _populate(self, cluster, claim_name=EXTERNAL_CLAIM_NAME):
         app_name = EXTERNAL_CLAIM_APP_NAME
-        cluster.put("applicationset", f"{app_name}-appset", ARGOCD_NAMESPACE, {
-            "metadata": {"labels": {"goldengate.adcb/environment": ENVIRONMENT, "goldengate.adcb/deployment-id": EXTERNAL_CLAIM_DEPLOYMENT_ID}},
+        appset_name = f"{app_name}-appset"
+        cluster.put("applicationset", appset_name, ARGOCD_NAMESPACE, {
+            "metadata": {"uid": DEFAULT_APPSET_UID, "labels": {"goldengate.adcb/environment": ENVIRONMENT, "goldengate.adcb/deployment-id": EXTERNAL_CLAIM_DEPLOYMENT_ID}},
             "spec": {
                 "template": {
                     "metadata": {"name": app_name},
@@ -1011,7 +1061,10 @@ class RuntimeAcceptanceExternalClaimTests(unittest.TestCase):
             },
         })
         cluster.put("application", app_name, ARGOCD_NAMESPACE, {
-            "metadata": {"labels": {"goldengate.adcb/environment": ENVIRONMENT, "goldengate.adcb/deployment-id": EXTERNAL_CLAIM_DEPLOYMENT_ID}},
+            "metadata": {
+                "labels": {"goldengate.adcb/environment": ENVIRONMENT, "goldengate.adcb/deployment-id": EXTERNAL_CLAIM_DEPLOYMENT_ID},
+                "ownerReferences": [{"apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet", "name": appset_name, "uid": DEFAULT_APPSET_UID, "controller": True}],
+            },
             "status": {"sync": {"status": "Synced"}, "health": {"status": "Healthy"}},
             "spec": {
                 "source": {"repoURL": f"oci://{ECR_REGISTRY}/{runtime_acceptance.HELM_REPO_PATH}", "helm": {"releaseName": EXTERNAL_CLAIM_DEPLOYMENT_ID}},

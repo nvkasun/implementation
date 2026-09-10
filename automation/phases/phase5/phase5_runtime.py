@@ -1525,6 +1525,45 @@ def _validate_csi_prerequisites():
     print("Secrets Store CSI Driver prerequisites validated.")
 
 
+def _require_applicationset_controller_ready(argocd_namespace):
+    """ApplicationSet Controller Readiness correction: the CRD-presence checks elsewhere in this module (applicationsets.argoproj.io) prove only that the API type is installed, never that a live argocd-applicationset-controller Deployment is actually running and ready to reconcile it -- this focused, read-only proof closes that gap. Fails closed (Phase5Error) on: NotFound/any other kubectl/RBAC/connectivity error, malformed JSON, missing required fields, spec.replicas<=0 (a deliberately scaled-to-zero controller must never be silently treated as fine merely because the CRD still exists), metadata.generation != status.observedGeneration (the Deployment controller has not yet observed its own latest spec), or status.updatedReplicas/readyReplicas/availableReplicas each not exactly equal to the desired replica count. Never installs/restarts/scales the controller -- Phase 3 remains its sole installation/lifecycle owner; this is read-only defense in depth, never a second installer or day-2 operator, and never a duplicate of Phase 3's own full Argo CD acceptance classifier."""
+    proc = run(["kubectl", "get", "deployment", "argocd-applicationset-controller", "-n", argocd_namespace, "-o", "json"], check=False)
+    if proc.returncode != 0:
+        raise Phase5Error(
+            f"could not read Deployment argocd-applicationset-controller in {argocd_namespace!r} (kubectl exit {proc.returncode}) -- "
+            f"refusing to rely on the ApplicationSet controller without proving it is ready:\n{((proc.stderr or '') + (proc.stdout or '')).strip()}"
+        )
+
+    try:
+        deployment = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise Phase5Error(f"Deployment argocd-applicationset-controller in {argocd_namespace!r} produced unparseable JSON: {exc}") from exc
+    if not isinstance(deployment, dict):
+        raise Phase5Error(f"Deployment argocd-applicationset-controller in {argocd_namespace!r} is a {type(deployment).__name__}, expected a JSON object.")
+
+    metadata = deployment.get("metadata") or {}
+    spec = deployment.get("spec") or {}
+    status = deployment.get("status") or {}
+
+    generation = metadata.get("generation")
+    observed_generation = status.get("observedGeneration")
+    if not isinstance(generation, int) or not isinstance(observed_generation, int):
+        raise Phase5Error(f"Deployment argocd-applicationset-controller is missing metadata.generation/status.observedGeneration (generation={generation!r}, observedGeneration={observed_generation!r}) -- refusing to rely on it.")
+    if generation != observed_generation:
+        raise Phase5Error(f"Deployment argocd-applicationset-controller has not been observed by its own controller yet (metadata.generation={generation} != status.observedGeneration={observed_generation}) -- refusing to rely on it.")
+
+    desired_replicas = spec.get("replicas")
+    if not isinstance(desired_replicas, int) or desired_replicas <= 0:
+        raise Phase5Error(f"Deployment argocd-applicationset-controller spec.replicas is {desired_replicas!r}, expected a positive integer -- the controller is scaled to zero or its replica count is missing/malformed.")
+
+    for field in ("updatedReplicas", "readyReplicas", "availableReplicas"):
+        actual = status.get(field)
+        if not isinstance(actual, int) or actual != desired_replicas:
+            raise Phase5Error(f"Deployment argocd-applicationset-controller status.{field}={actual!r}, expected exactly {desired_replicas} (desired replicas) -- the ApplicationSet controller is not currently Ready.")
+
+    print(f"Argo CD ApplicationSet controller Deployment is Ready ({desired_replicas} desired/updated/ready/available replicas, generation observed).")
+
+
 def cmd_validate_cluster_prerequisites(args):
     require_environment_arg(args.environment)
     require_deployment_id_arg(args.deployment_id)
@@ -1548,6 +1587,10 @@ def cmd_validate_cluster_prerequisites(args):
             "refusing to reconcile a runtime ApplicationSet without it."
         )
     print("Argo CD ApplicationSet CRD is present.")
+
+    # ApplicationSet Controller Readiness correction: CRD presence alone proves only that the API type is installed, never that a live controller is actually running/ready to reconcile it -- this focused readiness proof closes that gap, kept here alongside its own CRD check (defense in depth, never a duplicate of Phase 3's own full Argo CD installation/readiness implementation).
+    argocd_namespace = require_env("ARGOCD_NAMESPACE")
+    _require_applicationset_controller_ready(argocd_namespace)
     print("OK: live EKS runtime prerequisites validated.")
 
 
@@ -1693,6 +1736,8 @@ def cmd_reconcile_runtime(args):
     # Phase 5 Runtime Application Self-Healing: reconciliation now owns the runtime's ApplicationSet, not a bare Application -- fails closed here (before any apply) if the ApplicationSet CRD/controller prerequisite is unavailable, exactly like the existing Application CRD check above. cmd_validate_cluster_prerequisites also checks this earlier in the DAG; this is defense in depth against an unexpected mid-DAG loss of the CRD, never a duplicate authority.
     if run(["kubectl", "get", "crd", "applicationsets.argoproj.io"], check=False).returncode != 0:
         raise Phase5Error("CRD applicationsets.argoproj.io not found. Argo CD ApplicationSet controller prerequisite is not healthy -- refusing to reconcile a runtime ApplicationSet.")
+    # ApplicationSet Controller Readiness correction: proven again here, immediately before the ApplicationSet apply below -- cmd_validate_cluster_prerequisites already proves this earlier in the DAG, but a controller that becomes not-Ready between that step and this one must never be silently relied upon just because its CRD is still installed.
+    _require_applicationset_controller_ready(argocd_namespace)
 
     # Emergency fallback only; long-term auth is handled in-cluster by argocd-ecr-token-sync (IRSA role ARGOCD_ECR_READ_ROLE_ARN).
     if os.environ.get("ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION") == "true":

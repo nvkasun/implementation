@@ -98,14 +98,14 @@ def _appset_name(app_name):
 
 
 def _check_applicationset(run, reasons, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry, app_name):
-    """Phase 5 Runtime Application Self-Healing: an enabled runtime is not accepted as healthy merely because its generated child Application is Synced/Healthy -- the runtime's OWN ApplicationSet must also exist and be correctly owned, or the self-healing guarantee this feature exists to provide is not actually in place, even if the child happens to be healthy right now (e.g. immediately after a one-time migration that has not yet been proven, or after an operator deleted the ApplicationSet directly). Never accepts "ApplicationSet exists" alone as runtime health -- this check is always run alongside, never instead of, _check_application's own Synced/Healthy verification below."""
+    """Phase 5 Runtime Application Self-Healing: an enabled runtime is not accepted as healthy merely because its generated child Application is Synced/Healthy -- the runtime's OWN ApplicationSet must also exist and be correctly owned, or the self-healing guarantee this feature exists to provide is not actually in place, even if the child happens to be healthy right now (e.g. immediately after a one-time migration that has not yet been proven, or after an operator deleted the ApplicationSet directly). Never accepts "ApplicationSet exists" alone as runtime health -- this check is always run alongside, never instead of, _check_application's own Synced/Healthy verification below. Returns the ApplicationSet's own metadata.uid when it was found (regardless of whether it otherwise passed every check, so the caller can still compare the child's ownerReference against whatever ApplicationSet actually exists under this name), or None when no ApplicationSet exists at all (in which case _check_application below skips the ownerReference check -- already-appended reasons make the overall result BROKEN either way)."""
     appset_name = _appset_name(app_name)
     expected_repo_url = f"oci://{ecr_registry}/{HELM_REPO_PATH}"
 
     found, obj = get_json(run, "applicationset", appset_name, argocd_namespace)
     if not found:
         reasons.append(f"ApplicationSet {appset_name} does not exist in {argocd_namespace}")
-        return
+        return None
 
     labels = (obj.get("metadata") or {}).get("labels") or {}
     if labels.get("goldengate.adcb/environment") != environment:
@@ -124,18 +124,48 @@ def _check_applicationset(run, reasons, environment, deployment_id, argocd_names
     if ((template_spec.get("source") or {})).get("repoURL") != expected_repo_url:
         reasons.append(f"ApplicationSet {appset_name} spec.template.spec.source.repoURL={((template_spec.get('source') or {})).get('repoURL')!r}, expected {expected_repo_url!r}")
 
+    appset_uid = (obj.get("metadata") or {}).get("uid")
+    if not appset_uid:
+        reasons.append(f"ApplicationSet {appset_name} metadata.uid is missing/empty")
+    return appset_uid
+
+
+def _check_child_owner_reference(app_obj, app_name, appset_name, appset_uid):
+    """ApplicationSet Controller Readiness + Child ownerReference correction: a healthy child Application is not accepted as genuinely self-healing merely because the ApplicationSet object exists and the Application happens to be Synced/Healthy right now -- it must carry the EXACT controller ownerReference the garbage-collector cascade-delete/recreate guarantee actually depends on (apiVersion=argoproj.io/v1alpha1, kind=ApplicationSet, name=<appset_name>, uid=<the ApplicationSet's own actual metadata.uid>, controller=true). Mirrored (never imported, matching this file's existing self-contained convention) from automation/phases/phase5/runtime_state.py's own copy -- both preflight and strict acceptance agree on this exact contract. Missing, wrong-name, wrong-UID, wrong-kind/apiVersion, controller!=true, or more than one controller=true ownerReference are all rejected -- Kubernetes itself never allows two controller owners on one object, so more than one here is itself evidence this object was not created by the expected ApplicationSet generator."""
+    owner_refs = (app_obj.get("metadata") or {}).get("ownerReferences") or []
+    controller_refs = [ref for ref in owner_refs if isinstance(ref, dict) and ref.get("controller") is True]
+    if not controller_refs:
+        return [f"Application {app_name} has no controller ownerReference to ApplicationSet {appset_name} -- the self-healing ownership relationship is not in place"]
+    if len(controller_refs) > 1:
+        return [f"Application {app_name} has {len(controller_refs)} controller ownerReferences, expected exactly 1 (to ApplicationSet {appset_name})"]
+
+    ref = controller_refs[0]
+    reasons = []
+    if ref.get("apiVersion") != "argoproj.io/v1alpha1":
+        reasons.append(f"Application {app_name} controller ownerReference apiVersion={ref.get('apiVersion')!r}, expected 'argoproj.io/v1alpha1'")
+    if ref.get("kind") != "ApplicationSet":
+        reasons.append(f"Application {app_name} controller ownerReference kind={ref.get('kind')!r}, expected 'ApplicationSet'")
+    if ref.get("name") != appset_name:
+        reasons.append(f"Application {app_name} controller ownerReference name={ref.get('name')!r}, expected {appset_name!r}")
+    if ref.get("uid") != appset_uid:
+        reasons.append(f"Application {app_name} controller ownerReference uid={ref.get('uid')!r}, expected {appset_uid!r} (the ApplicationSet's own metadata.uid)")
+    return reasons
+
 
 def _check_application(run, reasons, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry):
     app_suffix = _app_suffix(deployment_id)
     app_name = f"goldengate-{environment}-{app_suffix}"
     expected_repo_url = f"oci://{ecr_registry}/{HELM_REPO_PATH}"
 
-    _check_applicationset(run, reasons, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry, app_name)
+    appset_uid = _check_applicationset(run, reasons, environment, deployment_id, argocd_namespace, runtime_namespace, ecr_registry, app_name)
 
     found, obj = get_json(run, "application", app_name, argocd_namespace)
     if not found:
         reasons.append(f"Application {app_name} does not exist in {argocd_namespace}")
         return
+
+    if appset_uid is not None:
+        reasons.extend(_check_child_owner_reference(obj, app_name, _appset_name(app_name), appset_uid))
 
     status = obj.get("status") or {}
     sync_status = (status.get("sync") or {}).get("status")

@@ -159,6 +159,29 @@ def _canonical_argocd_app_name(environment=ENVIRONMENT, deployment_id=DEPLOYMENT
     return phase5_runtime._canonical_argocd_app_name(environment, deployment_id)
 
 
+def _healthy_appset_controller_deployment(replicas=2, generation=3, **overrides):
+    """A complete, schema-valid `kubectl get deployment argocd-applicationset-controller -o json` shape that passes _require_applicationset_controller_ready() as-is -- generation observed, desired/updated/ready/available replicas all equal. Individual fields can be broken via keyword overrides for the fail-closed tests (e.g. replicas=0, observed_generation=<mismatch>, ready_replicas=<short>)."""
+    doc = {
+        "metadata": {"name": "argocd-applicationset-controller", "generation": generation},
+        "spec": {"replicas": replicas},
+        "status": {
+            "observedGeneration": generation,
+            "updatedReplicas": replicas,
+            "readyReplicas": replicas,
+            "availableReplicas": replicas,
+        },
+    }
+    doc["metadata"].update(overrides.pop("metadata", {}))
+    doc["spec"].update(overrides.pop("spec", {}))
+    doc["status"].update(overrides.pop("status", {}))
+    doc.update(overrides)
+    return doc
+
+
+def _appset_controller_proc(**overrides):
+    return FakeProc(0, json.dumps(_healthy_appset_controller_deployment(**overrides)))
+
+
 GITHUB_RUN_NUMBER = "42"  # must match _env_patch()'s own GITHUB_RUN_NUMBER default below
 CHART_VERSION = f"0.1.{GITHUB_RUN_NUMBER}-{DEPLOYMENT_ID}"
 TEMP_CHART_PATH = f"work/charts/{DEPLOYMENT_ID}/goldengate"
@@ -1168,6 +1191,8 @@ def _base_prereq_scripted():
                   FakeProc(0, '["sts.amazonaws.com","pods.eks.amazonaws.com"]'))
     scripted.when(_starts_with("helm", "status", "secrets-store-csi-driver"), FakeProc(1, "", "Error: release: not found"))
     scripted.when(_starts_with("kubectl", "get", "crd", "applications.argoproj.io"), FakeProc(0, ""))
+    scripted.when(_starts_with("kubectl", "get", "crd", "applicationsets.argoproj.io"), FakeProc(0, ""))
+    scripted.when(_starts_with("kubectl", "get", "deployment", "argocd-applicationset-controller"), _appset_controller_proc())
     return scripted
 
 
@@ -1467,6 +1492,8 @@ def _reconcile_scripted_ok():
     scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
     scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
     scripted.when(_starts_with("kubectl", "get", "crd", "applications.argoproj.io"), FakeProc(0, ""))
+    scripted.when(_starts_with("kubectl", "get", "crd", "applicationsets.argoproj.io"), FakeProc(0, ""))
+    scripted.when(_starts_with("kubectl", "get", "deployment", "argocd-applicationset-controller"), _appset_controller_proc())
     scripted.when(_starts_with("kubectl", "apply", "-f", "-"), FakeProc(0, ""))
     scripted.when(_starts_with("kubectl", "annotate", "application"), FakeProc(0, ""))
     scripted.when(_starts_with("kubectl", "get", "application"), FakeProc(0, ""))
@@ -2632,6 +2659,106 @@ class ApplicationSetPrerequisiteTests(unittest.TestCase):
                     _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
             self.assertIn("applicationsets.argoproj.io", str(ctx.exception))
             self.assertEqual([c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]], [], "no ApplicationSet may be applied once the CRD check has failed")
+
+
+class ApplicationSetControllerReadinessTests(unittest.TestCase):
+    """ApplicationSet Controller Readiness correction (required test cases): CRD presence alone must never be treated as proof that a live argocd-applicationset-controller Deployment is actually Ready -- _require_applicationset_controller_ready() proves that directly, and both cluster-prerequisite validation and reconcile-runtime must fail closed before any ApplicationSet mutation when it is not."""
+
+    def test_crd_exists_and_controller_ready_prerequisite_passes(self):
+        scripted = _base_prereq_scripted()
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        buf = io.StringIO()
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with redirect_stdout(buf):
+                phase5_runtime.cmd_validate_cluster_prerequisites(args)
+        self.assertIn("ApplicationSet controller Deployment is Ready", buf.getvalue())
+
+    def test_controller_missing_fails_before_applicationset_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            _full_reconcile_state(state_path)
+            args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
+            scripted = _reconcile_scripted_ok()
+            scripted.when(_starts_with("kubectl", "get", "deployment", "argocd-applicationset-controller"),
+                          FakeProc(1, "", 'Error from server (NotFound): deployments.apps "argocd-applicationset-controller" not found'))
+            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch(ENABLE_TEMP_ARGOCD_ECR_PASSWORD_INJECTION="false"):
+                with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                    _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
+            self.assertIn("argocd-applicationset-controller", str(ctx.exception))
+            self.assertEqual([c for c in scripted.calls if c["argv"][:3] == ["kubectl", "apply", "-f"]], [], "no ApplicationSet may be applied while the controller cannot be proven Ready")
+
+    def test_controller_desired_replicas_zero_fails(self):
+        scripted = _base_prereq_scripted()
+        scripted.when(_starts_with("kubectl", "get", "deployment", "argocd-applicationset-controller"), _appset_controller_proc(spec={"replicas": 0}, status={"updatedReplicas": 0, "readyReplicas": 0, "availableReplicas": 0}))
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+        self.assertIn("replicas", str(ctx.exception))
+
+    def test_controller_generation_not_observed_fails(self):
+        scripted = _base_prereq_scripted()
+        scripted.when(_starts_with("kubectl", "get", "deployment", "argocd-applicationset-controller"), _appset_controller_proc(status={"observedGeneration": 1}))
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+        self.assertIn("observedGeneration", str(ctx.exception))
+
+    def test_controller_updated_replicas_mismatch_fails(self):
+        scripted = _base_prereq_scripted()
+        scripted.when(_starts_with("kubectl", "get", "deployment", "argocd-applicationset-controller"), _appset_controller_proc(status={"updatedReplicas": 1}))
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+        self.assertIn("updatedReplicas", str(ctx.exception))
+
+    def test_controller_ready_replicas_mismatch_fails(self):
+        scripted = _base_prereq_scripted()
+        scripted.when(_starts_with("kubectl", "get", "deployment", "argocd-applicationset-controller"), _appset_controller_proc(status={"readyReplicas": 1}))
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+        self.assertIn("readyReplicas", str(ctx.exception))
+
+    def test_controller_available_replicas_mismatch_fails(self):
+        scripted = _base_prereq_scripted()
+        scripted.when(_starts_with("kubectl", "get", "deployment", "argocd-applicationset-controller"), _appset_controller_proc(status={"availableReplicas": 1}))
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+        self.assertIn("availableReplicas", str(ctx.exception))
+
+    def test_controller_malformed_json_fails_closed(self):
+        scripted = _base_prereq_scripted()
+        scripted.when(_starts_with("kubectl", "get", "deployment", "argocd-applicationset-controller"), FakeProc(0, "{not valid json"))
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error):
+                _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+
+    def test_kubectl_inspection_error_fails_closed(self):
+        scripted = _base_prereq_scripted()
+        scripted.when(_starts_with("kubectl", "get", "deployment", "argocd-applicationset-controller"), FakeProc(1, "", "Error from server (Forbidden): deployments.apps is forbidden"))
+        args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID)
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+                _run_quiet(phase5_runtime.cmd_validate_cluster_prerequisites, args)
+        self.assertIn("argocd-applicationset-controller", str(ctx.exception))
+
+    def test_never_installs_restarts_or_scales_the_controller(self):
+        """Read-only defense in depth only -- never a day-2 operator. Scans the readiness function's own source for the absence of any mutating kubectl/helm verb against the controller."""
+        source_path = REPO_ROOT / "automation" / "phases" / "phase5" / "phase5_runtime.py"
+        source = source_path.read_text()
+        import ast as _ast
+        tree = _ast.parse(source)
+        fn = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == "_require_applicationset_controller_ready")
+        fn_source = _ast.get_source_segment(source, fn)
+        for verb in ("apply", "create", "delete", "patch", "scale", "rollout", "annotate", "edit", "replace"):
+            self.assertNotIn(f'"{verb}"', fn_source, f"_require_applicationset_controller_ready must never issue a mutating kubectl {verb!r} call")
 
 
 class ChartVersionAndPackageBindingTests(unittest.TestCase):

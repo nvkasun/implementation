@@ -88,15 +88,34 @@ def _storageclass_labels(deployment_id=DEPLOYMENT_ID, environment=ENVIRONMENT):
     }
 
 
-def _app_obj(name=APP_NAME, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, dest_ns=RUNTIME_NAMESPACE, repo_url=None, release_name=None):
-    return {
-        "metadata": {
-            "name": name,
-            "labels": {
-                "goldengate.adcb/environment": environment,
-                "goldengate.adcb/deployment-id": deployment_id,
-            },
+APPSET_NAME = f"{APP_NAME}-appset"
+DEFAULT_APPSET_UID = "appset-fixture-uid-0001"
+
+
+def _app_obj(name=APP_NAME, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, dest_ns=RUNTIME_NAMESPACE, repo_url=None, release_name=None,
+             owner_appset_name=APPSET_NAME, owner_appset_uid=DEFAULT_APPSET_UID, owner_controller=True,
+             owner_kind="ApplicationSet", owner_api_version="argoproj.io/v1alpha1", include_owner_ref=True, extra_owner_refs=None):
+    """include_owner_ref defaults to True, pointing at (APPSET_NAME, DEFAULT_APPSET_UID) with controller=True -- exactly matching _appset_obj()'s own defaults, so every existing "AppSet + child" test fixture combination is a correctly-owned pair by default and needs no per-test wiring. The ownerReference is simply never inspected by classify() on the no-ApplicationSet path (MIGRATION_CANDIDATE/standalone), so its presence here is harmless there. Individual owner_* fields (or include_owner_ref=False / extra_owner_refs) let the ApplicationSet ownerReference contract tests construct every required broken shape explicitly."""
+    metadata = {
+        "name": name,
+        "labels": {
+            "goldengate.adcb/environment": environment,
+            "goldengate.adcb/deployment-id": deployment_id,
         },
+    }
+    owner_refs = list(extra_owner_refs) if extra_owner_refs else []
+    if include_owner_ref:
+        owner_refs.append({
+            "apiVersion": owner_api_version,
+            "kind": owner_kind,
+            "name": owner_appset_name,
+            "uid": owner_appset_uid,
+            "controller": owner_controller,
+        })
+    if owner_refs:
+        metadata["ownerReferences"] = owner_refs
+    return {
+        "metadata": metadata,
         "spec": {
             "source": {
                 "repoURL": repo_url if repo_url is not None else f"oci://{ECR_REGISTRY}/{runtime_state.HELM_REPO_PATH}",
@@ -111,19 +130,19 @@ def _named_obj(name, labels):
     return {"metadata": {"name": name, "labels": labels}}
 
 
-APPSET_NAME = f"{APP_NAME}-appset"
-
-
-def _appset_obj(appset_name=APPSET_NAME, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, template_name=APP_NAME, dest_ns=RUNTIME_NAMESPACE, repo_url=None):
-    """A correctly-owned runtime ApplicationSet -- spec.template mirrors _build_runtime_applicationset_manifest()'s own shape (template.metadata.name/spec.destination.namespace/spec.source.repoURL), never a second, independently-invented shape."""
-    return {
-        "metadata": {
-            "name": appset_name,
-            "labels": {
-                "goldengate.adcb/environment": environment,
-                "goldengate.adcb/deployment-id": deployment_id,
-            },
+def _appset_obj(appset_name=APPSET_NAME, environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, template_name=APP_NAME, dest_ns=RUNTIME_NAMESPACE, repo_url=None, uid=DEFAULT_APPSET_UID):
+    """A correctly-owned runtime ApplicationSet -- spec.template mirrors _build_runtime_applicationset_manifest()'s own shape (template.metadata.name/spec.destination.namespace/spec.source.repoURL), never a second, independently-invented shape. uid defaults to DEFAULT_APPSET_UID, matching _app_obj()'s own default ownerReference target."""
+    metadata = {
+        "name": appset_name,
+        "labels": {
+            "goldengate.adcb/environment": environment,
+            "goldengate.adcb/deployment-id": deployment_id,
         },
+    }
+    if uid is not None:
+        metadata["uid"] = uid
+    return {
+        "metadata": metadata,
         "spec": {
             "template": {
                 "metadata": {"name": template_name},
@@ -608,6 +627,97 @@ class ApplicationSetOwnershipTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
         self.assertTrue(any("Application" in r and "goldengate.adcb/deployment-id" in r for r in result["reasons"]))
+
+
+class ApplicationSetOwnerReferenceTests(unittest.TestCase):
+    """ApplicationSet Controller Readiness + Child ownerReference correction (required test cases): "ApplicationSet object exists + child Application is healthy/correctly-labeled" must never be accepted alone -- an owned ApplicationSet's child, when it exists, must also carry the exact controller ownerReference back to that exact ApplicationSet UID/name. The child-missing recoverable OWNED state and the no-ApplicationSet MIGRATION_CANDIDATE state must both remain completely unaffected -- neither requires (nor can produce) an ownerReference."""
+
+    def test_owned_appset_correct_owner_ref_child_is_owned(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
+
+    def test_owned_appset_child_missing_remains_recoverable_owned_no_owner_ref_required(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+        self.assertEqual(result["reasons"], [])
+
+    def test_owned_appset_child_without_owner_ref_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(include_owner_ref=False))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("no controller ownerReference" in r for r in result["reasons"]))
+
+    def test_wrong_appset_owner_ref_name_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(owner_appset_name="some-other-appset"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("controller ownerReference name=" in r for r in result["reasons"]))
+
+    def test_wrong_appset_owner_ref_uid_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(owner_appset_uid="totally-different-uid"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("controller ownerReference uid=" in r for r in result["reasons"]))
+
+    def test_wrong_owner_ref_kind_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(owner_kind="Application"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("controller ownerReference kind=" in r for r in result["reasons"]))
+
+    def test_wrong_owner_ref_api_version_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(owner_api_version="v1"))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("controller ownerReference apiVersion=" in r for r in result["reasons"]))
+
+    def test_owner_ref_controller_false_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(owner_controller=False))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("no controller ownerReference" in r for r in result["reasons"]))
+
+    def test_ambiguous_multiple_controller_owner_refs_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj())
+        extra = [{"apiVersion": "v1", "kind": "SomeOtherOwner", "name": "unrelated", "uid": "unrelated-uid", "controller": True}]
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(extra_owner_refs=extra))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("controller ownerReferences, expected exactly 1" in r for r in result["reasons"]))
+
+    def test_appset_missing_uid_is_broken(self):
+        cluster = FakeCluster()
+        cluster.put("applicationset", APPSET_NAME, ARGOCD_NAMESPACE, _appset_obj(uid=None))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        self.assertTrue(any("metadata.uid is missing" in r for r in result["reasons"]))
+
+    def test_standalone_correct_child_no_appset_remains_migration_candidate_without_owner_ref(self):
+        # A standalone Application (correctly owned, no ApplicationSet yet) obviously carries no ApplicationSet ownerReference -- this must never be rejected before migration.
+        cluster = FakeCluster()
+        cluster.put("application", APP_NAME, ARGOCD_NAMESPACE, _app_obj(include_owner_ref=False))
+        result = _classify(cluster)
+        self.assertEqual(result["state"], runtime_state.STATE_MIGRATION_CANDIDATE)
+        self.assertEqual(result["reasons"], [])
 
 
 class RuntimeStateNoMutationSourceSweepTests(unittest.TestCase):

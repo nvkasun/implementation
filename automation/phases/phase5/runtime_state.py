@@ -213,6 +213,32 @@ def _check_applicationset_ownership(appset_obj, appset_name, app_name, environme
     if actual_template_repo_url != expected_repo_url:
         reasons.append(f"ApplicationSet {appset_name} spec.template.spec.source.repoURL={actual_template_repo_url!r}, expected {expected_repo_url!r}")
 
+    if not ((appset_obj.get("metadata") or {})).get("uid"):
+        # ApplicationSet Controller Readiness + Child ownerReference correction: an ApplicationSet with no metadata.uid can never be the actual controller of any child Application's ownerReference (which must carry that exact UID) -- treated as BROKEN here rather than allowed to silently pass ownership and then fail the (unrelated-looking) ownerReference check on the child below.
+        reasons.append(f"ApplicationSet {appset_name} metadata.uid is missing/empty")
+
+    return reasons
+
+
+def _check_child_owner_reference(app_obj, app_name, appset_name, appset_uid):
+    """ApplicationSet Controller Readiness + Child ownerReference correction: a child Application existing under an already-owned ApplicationSet is not accepted as genuinely self-healing merely because it exists and is otherwise correctly shaped -- it must carry the EXACT controller ownerReference the garbage-collector cascade-delete/recreate guarantee actually depends on (apiVersion=argoproj.io/v1alpha1, kind=ApplicationSet, name=<appset_name>, uid=<the ApplicationSet's own actual metadata.uid>, controller=true). Only ever called when the ApplicationSet is already proven owned AND the child Application is present -- never for the no-ApplicationSet (MIGRATION_CANDIDATE/standalone) path, where no such ownerReference could exist yet, and never when the child is merely absent (that remains the recoverable OWNED shape). Missing, wrong-name, wrong-UID, wrong-kind/apiVersion, controller!=true, or more than one controller=true ownerReference are all rejected -- Kubernetes itself never allows two controller owners on one object, so more than one here is itself evidence this object was not created by the expected ApplicationSet generator."""
+    owner_refs = (app_obj.get("metadata") or {}).get("ownerReferences") or []
+    controller_refs = [ref for ref in owner_refs if isinstance(ref, dict) and ref.get("controller") is True]
+    if not controller_refs:
+        return [f"Application {app_name} has no controller ownerReference to ApplicationSet {appset_name} -- the self-healing ownership relationship is not in place"]
+    if len(controller_refs) > 1:
+        return [f"Application {app_name} has {len(controller_refs)} controller ownerReferences, expected exactly 1 (to ApplicationSet {appset_name})"]
+
+    ref = controller_refs[0]
+    reasons = []
+    if ref.get("apiVersion") != "argoproj.io/v1alpha1":
+        reasons.append(f"Application {app_name} controller ownerReference apiVersion={ref.get('apiVersion')!r}, expected 'argoproj.io/v1alpha1'")
+    if ref.get("kind") != "ApplicationSet":
+        reasons.append(f"Application {app_name} controller ownerReference kind={ref.get('kind')!r}, expected 'ApplicationSet'")
+    if ref.get("name") != appset_name:
+        reasons.append(f"Application {app_name} controller ownerReference name={ref.get('name')!r}, expected {appset_name!r}")
+    if ref.get("uid") != appset_uid:
+        reasons.append(f"Application {app_name} controller ownerReference uid={ref.get('uid')!r}, expected {appset_uid!r} (the ApplicationSet's own metadata.uid)")
     return reasons
 
 
@@ -259,6 +285,7 @@ def classify(run, environment, deployment_id, argocd_namespace, runtime_namespac
     non_pvc_footprint_found = any(found for label, (found, _obj) in footprint.items() if label != _PVC_KIND)
 
     appset_owned = False
+    appset_uid = None
     if appset_found:
         appset_reasons = _check_applicationset_ownership(appset_obj, appset_name, app_name, environment, deployment_id, runtime_namespace, expected_repo_url)
         if appset_reasons:
@@ -266,11 +293,13 @@ def classify(run, environment, deployment_id, argocd_namespace, runtime_namespac
             reasons.extend(appset_reasons)
         else:
             appset_owned = True
+            appset_uid = ((appset_obj.get("metadata") or {})).get("uid")
 
     if appset_owned:
-        # State #2/#3: the ApplicationSet itself is correctly owned. The generated child Application's presence/absence is verified, but its ABSENCE is a recoverable OWNED condition (the ApplicationSet controller is expected to recreate it), never an orphan-footprint BROKEN one -- this is the entire self-healing point of this feature. A child that DOES exist under the expected name must still be genuinely this deployment's own (State #7: a foreign/unrelated child under the expected name remains BROKEN).
+        # State #2/#3: the ApplicationSet itself is correctly owned. The generated child Application's presence/absence is verified, but its ABSENCE is a recoverable OWNED condition (the ApplicationSet controller is expected to recreate it), never an orphan-footprint BROKEN one -- this is the entire self-healing point of this feature. A child that DOES exist under the expected name must still be genuinely this deployment's own (State #7: a foreign/unrelated child under the expected name remains BROKEN) AND must carry the exact controller ownerReference back to this ApplicationSet (ApplicationSet Controller Readiness + Child ownerReference correction) -- "ApplicationSet object exists + child Application is healthy" alone is never accepted as proof of the controller-managed self-healing relationship.
         if app_found:
             reasons.extend(_check_application_ownership(app_obj, app_name, environment, deployment_id, runtime_namespace, expected_repo_url))
+            reasons.extend(_check_child_owner_reference(app_obj, app_name, appset_name, appset_uid))
         # Footprint ownership-label checks still apply unconditionally below; the "orphan non-PVC footprint without an owning Application" rule from the no-ApplicationSet path is deliberately NOT applied here -- a correctly-owned ApplicationSet is itself the authoritative ownership signal for any leftover-from-last-sync compute footprint while the child Application is being recreated.
     elif not appset_found:
         # No ApplicationSet at all: preserve the exact pre-feature ownership-safety behavior for the Application/footprint, with ONE addition -- a standalone Application that passes every existing ownership check is MIGRATION_CANDIDATE, never silently treated as the fully self-healing OWNED shape (State #6).
