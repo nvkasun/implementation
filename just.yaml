@@ -1,5 +1,122 @@
-Also, for the backend health validation, I deployed a lightweight Python health-agent service on both Oracle DB VMs.
+In identity.tf, add the VM download identity:
 
-Azure Load Balancer periodically sends an HTTP health probe to <VM-IP>:8080/health. When the request is received, the agent performs Oracle-level validation rather than only checking whether the VM is reachable. It verifies the Oracle database/instance state, listener availability on port 1521, pdb1 service registration/readiness, PDB1 READ WRITE status, and executes a real SQL query against the PDB.
+resource "azurerm_user_assigned_identity" "oracle_binary_vm" {
+  name                = "id-oracle-binary-vm-${var.environment}-uan"
+  resource_group_name = module.oracle_db_resource_group.rg_name
+  location            = var.location
 
-If all mandatory checks pass, the agent returns HTTP 200 / HEALTHY, and Azure keeps that VM eligible for new Oracle connections. If any critical check fails, the probe fails and Azure removes that VM from new-connection selection until it becomes healthy again.
+  tags = local.tags
+}
+
+Then add a new file such as oracle_binary_storage.tf:
+
+module "oracle_binary_storage" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/azure-terraform.git//modules/storage?ref=main"
+
+  resource_group = module.oracle_db_resource_group.rg_name
+  location       = var.location
+  environment    = var.environment
+
+  application_name     = "oraclebinary"
+  storage_account_name = "clft${var.environment}orabin"
+  storage_use          = "orabin"
+
+  account_kind = "StorageV2"
+  skuname      = "Standard_LRS"
+
+  public_network_access_enabled = false
+  allow_nested_items_to_be_public = false
+
+  containers_list = [
+    {
+      name        = "oracle-binaries"
+      access_type = "private"
+    }
+  ]
+
+  privatelink_subnet = {
+    name = module.base-infra.subnet_map[
+      "snet-cloud-native-pe-cl-factory-uaenorth-001"
+    ].name
+
+    vnet_name      = module.base-infra.vnet_name
+    resource_group = module.resource_group.rg_name
+  }
+
+  private_dns_zone_ids = data.azurerm_private_dns_zone.sa_dns_zone.id
+
+  customer_managed_key    = true
+  managed_identity_type   = "UserAssigned"
+  azurerm_key_vault_key   = "oracle-binary-storage-key"
+  kv_name                 = basename(module.azure_key_vault.id)
+  kv_resource_group_name  = module.resource_group.rg_name
+
+  tags = local.tags
+}
+
+resource "azurerm_role_assignment" "oracle_binary_blob_reader" {
+  scope = module.oracle_binary_storage.containers["oracle-binaries"]
+
+  role_definition_name = "Storage Blob Data Reader"
+  principal_id         = azurerm_user_assigned_identity.oracle_binary_vm.principal_id
+}
+
+I kept CMK enabled because your environment has already demonstrated CMK-policy enforcement. I would not weaken that for this test.
+
+Then append VM04 to virtual_machine.tf:
+
+module "oracle_binary_vm04" {
+  source = "./modules/virtual-machine"
+
+  resource_group_name = module.oracle_db_resource_group.rg_name
+  application_name    = "004"
+  environment         = var.environment
+
+  subnet_id = module.base-infra.subnet_map[
+    "snet-lb-cl-factory-uaenorth-001"
+  ].id
+
+  key_vault_id = module.azure_key_vault.id
+
+  dns_servers   = []
+  computer_name = "oraclebinvm04"
+
+  vm = {
+    os_type = "linux"
+  }
+
+  vm_size           = "Standard_E2s_v5"
+  availability_zone = "3"
+
+  source_image_reference = {
+    publisher = "RedHat"
+    offer     = "RHEL"
+    sku       = "94_gen2"
+    version   = "latest"
+  }
+
+  admin_username = "azureuser"
+  admin_password = var.oracle_db_vm_admin_password
+
+  managed_identities = {
+    system_assigned = false
+
+    user_assigned_resource_ids = [
+      azurerm_user_assigned_identity.oracle_binary_vm.id
+    ]
+  }
+
+  os_disk = {
+    caching              = "ReadWrite"
+    storage_account_type = "StandardSSD_LRS"
+    disk_size_gb         = 64
+  }
+
+  accelerated_networking_enabled = true
+  ip_forwarding_enabled          = false
+  enable_boot_diagnostics        = true
+  encryption_at_host_enabled     = false
+  patch_mode_linux               = "ImageDefault"
+
+  tags = local.tags
+}
