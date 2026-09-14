@@ -1,26 +1,17 @@
-Subject: Support Required – Storage Account Creation Blocked by CMK Policy
+Create a new file in your current Terraform root, for example:
 
-Hi Team,
+terraform/private_dns_zone.tf
 
-We are trying to provision an Azure Storage Account using the approved corporate azure-terraform/modules/storage module.
+Use this:
 
-The module is configured with:
+resource "azurerm_private_dns_zone_virtual_network_link" "oracle_binary_blob" {
+  provider = azurerm.connectivity
 
-customer_managed_key  = true
-managed_identity_type = "UserAssigned"
+  name                  = local.virtual_network_links["cloudfactory"].name
+  resource_group_name   = data.azurerm_private_dns_zone.sa_dns_zone.resource_group_name
+  private_dns_zone_name = data.azurerm_private_dns_zone.sa_dns_zone.name
+  virtual_network_id    = local.virtual_network_links["cloudfactory"].virtual_network_id
+  registration_enabled  = false
 
-The Terraform plan confirms that the Storage Account includes both the Customer Managed Key configuration and the User Assigned Managed Identity. We are currently using AzureRM provider v4.81.0.
-
-However, during terraform apply, Storage Account creation is rejected with the following policy error:
-
-RequestDisallowedByPolicy:
-Customer-Managed Keys (CMK) must be enforced at the time of resource creation.
-
-We have retried the deployment after allowing time for the Key Vault/RBAC permissions to propagate, but the same Storage Account policy error remains.
-
-Could you please advise whether there is an approved version/configuration of the corporate Storage module that supports the CMK-at-resource-creation policy, or if any additional module configuration is required?
-
-I can share the Terraform plan and apply logs if required.
-
-Thanks,
-Kasun
+  tags = local.tags
+}
