@@ -1,122 +1,26 @@
-In identity.tf, add the VM download identity:
+Subject: Support Required – Storage Account Creation Blocked by CMK Policy
 
-resource "azurerm_user_assigned_identity" "oracle_binary_vm" {
-  name                = "id-oracle-binary-vm-${var.environment}-uan"
-  resource_group_name = module.oracle_db_resource_group.rg_name
-  location            = var.location
+Hi Team,
 
-  tags = local.tags
-}
+We are trying to provision an Azure Storage Account using the approved corporate azure-terraform/modules/storage module.
 
-Then add a new file such as oracle_binary_storage.tf:
+The module is configured with:
 
-module "oracle_binary_storage" {
-  source = "git::https://github.com/AbuDhabiCommercialBank/azure-terraform.git//modules/storage?ref=main"
+customer_managed_key  = true
+managed_identity_type = "UserAssigned"
 
-  resource_group = module.oracle_db_resource_group.rg_name
-  location       = var.location
-  environment    = var.environment
+The Terraform plan confirms that the Storage Account includes both the Customer Managed Key configuration and the User Assigned Managed Identity. We are currently using AzureRM provider v4.81.0.
 
-  application_name     = "oraclebinary"
-  storage_account_name = "clft${var.environment}orabin"
-  storage_use          = "orabin"
+However, during terraform apply, Storage Account creation is rejected with the following policy error:
 
-  account_kind = "StorageV2"
-  skuname      = "Standard_LRS"
+RequestDisallowedByPolicy:
+Customer-Managed Keys (CMK) must be enforced at the time of resource creation.
 
-  public_network_access_enabled = false
-  allow_nested_items_to_be_public = false
+We have retried the deployment after allowing time for the Key Vault/RBAC permissions to propagate, but the same Storage Account policy error remains.
 
-  containers_list = [
-    {
-      name        = "oracle-binaries"
-      access_type = "private"
-    }
-  ]
+Could you please advise whether there is an approved version/configuration of the corporate Storage module that supports the CMK-at-resource-creation policy, or if any additional module configuration is required?
 
-  privatelink_subnet = {
-    name = module.base-infra.subnet_map[
-      "snet-cloud-native-pe-cl-factory-uaenorth-001"
-    ].name
+I can share the Terraform plan and apply logs if required.
 
-    vnet_name      = module.base-infra.vnet_name
-    resource_group = module.resource_group.rg_name
-  }
-
-  private_dns_zone_ids = data.azurerm_private_dns_zone.sa_dns_zone.id
-
-  customer_managed_key    = true
-  managed_identity_type   = "UserAssigned"
-  azurerm_key_vault_key   = "oracle-binary-storage-key"
-  kv_name                 = basename(module.azure_key_vault.id)
-  kv_resource_group_name  = module.resource_group.rg_name
-
-  tags = local.tags
-}
-
-resource "azurerm_role_assignment" "oracle_binary_blob_reader" {
-  scope = module.oracle_binary_storage.containers["oracle-binaries"]
-
-  role_definition_name = "Storage Blob Data Reader"
-  principal_id         = azurerm_user_assigned_identity.oracle_binary_vm.principal_id
-}
-
-I kept CMK enabled because your environment has already demonstrated CMK-policy enforcement. I would not weaken that for this test.
-
-Then append VM04 to virtual_machine.tf:
-
-module "oracle_binary_vm04" {
-  source = "./modules/virtual-machine"
-
-  resource_group_name = module.oracle_db_resource_group.rg_name
-  application_name    = "004"
-  environment         = var.environment
-
-  subnet_id = module.base-infra.subnet_map[
-    "snet-lb-cl-factory-uaenorth-001"
-  ].id
-
-  key_vault_id = module.azure_key_vault.id
-
-  dns_servers   = []
-  computer_name = "oraclebinvm04"
-
-  vm = {
-    os_type = "linux"
-  }
-
-  vm_size           = "Standard_E2s_v5"
-  availability_zone = "3"
-
-  source_image_reference = {
-    publisher = "RedHat"
-    offer     = "RHEL"
-    sku       = "94_gen2"
-    version   = "latest"
-  }
-
-  admin_username = "azureuser"
-  admin_password = var.oracle_db_vm_admin_password
-
-  managed_identities = {
-    system_assigned = false
-
-    user_assigned_resource_ids = [
-      azurerm_user_assigned_identity.oracle_binary_vm.id
-    ]
-  }
-
-  os_disk = {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = 64
-  }
-
-  accelerated_networking_enabled = true
-  ip_forwarding_enabled          = false
-  enable_boot_diagnostics        = true
-  encryption_at_host_enabled     = false
-  patch_mode_linux               = "ImageDefault"
-
-  tags = local.tags
-}
+Thanks,
+Kasun
