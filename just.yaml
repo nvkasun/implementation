@@ -1,17 +1,264 @@
-Create a new file in your current Terraform root, for example:
+#!/usr/bin/env python3
 
-terraform/private_dns_zone.tf
+import json
+import socket
+import sys
+import urllib.parse
+import urllib.request
+import urllib.error
+import xml.etree.ElementTree as ET
+import ipaddress
 
-Use this:
+STORAGE_ACCOUNT = "clftdevorabin40ayym"
+CONTAINER_NAME = "oracle-binaries"
 
-resource "azurerm_private_dns_zone_virtual_network_link" "oracle_binary_blob" {
-  provider = azurerm.connectivity
+MANAGED_IDENTITY_RESOURCE_ID = (
+    "/subscriptions/1a233215-09f6-404f-8536-bc83100ba1fa/"
+    "resourceGroups/rg-CloudFactory-dev-uaenorth-oracledb/"
+    "providers/Microsoft.ManagedIdentity/userAssignedIdentities/"
+    "id-oracle-binary-vm-dev-uan"
+)
 
-  name                  = local.virtual_network_links["cloudfactory"].name
-  resource_group_name   = data.azurerm_private_dns_zone.sa_dns_zone.resource_group_name
-  private_dns_zone_name = data.azurerm_private_dns_zone.sa_dns_zone.name
-  virtual_network_id    = local.virtual_network_links["cloudfactory"].virtual_network_id
-  registration_enabled  = false
+BLOB_HOST = f"{STORAGE_ACCOUNT}.blob.core.windows.net"
 
-  tags = local.tags
-}
+IMDS_ENDPOINT = "http://169.254.169.254/metadata/identity/oauth2/token"
+STORAGE_RESOURCE = "https://storage.azure.com/"
+
+AZURE_STORAGE_API_VERSION = "2023-11-03"
+
+
+def print_result(name, status, detail=""):
+    print(f"{name:<32}: {status}")
+    if detail:
+        print(f"{'':<34}{detail}")
+
+
+def resolve_storage_endpoint():
+    try:
+        addresses = socket.getaddrinfo(
+            BLOB_HOST,
+            443,
+            socket.AF_INET,
+            socket.SOCK_STREAM
+        )
+
+        ips = sorted(set(item[4][0] for item in addresses))
+
+        if not ips:
+            raise RuntimeError("No IPv4 address returned")
+
+        print_result("DNS resolution", "SUCCESS", ", ".join(ips))
+
+        private_ips = []
+
+        for ip in ips:
+            if ipaddress.ip_address(ip).is_private:
+                private_ips.append(ip)
+
+        if not private_ips:
+            print_result(
+                "Private endpoint DNS",
+                "FAILED",
+                "Storage endpoint did not resolve to a private IP"
+            )
+            return False
+
+        print_result(
+            "Private endpoint DNS",
+            "SUCCESS",
+            f"Private IP: {', '.join(private_ips)}"
+        )
+
+        return True
+
+    except Exception as exc:
+        print_result("DNS resolution", "FAILED", str(exc))
+        return False
+
+
+def get_managed_identity_token():
+    params = {
+        "api-version": "2018-02-01",
+        "resource": STORAGE_RESOURCE,
+        "mi_res_id": MANAGED_IDENTITY_RESOURCE_ID,
+    }
+
+    url = IMDS_ENDPOINT + "?" + urllib.parse.urlencode(params)
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Metadata": "true"
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        token = payload.get("access_token")
+
+        if not token:
+            raise RuntimeError(
+                "IMDS response did not contain an access_token"
+            )
+
+        print_result(
+            "Managed Identity token",
+            "SUCCESS",
+            f"Identity: id-oracle-binary-vm-dev-uan"
+        )
+
+        return token
+
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+
+        print_result(
+            "Managed Identity token",
+            "FAILED",
+            f"HTTP {exc.code}: {body}"
+        )
+
+    except Exception as exc:
+        print_result(
+            "Managed Identity token",
+            "FAILED",
+            str(exc)
+        )
+
+    return None
+
+
+def list_blobs(access_token):
+    query = urllib.parse.urlencode(
+        {
+            "restype": "container",
+            "comp": "list",
+        }
+    )
+
+    url = (
+        f"https://{BLOB_HOST}/"
+        f"{CONTAINER_NAME}?{query}"
+    )
+
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "x-ms-version": AZURE_STORAGE_API_VERSION,
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            status = response.status
+            body = response.read()
+
+        if status != 200:
+            raise RuntimeError(
+                f"Unexpected HTTP status: {status}"
+            )
+
+        print_result(
+            "Blob container access",
+            "SUCCESS",
+            f"HTTP {status}"
+        )
+
+        root = ET.fromstring(body)
+
+        blobs = []
+
+        for blob in root.findall(".//Blob"):
+            name_element = blob.find("Name")
+
+            if name_element is not None and name_element.text:
+                blobs.append(name_element.text)
+
+        print()
+        print("Files in container")
+        print("------------------")
+
+        if not blobs:
+            print("Container is accessible but currently contains no blobs.")
+        else:
+            for index, blob_name in enumerate(blobs, start=1):
+                print(f"{index:02d}. {blob_name}")
+
+        return True
+
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+
+        print_result(
+            "Blob container access",
+            "FAILED",
+            f"HTTP {exc.code}"
+        )
+
+        if exc.code == 403:
+            print(
+                "                                  "
+                "Managed Identity reached Storage, "
+                "but Blob Data Reader permission was denied."
+            )
+
+        print()
+        print(body)
+
+    except Exception as exc:
+        print_result(
+            "Blob container access",
+            "FAILED",
+            str(exc)
+        )
+
+    return False
+
+
+def main():
+    print()
+    print("Oracle Binary Storage Access Test")
+    print("=================================")
+    print(f"VM hostname                     : {socket.gethostname()}")
+    print(f"Storage account                : {STORAGE_ACCOUNT}")
+    print(f"Container                      : {CONTAINER_NAME}")
+    print(f"Blob endpoint                  : https://{BLOB_HOST}")
+    print()
+
+    if not resolve_storage_endpoint():
+        print()
+        print("FINAL RESULT: FAILED")
+        print("Private DNS / Private Endpoint validation failed.")
+        sys.exit(1)
+
+    token = get_managed_identity_token()
+
+    if not token:
+        print()
+        print("FINAL RESULT: FAILED")
+        print("Managed Identity authentication failed.")
+        sys.exit(1)
+
+    if not list_blobs(token):
+        print()
+        print("FINAL RESULT: FAILED")
+        print("Blob container access validation failed.")
+        sys.exit(1)
+
+    print()
+    print("FINAL RESULT: PASS")
+    print(
+        "VM04 successfully accessed the Oracle binary container "
+        "through the private Blob endpoint using Managed Identity."
+    )
+
+
+if __name__ == "__main__":
+    main()
