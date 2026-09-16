@@ -1,10 +1,67 @@
-Hi Jharna,
+module "oracle_binary_vm04" {
+  source = "./modules/virtual-machine"
 
-Thank you for your support and for pointing us to the maz-tf-module-storage module.
+  resource_group_name = module.oracle_db_resource_group.rg_name
+  application_name    = "004"
+  environment         = var.environment
 
-We have now updated our implementation to use the recommended module and successfully provisioned the Storage Account with CMK, Managed Identity and Private Endpoint configuration. We have also validated private connectivity from the VM to the Blob Storage endpoint.
+  subnet_id = module.base-infra.subnet_map[
+    "snet-lb-cl-factory-uaenorth-001"
+  ].id
 
-Really appreciate your prompt guidance and support on this.
+  key_vault_id = module.azure_key_vault.id
 
-Kind regards,
-Kasun
+  dns_servers   = []
+  computer_name = "oraclebinvm04"
+
+  vm = {
+    os_type = "linux"
+  }
+
+  vm_size           = "Standard_E8s_v5"
+  availability_zone = "3"
+
+  source_image_reference = {
+    publisher = "RedHat"
+    offer     = "RHEL"
+    sku       = "9-lvm-gen2"
+    version   = "latest"
+  }
+
+  admin_username = "azureuser"
+  admin_password = var.oracle_db_vm_admin_password
+
+  managed_identities = {
+    system_assigned = false
+
+    user_assigned_resource_ids = [
+      azurerm_user_assigned_identity.oracle_binary_vm.id
+    ]
+  }
+
+  os_disk = {
+    caching              = "ReadWrite"
+    storage_account_type = "StandardSSD_LRS"
+    disk_size_gb         = 64
+  }
+
+  data_disks = {
+    oracle_data = {
+      name                 = "oracle-data"
+      storage_account_type = "StandardSSD_LRS"
+      disk_size_gb         = 400
+      lun                  = 0
+      caching              = "None"
+      create_option        = "Empty"
+      tags                 = local.tags
+    }
+  }
+
+  accelerated_networking_enabled = true
+  ip_forwarding_enabled          = false
+  enable_boot_diagnostics        = true
+  encryption_at_host_enabled     = false
+  patch_mode_linux               = "ImageDefault"
+
+  tags = local.tags
+}
