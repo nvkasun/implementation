@@ -1,67 +1,12 @@
-module "oracle_binary_vm04" {
-  source = "./modules/virtual-machine"
+Hi Ambrose,
 
-  resource_group_name = module.oracle_db_resource_group.rg_name
-  application_name    = "004"
-  environment         = var.environment
+Thank you for the detailed clarification regarding the automatic backup window time change. In addition to that, we would like to follow up on the second concern we discussed yesterday regarding the planned Multi-AZ enablement for our existing production RDS for Oracle database.
 
-  subnet_id = module.base-infra.subnet_map[
-    "snet-lb-cl-factory-uaenorth-001"
-  ].id
+We would like to clarify the following two points before proceeding:
 
-  key_vault_id = module.azure_key_vault.id
+During Multi-AZ enablement:
+Currently, our existing Read Replica is asynchronously replicating from the primary RDS Oracle instance. While enabling Multi-AZ, if any failover or change of the active primary occurs during the enablement process, will the existing Read Replica automatically reconnect and continue replication from the active primary? Or would any manual intervention be required?
+After Multi-AZ enablement:
+Once Multi-AZ is enabled, if a future failover occurs and the standby instance in the secondary AZ becomes the new primary, will our existing Read Replica automatically switch its replication source to the newly promoted primary and continue replication without any manual intervention?
 
-  dns_servers   = []
-  computer_name = "oraclebinvm04"
-
-  vm = {
-    os_type = "linux"
-  }
-
-  vm_size           = "Standard_E8s_v5"
-  availability_zone = "3"
-
-  source_image_reference = {
-    publisher = "RedHat"
-    offer     = "RHEL"
-    sku       = "9-lvm-gen2"
-    version   = "latest"
-  }
-
-  admin_username = "azureuser"
-  admin_password = var.oracle_db_vm_admin_password
-
-  managed_identities = {
-    system_assigned = false
-
-    user_assigned_resource_ids = [
-      azurerm_user_assigned_identity.oracle_binary_vm.id
-    ]
-  }
-
-  os_disk = {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = 64
-  }
-
-  data_disks = {
-    oracle_data = {
-      name                 = "oracle-data"
-      storage_account_type = "StandardSSD_LRS"
-      disk_size_gb         = 400
-      lun                  = 0
-      caching              = "None"
-      create_option        = "Empty"
-      tags                 = local.tags
-    }
-  }
-
-  accelerated_networking_enabled = true
-  ip_forwarding_enabled          = false
-  enable_boot_diagnostics        = true
-  encryption_at_host_enabled     = false
-  patch_mode_linux               = "ImageDefault"
-
-  tags = local.tags
-}
+Could you please confirm the expected behavior for these two scenarios?
