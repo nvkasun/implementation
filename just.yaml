@@ -1,110 +1,45 @@
-{
-  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.0.0.0",
-  "parameters": {
-    "galleryName": {
-      "type": "string",
-      "defaultValue": "acgCloudFactorydevuaenorthoracledb"
-    },
-    "imageDefinitionName": {
-      "type": "string",
-      "defaultValue": "RHEL-9.8-oracle-db"
-    },
-    "imageVersion": {
-      "type": "string",
-      "defaultValue": "1.0.0"
-    },
-    "sourceVmName": {
-      "type": "string",
-      "defaultValue": "vm-004-dev-uan-b245iy"
-    },
-    "location": {
-      "type": "string",
-      "defaultValue": "uaenorth"
-    },
-    "diskEncryptionSetResourceId": {
-      "type": "string",
-      "metadata": {
-        "description": "Full resource ID of the Disk Encryption Set used by VM04."
-      }
-    }
-  },
-  "variables": {
-    "commonTags": {
-      "ApplicationName": "CloudFactory",
-      "BusinessCriticality": "Low",
-      "BusinessUnit": "TechnologyPlatform",
-      "CostCenter": "219",
-      "DataClassification": "General",
-      "DeployedBy": "Manual",
-      "Environment": "dev",
-      "RequestReference": "PO15763"
-    }
-  },
-  "resources": [
-    {
-      "type": "Microsoft.Compute/galleries/images",
-      "apiVersion": "2024-03-03",
-      "name": "[format('{0}/{1}', parameters('galleryName'), parameters('imageDefinitionName'))]",
-      "location": "[parameters('location')]",
-      "tags": "[variables('commonTags')]",
-      "properties": {
-        "architecture": "x64",
-        "hyperVGeneration": "V2",
-        "identifier": {
-          "publisher": "ADCB",
-          "offer": "CloudFactoryOracle",
-          "sku": "RHEL98"
-        },
-        "osState": "Specialized",
-        "osType": "Linux"
-      }
-    },
-    {
-      "type": "Microsoft.Compute/galleries/images/versions",
-      "apiVersion": "2024-03-03",
-      "name": "[format('{0}/{1}/{2}', parameters('galleryName'), parameters('imageDefinitionName'), parameters('imageVersion'))]",
-      "location": "[parameters('location')]",
-      "tags": "[variables('commonTags')]",
-      "dependsOn": [
-        "[resourceId('Microsoft.Compute/galleries/images', parameters('galleryName'), parameters('imageDefinitionName'))]"
-      ],
-      "properties": {
-        "publishingProfile": {
-          "excludeFromLatest": false,
-          "replicaCount": 1,
-          "replicationMode": "Full",
-          "storageAccountType": "Standard_ZRS",
-          "targetRegions": [
-            {
-              "name": "[parameters('location')]",
-              "regionalReplicaCount": 1,
-              "storageAccountType": "Standard_ZRS",
-              "excludeFromLatest": false,
-              "encryption": {
-                "osDiskImage": {
-                  "diskEncryptionSetId": "[parameters('diskEncryptionSetResourceId')]"
-                },
-                "dataDiskImages": [
-                  {
-                    "lun": 0,
-                    "diskEncryptionSetId": "[parameters('diskEncryptionSetResourceId')]"
-                  }
-                ]
-              }
-            }
-          ]
-        },
-        "storageProfile": {
-          "source": {
-            "virtualMachineId": "[resourceId('Microsoft.Compute/virtualMachines', parameters('sourceVmName'))]"
-          }
-        },
-        "safetyProfile": {
-          "allowDeletionOfReplicatedLocations": false,
-          "blockDeletionBeforeEndOfLife": false
-        }
-      }
-    }
-  ]
+module "oracle_binary_vm05" {
+  source = "./modules/virtual-machine"
+
+  resource_group_name = module.oracle_db_resource_group.rg_name
+  application_name    = "005"
+  environment         = var.environment
+
+  subnet_id = module.base-infra.subnet_map[
+    "snet-lb-cl-factory-uaenorth-001"
+  ].id
+
+  key_vault_id = module.azure_key_vault.id
+
+  dns_servers = []
+
+  vm = {
+    os_type = "linux"
+  }
+
+  vm_size           = "Standard_E8s_v5"
+  availability_zone = "3"
+
+  source_image_id = "/subscriptions/1a233215-09f6-404f-8536-bc83100ba1fa/resourceGroups/rg-CloudFactory-dev-uaenorth-oracledb/providers/Microsoft.Compute/galleries/acgCloudFactorydevuaenorthoracledb/images/RHEL-9.8-oracle-db/versions/1.0.0"
+
+  managed_identities = {
+    system_assigned = false
+
+    user_assigned_resource_ids = [
+      azurerm_user_assigned_identity.oracle_binary_vm.id
+    ]
+  }
+
+  os_disk = {
+    caching              = "ReadWrite"
+    storage_account_type = "StandardSSD_LRS"
+    disk_size_gb         = 64
+  }
+
+  accelerated_networking_enabled = true
+  ip_forwarding_enabled          = false
+  enable_boot_diagnostics        = true
+  encryption_at_host_enabled     = false
+
+  tags = local.tags
 }
