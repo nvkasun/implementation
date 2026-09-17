@@ -25,7 +25,7 @@
     "diskEncryptionSetResourceId": {
       "type": "string",
       "metadata": {
-        "description": "Full resource ID of the Disk Encryption Set used by VM04 OS and data disks."
+        "description": "Full resource ID of the Disk Encryption Set used by VM04."
       }
     }
   },
@@ -98,16 +98,7 @@
         "storageProfile": {
           "source": {
             "virtualMachineId": "[resourceId('Microsoft.Compute/virtualMachines', parameters('sourceVmName'))]"
-          },
-          "osDiskImage": {
-            "hostCaching": "ReadWrite"
-          },
-          "dataDiskImages": [
-            {
-              "lun": 0,
-              "hostCaching": "None"
-            }
-          ]
+          }
         },
         "safetyProfile": {
           "allowDeletionOfReplicatedLocations": false,
@@ -115,15 +106,5 @@
         }
       }
     }
-  ],
-  "outputs": {
-    "imageDefinitionId": {
-      "type": "string",
-      "value": "[resourceId('Microsoft.Compute/galleries/images', parameters('galleryName'), parameters('imageDefinitionName'))]"
-    },
-    "imageVersionId": {
-      "type": "string",
-      "value": "[resourceId('Microsoft.Compute/galleries/images/versions', parameters('galleryName'), parameters('imageDefinitionName'), parameters('imageVersion'))]"
-    }
-  }
+  ]
 }
