@@ -1,12 +1,129 @@
-Hi Ambrose,
-
-Thank you so much for the detailed clarification regarding the automatic backup window time change.
-
-Apart from that, we would like to follow up on the second concern we discussed yesterday regarding the planned Multi-AZ enablement for our existing production RDS for Oracle database. We would like to clarify the following two points before proceeding:
-
-During Multi-AZ enablement:
-Currently, our existing Read Replica is asynchronously replicating from the primary RDS Oracle instance. While enabling Multi-AZ on the primary database, will there be any impact on the existing Read Replica or its replication process? Would any manual intervention be required on the Read Replica during or after the Multi-AZ enablement?
-After Multi-AZ enablement:
-Once Multi-AZ is enabled, if a future failover occurs and the standby instance in the secondary AZ becomes the new primary, will our existing Read Replica automatically switch its replication source to the newly promoted primary and continue replication without any manual intervention?
-
-Could you please confirm the expected behavior for these two scenarios?
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "galleryName": {
+      "type": "string",
+      "defaultValue": "acgCloudFactorydevuaenorthoracledb"
+    },
+    "imageDefinitionName": {
+      "type": "string",
+      "defaultValue": "RHEL-9.8-oracle-db"
+    },
+    "imageVersion": {
+      "type": "string",
+      "defaultValue": "1.0.0"
+    },
+    "sourceVmName": {
+      "type": "string",
+      "defaultValue": "vm-004-dev-uan-b245iy"
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "uaenorth"
+    },
+    "diskEncryptionSetResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Full resource ID of the Disk Encryption Set used by VM04 OS and data disks."
+      }
+    }
+  },
+  "variables": {
+    "commonTags": {
+      "ApplicationName": "CloudFactory",
+      "BusinessCriticality": "Low",
+      "BusinessUnit": "TechnologyPlatform",
+      "CostCenter": "219",
+      "DataClassification": "General",
+      "DeployedBy": "Manual",
+      "Environment": "dev",
+      "RequestReference": "PO15763"
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Compute/galleries/images",
+      "apiVersion": "2024-03-03",
+      "name": "[format('{0}/{1}', parameters('galleryName'), parameters('imageDefinitionName'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]",
+      "properties": {
+        "architecture": "x64",
+        "hyperVGeneration": "V2",
+        "identifier": {
+          "publisher": "ADCB",
+          "offer": "CloudFactoryOracle",
+          "sku": "RHEL98"
+        },
+        "osState": "Specialized",
+        "osType": "Linux"
+      }
+    },
+    {
+      "type": "Microsoft.Compute/galleries/images/versions",
+      "apiVersion": "2024-03-03",
+      "name": "[format('{0}/{1}/{2}', parameters('galleryName'), parameters('imageDefinitionName'), parameters('imageVersion'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/galleries/images', parameters('galleryName'), parameters('imageDefinitionName'))]"
+      ],
+      "properties": {
+        "publishingProfile": {
+          "excludeFromLatest": false,
+          "replicaCount": 1,
+          "replicationMode": "Full",
+          "storageAccountType": "Standard_ZRS",
+          "targetRegions": [
+            {
+              "name": "[parameters('location')]",
+              "regionalReplicaCount": 1,
+              "storageAccountType": "Standard_ZRS",
+              "excludeFromLatest": false,
+              "encryption": {
+                "osDiskImage": {
+                  "diskEncryptionSetId": "[parameters('diskEncryptionSetResourceId')]"
+                },
+                "dataDiskImages": [
+                  {
+                    "lun": 0,
+                    "diskEncryptionSetId": "[parameters('diskEncryptionSetResourceId')]"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "storageProfile": {
+          "source": {
+            "virtualMachineId": "[resourceId('Microsoft.Compute/virtualMachines', parameters('sourceVmName'))]"
+          },
+          "osDiskImage": {
+            "hostCaching": "ReadWrite"
+          },
+          "dataDiskImages": [
+            {
+              "lun": 0,
+              "hostCaching": "None"
+            }
+          ]
+        },
+        "safetyProfile": {
+          "allowDeletionOfReplicatedLocations": false,
+          "blockDeletionBeforeEndOfLife": false
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "imageDefinitionId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/galleries/images', parameters('galleryName'), parameters('imageDefinitionName'))]"
+    },
+    "imageVersionId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/galleries/images/versions', parameters('galleryName'), parameters('imageDefinitionName'), parameters('imageVersion'))]"
+    }
+  }
+}
