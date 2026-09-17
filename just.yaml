@@ -1,106 +1,48 @@
-{
-  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.0.0.0",
-  "parameters": {
-    "location": {
-      "type": "string",
-      "defaultValue": "uaenorth"
-    },
-    "osDiskResourceId": {
-      "type": "string",
-      "metadata": {
-        "description": "Full ARM resource ID of VM04 OS managed disk."
-      }
-    },
-    "dataDiskResourceId": {
-      "type": "string",
-      "metadata": {
-        "description": "Full ARM resource ID of VM04 400 GB data disk."
-      }
-    },
-    "diskEncryptionSetResourceId": {
-      "type": "string",
-      "metadata": {
-        "description": "Full ARM resource ID of the Disk Encryption Set used by VM04."
-      }
-    },
-    "osSnapshotName": {
-      "type": "string",
-      "defaultValue": "snap-vm004-os-rhel98"
-    },
-    "dataSnapshotName": {
-      "type": "string",
-      "defaultValue": "snap-vm004-data-400gb"
-    }
-  },
-  "variables": {
-    "commonTags": {
-      "ApplicationName": "CloudFactory",
-      "BusinessCriticality": "Low",
-      "BusinessUnit": "TechnologyPlatform",
-      "CostCenter": "219",
-      "DataClassification": "General",
-      "DeployedBy": "Manual",
-      "Environment": "dev",
-      "RequestReference": "PO15763"
-    }
-  },
-  "resources": [
-    {
-      "type": "Microsoft.Compute/snapshots",
-      "apiVersion": "2024-03-02",
-      "name": "[parameters('osSnapshotName')]",
-      "location": "[parameters('location')]",
-      "sku": {
-        "name": "Standard_ZRS"
-      },
-      "tags": "[variables('commonTags')]",
-      "properties": {
-        "creationData": {
-          "createOption": "Copy",
-          "sourceResourceId": "[parameters('osDiskResourceId')]"
-        },
-        "encryption": {
-          "type": "EncryptionAtRestWithCustomerKey",
-          "diskEncryptionSetId": "[parameters('diskEncryptionSetResourceId')]"
-        },
-        "incremental": false,
-        "networkAccessPolicy": "DenyAll",
-        "publicNetworkAccess": "Disabled"
-      }
-    },
-    {
-      "type": "Microsoft.Compute/snapshots",
-      "apiVersion": "2024-03-02",
-      "name": "[parameters('dataSnapshotName')]",
-      "location": "[parameters('location')]",
-      "sku": {
-        "name": "Standard_ZRS"
-      },
-      "tags": "[variables('commonTags')]",
-      "properties": {
-        "creationData": {
-          "createOption": "Copy",
-          "sourceResourceId": "[parameters('dataDiskResourceId')]"
-        },
-        "encryption": {
-          "type": "EncryptionAtRestWithCustomerKey",
-          "diskEncryptionSetId": "[parameters('diskEncryptionSetResourceId')]"
-        },
-        "incremental": false,
-        "networkAccessPolicy": "DenyAll",
-        "publicNetworkAccess": "Disabled"
-      }
-    }
-  ],
-  "outputs": {
-    "osSnapshotId": {
-      "type": "string",
-      "value": "[resourceId('Microsoft.Compute/snapshots', parameters('osSnapshotName'))]"
-    },
-    "dataSnapshotId": {
-      "type": "string",
-      "value": "[resourceId('Microsoft.Compute/snapshots', parameters('dataSnapshotName'))]"
-    }
-  }
+Subject: Support Required – Azure Compute Gallery Image Support in VM Terraform Module
+
+Hi Jharna,
+
+As part of our Oracle Database deployment activities, we have prepared a custom RHEL 9.8 machine image with the required Oracle Database deployment configurations and settings. The image includes both the OS disk and the 400 GB data disk, and it has been stored in Azure Compute Gallery so that it can be reused when provisioning new database VMs. Microsoft documents that an Azure Compute Gallery image version is used to create new VM disks and can include both OS and data disk images. Microsoft – Azure Compute Gallery image versions
+
+The image is successfully available under Shared Images in the Azure Portal and can be selected when creating a VM manually. Azure Compute Gallery images can also be shared through RBAC and consumed for VM deployment when the required access is provided. Microsoft – Share Azure Compute Gallery resources
+
+Our next requirement is to provision a new VM in a different subscription using this prebuilt image through Terraform.
+
+While reviewing the latest maz-tf-module-virtual-machine module, we noticed that it currently supports image selection using source_image_reference, for example:
+
+source_image_reference {
+  publisher = var.source_image_reference.publisher
+  offer     = var.source_image_reference.offer
+  sku       = var.source_image_reference.sku
+  version   = var.source_image_reference.version
 }
+
+However, we could not find an option to provide a source_image_id, which would allow us to reference a specific Azure Compute Gallery image version directly. The AzureRM azurerm_linux_virtual_machine resource supports source_image_id, including Shared Image and Shared Image Version IDs, and requires either source_image_id or source_image_reference. HashiCorp – azurerm_linux_virtual_machine
+
+For example:
+
+source_image_id = "/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Compute/galleries/<gallery-name>/images/<image-definition>/versions/<version>"
+
+Would it be possible to support an optional source_image_id in the VM module, so that the module can support both scenarios:
+
+source_image_id = var.source_image_id
+
+or the existing:
+
+source_image_reference {
+  publisher = var.source_image_reference.publisher
+  offer     = var.source_image_reference.offer
+  sku       = var.source_image_reference.sku
+  version   = var.source_image_reference.version
+}
+
+depending on the image source being used?
+
+Our current image is a Specialized Azure Compute Gallery image, so we would also need the module to support this image type when provisioning a VM from source_image_id. Microsoft documents creating VMs directly from specialized Azure Compute Gallery image versions using the image/version ID. Microsoft – Create a VM from a specialized image version
+
+Please let us know if this can be supported in the latest VM module, or if there is another recommended approach for consuming Azure Compute Gallery images through the module.
+
+Thanks again for your continued support.
+
+Kind Regards,
+Kasun
