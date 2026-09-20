@@ -1,1 +1,8 @@
-https://learn.microsoft.com/en-us/azure/virtual-machines/vm-specialized-image-version?utm_source=chatgpt.com
+Hi Lakshmi, sorry for the late reply. I’m also getting the below error while enabling the RDS backup, and it seems to be related to the same IAM permission issue. Since AdministratorAccess is blocked by our SCP, could you please use the below AWS Backup-specific policy instead of the admin privileges?
+
+resource "aws_iam_role_policy_attachment" "this" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup"
+  role       = aws_iam_role.this.name
+}
+
+This should provide the required permissions for AWS Backup without granting full administrator access.
