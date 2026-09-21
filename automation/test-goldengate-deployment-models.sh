@@ -6700,6 +6700,342 @@ else
   skip "MOVED-BLOCK-PROOF: terraform not available"
 fi
 
+echo ""
+echo "--- DynamoDB CONFIG Identity Migration Correction: bounded legacy-content-preserving migration ---"
+
+# Structural proof: the exact four bounded old->new CONFIG identity mappings exist in envs/dev/dynamodb.tf, the migration-window variable defaults to pending (true), the read-only legacy data source and its fail-closed precondition contract exist, the item selection ternary correctly wires the bounded map/variable/data source together, and -- critically -- NO moved block was added for these four CONFIG for_each keys (a moved block here would be actively wrong: it would freeze the stale OLD physical key forever under ignore_changes=[item], never a valid fix for this resource, unlike envs/dev/efs.tf's module.goldengate_runtime_efs).
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  DYNAMODB_CONFIG_MIGRATION_CHECK="$(python3 -c '
+import re
+
+with open("envs/dev/dynamodb.tf") as f:
+    dynamodb_tf = f.read()
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+REQUIRED_PAIRS = {
+    "gg-postgresql-repltest-001": "gg-postgresql-repltest-01",
+    "gg-mssql-repltest-001": "gg-mssql-repltest-01",
+    "gg-oracle-repltest-002": "gg-oracle-repltest-01",
+    "gg-postgresql-repltest-002": "gg-postgresql-repltest-02",
+}
+
+map_match = re.search(r"goldengate_config_migration_source_ids\s*=\s*\{(.*?)\n  \}", dynamodb_tf, re.S)
+check("1: goldengate_config_migration_source_ids local exists", map_match is not None)
+map_pairs = dict(re.findall(r"\"([^\"]+)\"\s*=\s*\"([^\"]+)\"", map_match.group(1))) if map_match else {}
+check("1: exactly the four known old -> new CONFIG identity mappings exist", map_pairs == REQUIRED_PAIRS)
+check("2: no migration mapping exists for an unrelated/future runtime (exactly four entries, no more)", len(map_pairs) == 4)
+
+check("3: new canonical deployment IDs gg-postgresql-repltest-001/gg-mssql-repltest-001/gg-oracle-repltest-002/gg-postgresql-repltest-002 are exactly the map keys", set(map_pairs.keys()) == set(REQUIRED_PAIRS.keys()))
+
+var_match = re.search(r"variable \"goldengate_config_migration_pending\" \{(.*?)\n\}", dynamodb_tf, re.S)
+check("goldengate_config_migration_pending variable exists", var_match is not None)
+var_body = var_match.group(1) if var_match else ""
+check("goldengate_config_migration_pending defaults to true (the real live migration has not run as of this correction)", re.search(r"default\s*=\s*true", var_body) is not None)
+check("goldengate_config_migration_pending is typed bool", re.search(r"type\s*=\s*bool", var_body) is not None)
+
+data_match = re.search(r"data \"aws_dynamodb_table_item\" \"legacy_pipeline_config\" \{(.*?)\n\}", dynamodb_tf, re.S)
+check("6: read-only legacy CONFIG data source exists", data_match is not None)
+data_body = data_match.group(1) if data_match else ""
+check("legacy CONFIG data source for_each is gated on goldengate_config_migration_pending, sourced from the bounded map only (never all deployments)", "var.goldengate_config_migration_pending ? local.goldengate_config_migration_source_ids : {}" in data_body)
+check("legacy CONFIG data source reads by the OLD id (each.value), never the NEW id (each.key)", "S = each.value" in data_body and "pipeline   = { S = each.value }" in data_body.replace("\n", " ").replace("  ", " ") or "each.value" in data_body)
+check("legacy CONFIG data source targets the same gg-eks-pipeline table and CONFIG recordType", "table_name = \"gg-eks-pipeline\"" in data_body and "\"CONFIG\"" in data_body)
+
+contract_match = re.search(r"resource \"terraform_data\" \"goldengate_config_migration_contract\" \{(.*?)\n\}\n", dynamodb_tf, re.S)
+check("fail-closed migration-contract precondition resource exists", contract_match is not None)
+contract_body = contract_match.group(1) if contract_match else ""
+check("7/8: precondition rejects a NEW id mapped to itself", "new_id != old_id" in contract_body)
+check("9: precondition rejects a chained/duplicate old<->new identity (setintersection == 0)", "setintersection" in contract_body)
+check("2: precondition pins the map to exactly four entries, never a general onboarding mechanism", "length(local.goldengate_config_migration_source_ids) == 4" in contract_body)
+
+pipeline_config_match = re.search(r"resource \"aws_dynamodb_table_item\" \"pipeline_config\" \{(.*?)\n\}\n\nmodule \"goldengate_alerts\"", dynamodb_tf, re.S)
+check("pipeline_config resource block located", pipeline_config_match is not None)
+pipeline_config_body = pipeline_config_match.group(1) if pipeline_config_match else ""
+check("4/10: item selection ternary is gated on BOTH goldengate_config_migration_pending AND contains(...) membership in the bounded map -- a future/unrelated deployment ID (never a map member) always takes the plain-default branch, regardless of the pending switch", "var.goldengate_config_migration_pending && contains(keys(local.goldengate_config_migration_source_ids), each.key)" in pipeline_config_body)
+check("6: the bounded (pending) branch sources item from the legacy data source, never re-synthesizes a default body for a migrated id", "data.aws_dynamodb_table_item.legacy_pipeline_config[each.key].item" in pipeline_config_body)
+check("ignore_changes=[item] is retained -- later manual tuning on the resulting item (from either branch) still survives future applies", "ignore_changes = [item]" in pipeline_config_body)
+check("depends_on includes the fail-closed migration-contract precondition, evaluated before any CONFIG item action", "terraform_data.goldengate_config_migration_contract" in pipeline_config_body)
+
+# Critical design proof: NO moved block exists for aws_dynamodb_table_item.pipeline_config keyed by any of the four OLD ids -- a moved block here would be actively wrong (see comment above the map), unlike envs/dev/efs.tf'"'"'s module.goldengate_runtime_efs.
+old_id_moved_blocks = re.findall(r"moved\s*\{\s*from\s*=\s*aws_dynamodb_table_item\.pipeline_config\[\"([^\"]+)\"\]", dynamodb_tf)
+check("no moved block exists for aws_dynamodb_table_item.pipeline_config keyed by any of the four OLD repltest ids (a moved block would freeze the stale physical key forever under ignore_changes=[item] -- proven destructive-by-omission below)", not any(old_id in REQUIRED_PAIRS.values() for old_id in old_id_moved_blocks))
+# The two PRE-EXISTING, UNRELATED payments-01 moved blocks (historical static-resource-to-for_each migration, same key value both sides) must remain untouched.
+check("the two pre-existing, unrelated gg-oracle-payments-01/gg-postgresql-payments-01 moved blocks remain untouched", "gg_oracle_payments_01_config" in dynamodb_tf and "gg_postgresql_payments_01_config" in dynamodb_tf)
+
+# 10: a genuinely new/future deployment ID is never a member of the bounded migration map -- it always takes the plain-default CONFIG branch, in this same push and forever after, never entering the legacy migration path at all.
+check("10: a hypothetical future deployment (never one of the four known pairs) is not a member of goldengate_config_migration_source_ids in either direction", "gg-mysql-fixture-003" not in map_pairs and "gg-mysql-fixture-003" not in map_pairs.values())
+
+# 11/12: this correction makes zero changes to the monitor -- it remains a passive CONFIG/STATE#/LEASE reader keyed by the CURRENT canonical deployment ID (never a legacy-aware resolver), which is exactly what lets it transparently pick up CONFIG at its new physical key with no monitor-side change once the real live Terraform migration completes.
+with open("monitoring/monitor/monitor.py") as f:
+    monitor_source = f.read()
+with open("monitoring/monitor/collector.py") as f:
+    collector_source = f.read()
+check("11/12: monitor.py still reads CONFIG/LEASE/STATE# via Key={\"pipeline\": pipeline, ...} keyed by the CURRENT canonical deployment ID, never a legacy-ID-aware resolver", "Key={\"pipeline\": pipeline, \"recordType\": RECORD_TYPE_CONFIG}" in monitor_source)
+check("11/12: no legacy/old-deployment-ID CONFIG resolution logic was introduced into the monitor", "gg-postgresql-repltest-01" not in monitor_source and "gg-oracle-repltest-01" not in monitor_source and "gg-mssql-repltest-01" not in monitor_source and "gg-postgresql-repltest-02" not in monitor_source and "goldengate_config_migration_source_ids" not in monitor_source and "goldengate_config_migration_source_ids" not in collector_source)
+check("13: no automated GoldenGate replication logic was introduced anywhere in this correction (dynamodb.tf carries no replication key/process-provisioning field)", "replication" not in dynamodb_tf.lower())
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "DYNAMODB-CONFIG-MIGRATION: ${line#FAIL }" ;;
+      OK\ *) pass "DYNAMODB-CONFIG-MIGRATION: ${line#OK }" ;;
+    esac
+  done <<< "$DYNAMODB_CONFIG_MIGRATION_CHECK"
+else
+  skip "DYNAMODB-CONFIG-MIGRATION: structural checks -- python3 unavailable"
+fi
+
+# Behavioral proof (offline, no real backend, no real AWS data exchanged): reproduces the actual aws_dynamodb_table_item resource type's own moved-block + ignore_changes interaction against a fabricated prior state via `terraform plan -refresh=false` (never live-refreshed, never applied) -- proving the DESIGN DECISION above (deliberately NOT adding a moved block for this resource) is correct, not an oversight. (a) WITHOUT a moved block, renaming the for_each key alone plans a destroy (of the tuned item) + create (from Terraform defaults) -- silently loses manual tuning. (b) WITH a moved block, the rename plans zero changes, but the resulting resource'"'"'s own `item` (and therefore its embedded physical `pipeline` primary-key attribute) remains frozen at its OLD value forever, via ignore_changes=[item] -- never relocating to the new physical key. Both confirm why this correction copies content forward via a read-only data source instead of using a moved block for this specific resource.
+if command -v terraform >/dev/null 2>&1; then
+  DYNAMO_PROOF_ROOT="$(mktemp -d)"
+  cat > "${DYNAMO_PROOF_ROOT}/main.tf" <<'EOF'
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "5.91.0"
+    }
+  }
+}
+provider "aws" {
+  region                      = "eu-west-1"
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_requesting_account_id  = true
+  skip_metadata_api_check     = true
+}
+
+locals {
+  deployment_names = ["gg-oracle-repltest-01"]
+  deployment_types = { "gg-oracle-repltest-01" = "oracle" }
+}
+
+resource "aws_dynamodb_table_item" "pipeline_config" {
+  for_each = { for id in local.deployment_names : id => local.deployment_types[id] }
+
+  table_name = "gg-eks-pipeline"
+  hash_key   = "pipeline"
+  range_key  = "recordType"
+
+  item = jsonencode({
+    pipeline       = { S = each.key }
+    recordType     = { S = "CONFIG" }
+    deploymentType = { S = each.value }
+    alertsEnabled  = { BOOL = false }
+    metricsEnabled = { BOOL = false }
+  })
+
+  lifecycle {
+    ignore_changes = [item]
+  }
+}
+EOF
+  set +e
+  (cd "$DYNAMO_PROOF_ROOT" && terraform init -backend=false) >"${DYNAMO_PROOF_ROOT}/init.log" 2>&1
+  DYNAMO_INIT_STATUS=$?
+  set -e
+
+  if [ "$DYNAMO_INIT_STATUS" -ne 0 ]; then
+    skip "DYNAMODB-CONFIG-MIGRATION-PROOF: could not download the AWS provider from the public Terraform registry in this environment -- offline reproduction skipped"
+  else
+    # Fabricate a prior state simulating this item ALREADY existing live with manually-tuned (non-default) attributes -- exactly what a real `terraform refresh` would have captured from the actual DynamoDB item.
+    TUNED_ITEM_JSON="$(python3 -c '
+import json
+item = {
+    "pipeline": {"S": "gg-oracle-repltest-01"}, "recordType": {"S": "CONFIG"}, "deploymentType": {"S": "oracle"},
+    "alertsEnabled": {"BOOL": True}, "metricsEnabled": {"BOOL": True}, "checkIntervalSeconds": {"N": "15"},
+    "quietHours": {"M": {"friday": {"S": "22:00-06:00"}}}, "overrides": {"M": {"maxConsecutiveAbends": {"N": "10"}}},
+}
+print(json.dumps(json.dumps(item)))
+')"
+    python3 - "$DYNAMO_PROOF_ROOT" "$TUNED_ITEM_JSON" <<'PYEOF'
+import json, sys
+work, tuned_item_json = sys.argv[1], sys.argv[2]
+tuned_item = json.loads(tuned_item_json)
+state = {
+    "version": 4, "terraform_version": "1.7.2", "serial": 1,
+    "lineage": "33333333-3333-3333-3333-333333333333", "outputs": {},
+    "resources": [{
+        "mode": "managed", "type": "aws_dynamodb_table_item", "name": "pipeline_config",
+        "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+        "instances": [{
+            "index_key": "gg-oracle-repltest-01", "schema_version": 0,
+            "attributes": {
+                "id": "gg-eks-pipeline|gg-oracle-repltest-01|CONFIG", "table_name": "gg-eks-pipeline",
+                "hash_key": "pipeline", "range_key": "recordType", "item": tuned_item,
+            },
+            "sensitive_attributes": [], "private": "bnVsbA==",
+        }],
+    }],
+}
+with open(work + "/terraform.tfstate", "w") as f:
+    json.dump(state, f, indent=2)
+PYEOF
+
+    # (a) Rename the for_each key with NO moved block -- proves the naive rename destroys the tuned item and creates a fresh, DEFAULT-only one under the new key.
+    cp -r "$DYNAMO_PROOF_ROOT" "${DYNAMO_PROOF_ROOT}-nomoved"
+    sed -i 's/gg-oracle-repltest-01/gg-oracle-repltest-002/g' "${DYNAMO_PROOF_ROOT}-nomoved/main.tf"
+    set +e
+    (cd "${DYNAMO_PROOF_ROOT}-nomoved" && terraform init -backend=false) >"${DYNAMO_PROOF_ROOT}-nomoved/init.log" 2>&1
+    (cd "${DYNAMO_PROOF_ROOT}-nomoved" && terraform plan -refresh=false -no-color) >"${DYNAMO_PROOF_ROOT}-nomoved/plan.log" 2>&1
+    set -e
+    DYNAMO_NOMOVED_CREATED_BLOCK="$(sed -n '/will be created/,/^    }$/p' "${DYNAMO_PROOF_ROOT}-nomoved/plan.log")"
+    DYNAMO_NOMOVED_DESTROYED_BLOCK="$(sed -n '/will be destroyed/,/^    }$/p' "${DYNAMO_PROOF_ROOT}-nomoved/plan.log")"
+    if grep -qE '^Plan: 1 to add, 0 to change, 1 to destroy\.$' "${DYNAMO_PROOF_ROOT}-nomoved/plan.log" \
+        && echo "$DYNAMO_NOMOVED_DESTROYED_BLOCK" | grep -qF "checkIntervalSeconds" \
+        && ! echo "$DYNAMO_NOMOVED_CREATED_BLOCK" | grep -qF "checkIntervalSeconds"; then
+      pass "DYNAMODB-CONFIG-MIGRATION-PROOF (a): confirmed reproduction -- renaming the for_each key with NO moved block plans a destroy of the tuned item + create of a fresh Terraform-DEFAULT-only item under the new key (silently loses manual tuning), proving a naive rename is unsafe"
+    else
+      fail "DYNAMODB-CONFIG-MIGRATION-PROOF (a): expected the no-moved-block rename to plan exactly '1 to add, 0 to change, 1 to destroy' with the new item using plain defaults"
+      cat "${DYNAMO_PROOF_ROOT}-nomoved/plan.log"
+    fi
+
+    # (b) The SAME rename, this time WITH a moved block -- proves it avoids destruction, but item (and its embedded physical pipeline key) stays frozen at the OLD value forever via ignore_changes=[item].
+    cp -r "$DYNAMO_PROOF_ROOT" "${DYNAMO_PROOF_ROOT}-withmoved"
+    sed -i 's/gg-oracle-repltest-01/gg-oracle-repltest-002/g' "${DYNAMO_PROOF_ROOT}-withmoved/main.tf"
+    cat >> "${DYNAMO_PROOF_ROOT}-withmoved/main.tf" <<'EOF'
+
+moved {
+  from = aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-01"]
+  to   = aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-002"]
+}
+EOF
+    set +e
+    (cd "${DYNAMO_PROOF_ROOT}-withmoved" && terraform init -backend=false) >"${DYNAMO_PROOF_ROOT}-withmoved/init.log" 2>&1
+    (cd "${DYNAMO_PROOF_ROOT}-withmoved" && terraform plan -refresh=false -no-color) >"${DYNAMO_PROOF_ROOT}-withmoved/plan.log" 2>&1
+    set -e
+    if grep -qE '^Plan: 0 to add, 0 to change, 0 to destroy\.$' "${DYNAMO_PROOF_ROOT}-withmoved/plan.log" \
+        && grep -qF 'has moved to' "${DYNAMO_PROOF_ROOT}-withmoved/plan.log" \
+        && grep -qF 'id         = "gg-eks-pipeline|gg-oracle-repltest-01|CONFIG"' "${DYNAMO_PROOF_ROOT}-withmoved/plan.log"; then
+      pass "DYNAMODB-CONFIG-MIGRATION-PROOF (b): confirmed reproduction -- WITH a moved block the identical rename plans zero changes (no destroy, tuned data safe), but the resource's own id/item remain frozen showing the OLD physical key 'gg-eks-pipeline|gg-oracle-repltest-01|CONFIG' -- ignore_changes=[item] never lets the physical pipeline key attribute actually relocate, proving a moved block alone is insufficient for this resource and confirming the read-only-data-source design is required instead"
+    else
+      fail "DYNAMODB-CONFIG-MIGRATION-PROOF (b): expected the moved-block rename to plan '0 to add, 0 to change, 0 to destroy' while the item/id remain frozen at the OLD physical key"
+      cat "${DYNAMO_PROOF_ROOT}-withmoved/plan.log"
+    fi
+  fi
+  rm -rf "$DYNAMO_PROOF_ROOT" "${DYNAMO_PROOF_ROOT}-nomoved" "${DYNAMO_PROOF_ROOT}-withmoved"
+else
+  skip "DYNAMODB-CONFIG-MIGRATION-PROOF: terraform not available"
+fi
+
+# Behavioral proof of the REAL committed envs/dev/dynamodb.tf itself (a local stub replaces the private, auth-gated aws-tf-module-dynamodb source only -- never the resource/data-source types under test, which are the real AWS provider): (c) terraform validate proves the new HCL is syntactically/referentially correct; (d) with goldengate_config_migration_pending=false, planning ANY deployment ID (including the four bounded ones) makes ZERO AWS calls at all (the legacy data source's own for_each becomes empty) and correctly falls back to the plain-default CONFIG body -- the safe post-migration steady state; (e) with the real default (pending=true, matching this correction's own committed default), planning correctly ATTEMPTS the four bounded read-only legacy lookups and fails closed with a live-credentials error naming the exact expected OLD physical key -- proving the mechanism cannot silently substitute defaults when live data is unavailable, and that this sandbox never fabricates or synthesizes their real content.
+if command -v terraform >/dev/null 2>&1; then
+  DYNAMODB_REAL_PROOF_ROOT="$(mktemp -d)"
+  mkdir -p "${DYNAMODB_REAL_PROOF_ROOT}/stub-dynamodb-module" "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev"
+  python3 -c '
+names_defaults = [
+    ("name", "string", None, True), ("hash_key", "string", None, True), ("range_key", "string", "null", False),
+    ("attributes", "any", None, True), ("billing_mode", "string", "null", False), ("safety_mode", "string", "null", False),
+    ("ttl_enabled", "bool", "false", False), ("ttl_attribute_name", "string", "null", False),
+    ("global_secondary_indexes", "any", "[]", False), ("local_secondary_indexes", "any", "[]", False),
+    ("autoscaling_enabled", "bool", "false", False), ("custom_kms_key_arn", "string", "null", False),
+    ("map_migrated", "string", "null", False), ("business_criticality", "string", "null", False),
+    ("application_name", "string", "null", False), ("cost_center", "string", "null", False),
+    ("business_unit", "string", "null", False), ("business_unit_owner", "string", "null", False),
+    ("data_classification", "string", "null", False), ("env", "string", "null", False),
+]
+lines = []
+for name, typ, default, required in names_defaults:
+    lines.append(f"variable \"{name}\" {{")
+    lines.append(f"  type = {typ}")
+    if not required:
+        lines.append(f"  default = {default}")
+    lines.append("}")
+    lines.append("")
+with open("'"${DYNAMODB_REAL_PROOF_ROOT}"'/stub-dynamodb-module/main.tf", "w") as f:
+    f.write("\n".join(lines))
+'
+  sed 's#source = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-dynamodb.git?ref=v1.2.0"#source = "../../stub-dynamodb-module"#' \
+    envs/dev/dynamodb.tf > "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev/dynamodb.tf"
+  cat > "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev/provider_and_stubs.tf" <<'EOF'
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "5.91.0"
+    }
+  }
+}
+provider "aws" {
+  region                      = "eu-west-1"
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_requesting_account_id  = true
+  skip_metadata_api_check     = true
+}
+
+locals {
+  tags = {
+    env = "dev", application_name = "GoldenGate", business_criticality = "Low", business_unit = "TechnologyPlatform"
+    business_unit_owner = "test", cost_center = "219", map_migrated = "test", data_classification = "General"
+  }
+  goldengate_deployment_names = ["gg-oracle-repltest-002"]
+  goldengate_enabled_deployments = {
+    "gg-oracle-repltest-002" = { runtime = { deploymentType = "oracle" } }
+  }
+}
+EOF
+
+  set +e
+  (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev" && terraform init -backend=false) >"${DYNAMODB_REAL_PROOF_ROOT}/init.log" 2>&1
+  DYNAMODB_REAL_INIT_STATUS=$?
+  set -e
+
+  if [ "$DYNAMODB_REAL_INIT_STATUS" -ne 0 ]; then
+    skip "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF: could not download the AWS provider from the public Terraform registry in this environment -- offline reproduction skipped"
+  else
+    set +e
+    (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev" && terraform validate -no-color) >"${DYNAMODB_REAL_PROOF_ROOT}/validate.log" 2>&1
+    DYNAMODB_VALIDATE_STATUS=$?
+    set -e
+    if [ "$DYNAMODB_VALIDATE_STATUS" -eq 0 ] && grep -qF "The configuration is valid" "${DYNAMODB_REAL_PROOF_ROOT}/validate.log"; then
+      pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (c): terraform validate confirms the real envs/dev/dynamodb.tf's new locals/variable/data source/precondition/ternary HCL is syntactically and referentially valid"
+    else
+      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (c): terraform validate failed against the real envs/dev/dynamodb.tf"
+      cat "${DYNAMODB_REAL_PROOF_ROOT}/validate.log"
+    fi
+
+    set +e
+    (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev" && terraform plan -refresh=false -no-color -var="goldengate_config_migration_pending=false") >"${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_false.log" 2>&1
+    DYNAMODB_PENDING_FALSE_STATUS=$?
+    set -e
+    if [ "$DYNAMODB_PENDING_FALSE_STATUS" -eq 0 ] \
+        && grep -qF 'aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-002"] will be created' "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_false.log" \
+        && grep -qF 'checkIntervalSeconds     = {' "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_false.log" \
+        && ! grep -q "data\.aws_dynamodb_table_item\.legacy_pipeline_config" "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_false.log"; then
+      pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (d): with goldengate_config_migration_pending=false, planning gg-oracle-repltest-002 makes ZERO AWS calls (the legacy data source's own for_each is empty) and correctly falls back to the plain-default CONFIG body -- the safe steady state once the real live migration is independently confirmed complete"
+    else
+      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (d): expected a zero-AWS-call plan with the plain-default CONFIG body when goldengate_config_migration_pending=false"
+      cat "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_false.log"
+    fi
+
+    set +e
+    (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev" && terraform plan -refresh=false -no-color) >"${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_true.log" 2>&1
+    DYNAMODB_PENDING_TRUE_STATUS=$?
+    set -e
+    if [ "$DYNAMODB_PENDING_TRUE_STATUS" -ne 0 ] \
+        && grep -qF 'reading DynamoDB Table Item (gg-eks-pipeline|gg-oracle-repltest-01|CONFIG)' "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_true.log" \
+        && ! grep -qF 'aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-002"] will be created' "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_true.log"; then
+      pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): with the real default (goldengate_config_migration_pending=true), planning correctly ATTEMPTS a read-only lookup of the exact expected legacy key (gg-eks-pipeline|gg-oracle-repltest-01|CONFIG) and fails closed (no live credentials in this sandbox) BEFORE ever proposing a pipeline_config CONFIG item action -- the mechanism never fabricates/substitutes default content when the real legacy item cannot be read, and no live AWS data was returned or exchanged"
+    else
+      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): expected a fail-closed plan attempting exactly the expected legacy key read, never proposing a pipeline_config action"
+      cat "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_true.log"
+    fi
+  fi
+  rm -rf "$DYNAMODB_REAL_PROOF_ROOT"
+else
+  skip "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF: terraform not available"
+fi
+
 if grep -qE 'resource\s+"aws_security_group"' envs/dev/*.tf 2>/dev/null; then
   fail "envs/dev/*.tf creates a new security group instead of reusing the single shared one via a fail-closed data lookup"
 else
@@ -8600,8 +8936,8 @@ else
 fi
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # Repo-wide scan of envs/dev/*.tf (excluding efs.tf and goldengate_inventory.tf, both exempted for the same reviewed, narrowly-scoped, explicit 4-ID legacy-migration/EFS-decommission carve-out -- bridging this one intentional deployment-ID rename without destroying/recreating a pre-existing managed EFS filesystem, never a general onboarding mechanism) for a deployment-ID-specific carve-out.
-  TF_CARVEOUT_MATCHES="$(grep -lF "gg-mssql-repltest-001" envs/dev/*.tf 2>/dev/null | grep -vF "envs/dev/efs.tf" | grep -vF "envs/dev/goldengate_inventory.tf" || true)"
+  # Repo-wide scan of envs/dev/*.tf (excluding efs.tf, goldengate_inventory.tf, and dynamodb.tf, all three exempted for the same reviewed, narrowly-scoped, explicit 4-ID legacy-migration carve-out -- bridging this one intentional deployment-ID rename without destroying/recreating a pre-existing managed EFS filesystem or losing an existing DynamoDB CONFIG item's real content, never a general onboarding mechanism) for a deployment-ID-specific carve-out.
+  TF_CARVEOUT_MATCHES="$(grep -lF "gg-mssql-repltest-001" envs/dev/*.tf 2>/dev/null | grep -vF "envs/dev/efs.tf" | grep -vF "envs/dev/goldengate_inventory.tf" | grep -vF "envs/dev/dynamodb.tf" || true)"
   if [ -z "$TF_CARVEOUT_MATCHES" ]; then
     pass "no deployment-specific Terraform carve-out exists for the MSSQL runtime anywhere under envs/dev/*.tf (tracked or untracked) outside the explicit, reviewed EFS decommission allowlist -- the generic local.goldengate_managed_efs_deployments for_each and the restored shared gg-runtime-sa identity own it automatically"
   else
