@@ -11,16 +11,16 @@ variable "environment" {
 }
 
 locals {
-  goldengate_ignored_runtime_folders = ["argocd", "goldengate-monitor"]
+  # Pipeline-Aware Descriptor Hierarchy: the ONLY canonical runtime descriptor shape is exactly two levels under pipelines/ -- pipelines/<pipeline-id>/<deployment-id>/values.yaml. This exact two-star fileset pattern is itself the complete discovery-boundary contract, mirroring automation/goldengate-deployment-model.py's own find_values_files() exactly: envs/dev/argocd/values.yaml and envs/dev/goldengate-monitor/values.yaml (both siblings of pipelines/, never inside it) are never matched at all -- there is no longer a goldengate_ignored_runtime_folders filter to maintain, since the pattern itself structurally excludes them.
+  goldengate_runtime_value_files = sort(fileset(path.module, "pipelines/*/*/values.yaml"))
 
-  goldengate_runtime_value_files = sort([
-    for f in fileset(path.module, "*/values.yaml") : f
-    if !contains(local.goldengate_ignored_runtime_folders, split("/", f)[0])
-  ])
+  goldengate_runtime_pipeline_folder_by_id = {
+    for f in local.goldengate_runtime_value_files : split("/", f)[2] => split("/", f)[1]
+  }
 
   goldengate_runtime_documents = {
     for f in local.goldengate_runtime_value_files :
-    split("/", f)[0] => yamldecode(file("${path.module}/${f}"))
+    split("/", f)[2] => yamldecode(file("${path.module}/${f}"))
   }
 
   # jsonencode() roundtrip proves a literal Boolean: can(tobool("true")) is also true for the STRING "true".
@@ -82,10 +82,18 @@ locals {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.storage.u02.type, "")
   }
 
+  # Pipeline-Aware Descriptor Hierarchy Migration: exactly four intentional deployment-ID renames must NOT change the underlying managed EFS filesystem's immutable creation_token (creation_token is a ForceNew argument on the real aws_efs_file_system resource below, so changing it would destroy and recreate the filesystem). Mirrors automation/goldengate-deployment-model.py's own LEGACY_MANAGED_EFS_CREATION_TOKENS exactly (never imported -- Terraform cannot import Python; a dedicated drift test in that module's own test suite proves the two copies agree). A narrowly-scoped, explicit, auditable mapping of NEW deployment ID -> the EXACT creation token the existing AWS filesystem was already created with under its OLD deployment ID -- NOT a general runtime-identity override: a deployment ID absent from this map always derives its token normally below. This file lives only under envs/dev/, so (unlike the Python module, which serves every environment) this map needs no environment key -- it can never leak into another environment's Terraform state. Never add a future entry here for a genuinely new runtime.
+  goldengate_legacy_managed_efs_creation_tokens = {
+    "gg-postgresql-repltest-001" = "dev-gg-postgresql-repltest-01-efs"
+    "gg-mssql-repltest-001"      = "dev-gg-mssql-repltest-01-efs"
+    "gg-oracle-repltest-002"     = "dev-gg-oracle-repltest-01-efs"
+    "gg-postgresql-repltest-002" = "dev-gg-postgresql-repltest-02-efs"
+  }
+
   # Keyed by every folder-driven document (not just goldengate_enabled_deployments): storage follows the runtime's Git folder, never deployment.enabled. A managed EFS module instance must never disappear from this map merely because a deployment is temporarily disabled -- only physical deletion of the values.yaml file removes an entry here, and that case is guarded upstream by the workflow's managed_efs_deletion_guard job, which must run before any Terraform apply can observe the removal.
   goldengate_managed_efs_deployments = {
     for id, doc in local.goldengate_runtime_documents : id => {
-      creation_token = "${var.environment}-${id}-efs"
+      creation_token = lookup(local.goldengate_legacy_managed_efs_creation_tokens, id, "${var.environment}-${id}-efs")
     }
     if local.goldengate_persistence_efs_declared[id] && local.goldengate_persistence_efs_mode_raw[id] == "managed"
   }
@@ -150,24 +158,48 @@ resource "terraform_data" "goldengate_runtime_contract" {
   lifecycle {
     precondition {
       condition     = try(each.value.deploymentModel, null) == "singleRuntime"
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: deploymentModel must be exactly \"singleRuntime\"."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: deploymentModel must be exactly \"singleRuntime\"."
     }
     precondition {
       condition     = local.goldengate_enabled_jsonenc[each.key] == "true" || local.goldengate_enabled_jsonenc[each.key] == "false"
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: deployment.enabled must be a literal Boolean, not a Boolean-like string."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: deployment.enabled must be a literal Boolean, not a Boolean-like string."
     }
     precondition {
       condition     = try(each.value.deployment.pipeline, "") != "" && can(regex("^[a-z][a-z0-9-]*$", each.value.deployment.pipeline))
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: deployment.pipeline must be a safe non-empty identifier."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: deployment.pipeline must be a safe non-empty identifier."
+    }
+    precondition {
+      # Pipeline-Aware Descriptor Hierarchy: mirrors automation/goldengate-deployment-model.py's own parse_descriptor() pipeline-folder-equality check (contract B) exactly.
+      condition     = try(each.value.deployment.pipeline, "") == lookup(local.goldengate_runtime_pipeline_folder_by_id, each.key, "")
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: the parent pipeline folder must exactly equal deployment.pipeline."
+    }
+    precondition {
+      # Pipeline-Aware Descriptor Hierarchy (contract E): mirrors automation/goldengate-deployment-model.py's own _three_digit_suffix() check on deployment.pipeline.
+      condition     = can(regex("-[0-9]{3}$", try(each.value.deployment.pipeline, "")))
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: deployment.pipeline must end in a 3-digit pipeline correlation suffix (-NNN)."
+    }
+    precondition {
+      # Pipeline-Aware Descriptor Hierarchy (contract F): mirrors automation/goldengate-deployment-model.py's own _three_digit_suffix() check on the deployment ID.
+      condition     = can(regex("-[0-9]{3}$", each.key))
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: the deployment ID (folder name) must end in a 3-digit pipeline correlation suffix (-NNN)."
+    }
+    precondition {
+      # Pipeline-Aware Descriptor Hierarchy (contract G): the 3-digit suffix of deployment.pipeline must exactly equal the deployment ID's own 3-digit suffix. Short-circuits (via can()) to vacuously true when either input doesn't end in -NNN at all -- the two preconditions above already produce a clear, dedicated error message for that case; substr() is never evaluated on a malformed/too-short string.
+      condition = (
+        !can(regex("-[0-9]{3}$", each.key))
+        || !can(regex("-[0-9]{3}$", try(each.value.deployment.pipeline, "")))
+        || substr(each.key, -3, 3) == substr(try(each.value.deployment.pipeline, ""), -3, 3)
+      )
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: deployment.pipeline's 3-digit correlation suffix must exactly equal the deployment ID's 3-digit suffix."
     }
     precondition {
       condition     = contains(["source", "target"], try(each.value.deployment.role, ""))
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: deployment.role must be exactly \"source\" or \"target\"."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: deployment.role must be exactly \"source\" or \"target\"."
     }
     precondition {
       # Fresh-EKS Phase A/Phase 9: global.environment is shared environment configuration (envs/dev/environment.yaml), no longer descriptor input -- forbid its reintroduction rather than requiring/validating a descriptor-owned copy.
       condition     = try(each.value.global.environment, null) == null
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: global.environment is a forbidden override -- it is shared environment configuration, injected by the deploy workflow from envs/dev/environment.yaml, and must not be set in a runtime descriptor."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: global.environment is a forbidden override -- it is shared environment configuration, injected by the deploy workflow from envs/dev/environment.yaml, and must not be set in a runtime descriptor."
     }
     precondition {
       condition = (
@@ -175,7 +207,7 @@ resource "terraform_data" "goldengate_runtime_contract" {
         && length(try(each.value.runtime.deploymentType, "")) <= 32
         && can(regex("^[a-z][a-z0-9]*(-[a-z0-9]+)*$", each.value.runtime.deploymentType))
       )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.deploymentType must be a safe lowercase token (letters/digits only, internal hyphens only, no leading/trailing hyphen, max 32 characters)."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.deploymentType must be a safe lowercase token (letters/digits only, internal hyphens only, no leading/trailing hyphen, max 32 characters)."
     }
     precondition {
       # Fresh-EKS Phase A/Phase 9: the descriptor owns only the environment-neutral repositoryName; the full private-ECR repository (the canonical environment configuration's ECR registry + <repositoryName>) is derived once by the workflow/deployment model, never descriptor input.
@@ -183,72 +215,72 @@ resource "terraform_data" "goldengate_runtime_contract" {
         try(each.value.runtime.image.repositoryName, "") != ""
         && can(regex("^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$", each.value.runtime.image.repositoryName))
       )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.repositoryName must be a non-empty, safe, environment-neutral ECR repository name (no registry host, tag, digest, whitespace, or traversal)."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.image.repositoryName must be a non-empty, safe, environment-neutral ECR repository name (no registry host, tag, digest, whitespace, or traversal)."
     }
     precondition {
       condition     = try(each.value.runtime.image.repository, null) == null
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.repository is a forbidden override -- it is shared environment identity, derived from the canonical environment configuration's ECR registry + runtime.image.repositoryName, and must not be set in a runtime descriptor."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.image.repository is a forbidden override -- it is shared environment identity, derived from the canonical environment configuration's ECR registry + runtime.image.repositoryName, and must not be set in a runtime descriptor."
     }
     precondition {
       condition     = try(each.value.runtime.image.tag, "") != "" && try(each.value.runtime.image.tag, "latest") != "latest"
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.image.tag must be explicit and must not be \"latest\"."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.image.tag must be explicit and must not be \"latest\"."
     }
     precondition {
       condition     = !local.goldengate_service_account_declared[each.key]
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.serviceAccount is a forbidden override -- every singleRuntime deployment shares the platform-owned gg-runtime-sa identity regardless of runtime.deploymentType."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.serviceAccount is a forbidden override -- every singleRuntime deployment shares the platform-owned gg-runtime-sa identity regardless of runtime.deploymentType."
     }
     precondition {
       condition     = !local.goldengate_deployment_admin_secret_declared[each.key]
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: deployment.adminSecret is a forbidden override -- the admin secret is derived solely from deployment.role."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: deployment.adminSecret is a forbidden override -- the admin secret is derived solely from deployment.role."
     }
     precondition {
       condition     = !local.goldengate_csi_admin_object_name_declared[each.key]
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.admin.objectName is a forbidden override -- it is derived solely from deployment.role."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.csi.admin.objectName is a forbidden override -- it is derived solely from deployment.role."
     }
     precondition {
       condition     = !local.goldengate_csi_certificate_object_name_declared[each.key]
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.certificate.objectName is a forbidden override -- it is a shared platform invariant."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.csi.certificate.objectName is a forbidden override -- it is a shared platform invariant."
     }
     precondition {
       condition     = !local.goldengate_csi_service_account_role_arn_declared[each.key]
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.csi.serviceAccountRoleArn is a forbidden override -- it is a shared platform invariant."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.csi.serviceAccountRoleArn is a forbidden override -- it is a shared platform invariant."
     }
     precondition {
       # GoldenGate Runtime Desired-State Simplification: lifecycle.state is retired as a second runtime-presence source of truth -- deployment.enabled is now the ONLY authoritative control, so a descriptor still carrying a lifecycle block is rejected outright (mirrors automation/goldengate-deployment-model.py's _reject_lifecycle_presence_control), never silently reinterpreted. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based (contains(keys(...), "lifecycle")), never try(each.value.lifecycle, null) == null -- that null-tolerant form incorrectly treats a PRESENT key with a null value (`lifecycle: null`) as equivalent to the key being absent entirely, since yamldecode() still includes a null-valued key in the decoded object's own keys(). The contract is that the key must not be present at all, present-with-null included.
       condition     = !try(contains(keys(each.value), "lifecycle"), false)
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: lifecycle.state is no longer supported for runtime presence; use deployment.enabled only."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: lifecycle.state is no longer supported for runtime presence; use deployment.enabled only."
     }
     precondition {
       # GoldenGate Runtime Presence Contract Finalization: a legacy descriptor-root `enabled:` key (outside deployment.enabled) is a second, potentially contradictory runtime-presence signal -- rejected outright here too, mirroring automation/goldengate-deployment-model.py's _reject_root_level_enabled. Never fires for nested `enabled` fields belonging to other components (ingress.enabled, persistence.enabled, replication.enabled, etc.) since those are different mapping keys entirely. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based, so `enabled: null` at the descriptor root is rejected exactly like `enabled: true`/`enabled: false` -- see the lifecycle precondition above for why a null-tolerant try(...) == null form is wrong here.
       condition     = !try(contains(keys(each.value), "enabled"), false)
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: root-level enabled is no longer supported; use deployment.enabled only."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: root-level enabled is no longer supported; use deployment.enabled only."
     }
     precondition {
       # GoldenGate Runtime Presence Contract Finalization: runtime.enabled was a second, chart-level runtime-presence switch that could silently contradict deployment.enabled -- it is no longer part of the schema at all and is rejected outright here too, mirroring automation/goldengate-deployment-model.py's _reject_runtime_enabled_presence_control. Nested feature flags such as runtime.csi.enabled are untouched -- only runtime's own `enabled` key is prohibited. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based, so `runtime.enabled: null` is rejected exactly like a literal true/false value -- see the lifecycle precondition above for why a null-tolerant try(...) == null form is wrong here.
       condition     = !try(contains(keys(each.value.runtime), "enabled"), false)
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.enabled is no longer supported as a runtime presence control; use deployment.enabled only."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.enabled is no longer supported as a runtime presence control; use deployment.enabled only."
     }
     precondition {
       # Automated Replication Implementation Removal (Task 4): mirrors automation/goldengate-deployment-model.py's _reject_replication_key_presence() -- rejects the mere PRESENCE of a top-level `replication` key in ANY shape (null, {}, enabled:false, enabled:true), never merely a disallowed value inside it. Key-presence based, exactly like the lifecycle/root-enabled/runtime-enabled tombstone preconditions above -- a present `replication: null` key must still be rejected. GoldenGate database connections, credentials, Extract, trails, Distribution Path, and Replicat are configured manually by an operator/DBA through the GoldenGate UI after deployment; there is deliberately no replacement replication-shaped field, and this precondition never parses nested schema -- only presence.
       condition     = !local.goldengate_replication_key_present[each.key]
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: unsupported descriptor key: top-level replication automation has been retired; configure database connections and replication processes manually through the GoldenGate UI."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: unsupported descriptor key: top-level replication automation has been retired; configure database connections and replication processes manually through the GoldenGate UI."
     }
     precondition {
       # Fresh-EKS Phase A/Phase 9: ingress.hostDomain/alb.groupName/alb.certificateArn are shared environment configuration, injected by the deploy workflow from envs/dev/environment.yaml -- forbid their reintroduction rather than requiring/validating a descriptor-owned copy. ingress.alb.groupOrder remains deployment-specific and stays required/validated below.
       condition     = try(each.value.ingress.hostDomain, null) == null
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.hostDomain is a forbidden override -- it is shared environment configuration and must not be set in a runtime descriptor."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: ingress.hostDomain is a forbidden override -- it is shared environment configuration and must not be set in a runtime descriptor."
     }
     precondition {
       condition     = try(each.value.ingress.alb.groupName, null) == null
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.alb.groupName is a forbidden override -- it is shared environment configuration and must not be set in a runtime descriptor."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: ingress.alb.groupName is a forbidden override -- it is shared environment configuration and must not be set in a runtime descriptor."
     }
     precondition {
       condition     = try(each.value.ingress.alb.certificateArn, null) == null
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.alb.certificateArn is a forbidden override -- it is shared environment configuration and must not be set in a runtime descriptor."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: ingress.alb.certificateArn is a forbidden override -- it is shared environment configuration and must not be set in a runtime descriptor."
     }
     precondition {
       condition     = !contains(local.goldengate_duplicate_alb_group_order_ids, each.key)
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: ingress.alb.groupOrder duplicates another enabled runtime's ALB group order."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: ingress.alb.groupOrder duplicates another enabled runtime's ALB group order."
     }
     precondition {
       condition = (
@@ -256,21 +288,21 @@ resource "terraform_data" "goldengate_runtime_contract" {
         || local.goldengate_persistence_enabled_jsonenc[each.key] == "true"
         || local.goldengate_persistence_enabled_jsonenc[each.key] == "false"
       )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: persistence.enabled must be a literal Boolean, not a Boolean-like string, when persistence is present."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: persistence.enabled must be a literal Boolean, not a Boolean-like string, when persistence is present."
     }
     precondition {
       condition = (
         !local.goldengate_persistence_efs_declared[each.key]
         || local.goldengate_runtime_storage_u02_type_raw[each.key] == "efs"
       )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: runtime.storage.u02.type must be \"efs\" when persistence.enabled=true and persistence.provider=efs."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.storage.u02.type must be \"efs\" when persistence.enabled=true and persistence.provider=efs."
     }
     precondition {
       condition = (
         !local.goldengate_persistence_efs_declared[each.key]
         || contains(["managed", "existing"], local.goldengate_persistence_efs_mode_raw[each.key])
       )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: persistence.efs.mode must be explicitly \"managed\" or \"existing\" when persistence.enabled=true and persistence.provider=efs."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: persistence.efs.mode must be explicitly \"managed\" or \"existing\" when persistence.enabled=true and persistence.provider=efs."
     }
     precondition {
       condition = (
@@ -278,7 +310,7 @@ resource "terraform_data" "goldengate_runtime_contract" {
         || local.goldengate_persistence_efs_mode_raw[each.key] != "existing"
         || can(regex("^fs-[0-9a-f]+$", local.goldengate_persistence_efs_filesystem_id_raw[each.key]))
       )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: persistence.efs.fileSystemId is not a safe EFS filesystem ID (required when persistence.efs.mode=existing)."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: persistence.efs.fileSystemId is not a safe EFS filesystem ID (required when persistence.efs.mode=existing)."
     }
     precondition {
       condition = (
@@ -286,7 +318,7 @@ resource "terraform_data" "goldengate_runtime_contract" {
         || local.goldengate_persistence_efs_mode_raw[each.key] != "managed"
         || !local.goldengate_persistence_efs_filesystem_id_declared[each.key]
       )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: persistence.efs.fileSystemId must not be set when persistence.efs.mode=managed -- Terraform provisions and resolves it."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: persistence.efs.fileSystemId must not be set when persistence.efs.mode=managed -- Terraform provisions and resolves it."
     }
     precondition {
       condition = (
@@ -294,7 +326,7 @@ resource "terraform_data" "goldengate_runtime_contract" {
         || local.goldengate_persistence_efs_mode_raw[each.key] != "managed"
         || length("${var.environment}-${each.key}-efs") <= 64
       )
-      error_message = "envs/${var.environment}/${each.key}/values.yaml: derived EFS creation token \"${var.environment}-${each.key}-efs\" exceeds the 64-character AWS EFS creation-token limit."
+      error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: derived EFS creation token \"${var.environment}-${each.key}-efs\" exceeds the 64-character AWS EFS creation-token limit."
     }
   }
 }

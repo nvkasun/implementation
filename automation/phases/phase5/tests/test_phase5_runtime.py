@@ -119,6 +119,8 @@ class TempStateCase(unittest.TestCase):
 
 DESCRIPTOR = {
     "deploymentId": DEPLOYMENT_ID,
+    # Pipeline-Aware Descriptor Hierarchy: the canonical descriptor path automation/goldengate-deployment-model.py's own parse_descriptor() now returns -- _validate_reconcile_state_identity()/_validate_packaged_chart_contents()/cmd_prepare_deployment() all consume it via _describe_deployment_json() instead of reconstructing it. This fixture's own value never needs to point at a real file (every subprocess call in this test file is scripted/mocked), only to stay internally consistent with wherever a test constructs its own "values_file" reconcile-state value (see _full_reconcile_state()/_reconcile_state_fixture() below, which use this exact same flat-looking literal).
+    "valuesFile": f"envs/{ENVIRONMENT}/{DEPLOYMENT_ID}/values.yaml",
     "adminSecretName": "dev/goldengate/source/admin",
     "tlsSecretName": "dev/goldengate/tls-certificate",
     "runtimeServiceAccountName": "gg-runtime-sa",
@@ -256,6 +258,16 @@ class InputValidationTests(unittest.TestCase):
 
 
 class PrepareDeploymentTests(TempStateCase):
+    """Pipeline-Aware Descriptor Hierarchy: cmd_prepare_deployment() now resolves values_file via a local, offline, read-only deployment-model describe call (never a reconstructed flat path) -- scripted for the whole class via setUp(), since every test method here exercises cmd_prepare_deployment directly."""
+
+    def setUp(self):
+        super().setUp()
+        self._describe_scripted = ScriptedRun()
+        self._describe_scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+        self._run_patcher = mock.patch.object(phase5_runtime, "run", self._describe_scripted)
+        self._run_patcher.start()
+        self.addCleanup(self._run_patcher.stop)
+
     def test_deployment_model_other_than_singleruntime_rejected(self):
         args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, deployment_model="legacyPair", deploy="true", state_path=self.state_path)
         with _env_patch():
@@ -1094,6 +1106,7 @@ class EcrRepositoryTests(unittest.TestCase):
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
 
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "SECRET_PASSWORD_VALUE\n"))
             scripted.when(_starts_with("helm", "registry", "login"), FakeProc(0, ""))
             scripted.when(_starts_with("aws", "ecr", "describe-repositories"), FakeProc(0, ""))
@@ -1120,6 +1133,7 @@ class EcrRepositoryTests(unittest.TestCase):
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
 
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "SECRET_PASSWORD_VALUE\n"))
             scripted.when(_starts_with("helm", "registry", "login"), FakeProc(0, ""))
             scripted.when(_starts_with("aws", "ecr", "describe-repositories"), FakeProc(0, ""))
@@ -1144,6 +1158,7 @@ class EcrRepositoryTests(unittest.TestCase):
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
 
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "pw"))
             scripted.when(_starts_with("helm", "registry", "login"), FakeProc(0, ""))
             scripted.when(_starts_with("aws", "ecr", "describe-repositories"), FakeProc(0, ""))
@@ -1165,6 +1180,7 @@ class EcrRepositoryTests(unittest.TestCase):
             }, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
 
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "pw"))
             scripted.when(_starts_with("helm", "registry", "login"), FakeProc(0, ""))
             scripted.when(_starts_with("aws", "ecr", "describe-repositories"), FakeProc(0, ""))
@@ -2271,8 +2287,11 @@ class LiteralDeployBooleanTests(unittest.TestCase):
     """Issue 3: cmd_resolve_live_inputs() no longer contains `deploy = bool(state.get("deploy"))` -- bool("false") == True in Python. _validate_reconcile_state_identity() now requires state["deploy"] to already be a literal JSON boolean."""
 
     def _validate(self, deploy_value):
+        # Pipeline-Aware Descriptor Hierarchy: _validate_reconcile_state_identity() now cross-checks values_file against a freshly-described descriptor -- run must be scripted here too, exactly like every other test exercising it below.
         state = _reconcile_state_fixture(deploy=deploy_value)
-        with _env_patch():
+        scripted = ScriptedRun()
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
             return phase5_runtime._validate_reconcile_state_identity(state, ENVIRONMENT, DEPLOYMENT_ID)
 
     def test_1_deploy_false_accepted_as_literal_false(self):
@@ -2332,16 +2351,20 @@ class CrossRuntimeReconcileStateTests(unittest.TestCase):
     """State identity/target binding: a reconcile-state JSON document whose mutation-target fields do not match the CURRENT matrix environment/deployment_id (or the canonical Phase 5 naming/config rules) must never be trusted by resolve-live-inputs/publish-chart/reconcile-runtime -- each must fail BEFORE any AWS/Kubernetes call."""
 
     def _resolve_live_inputs_fails_zero_calls(self, **state_overrides):
+        # Pipeline-Aware Descriptor Hierarchy: _validate_reconcile_state_identity() now cross-checks values_file via its own local, offline, read-only deployment-model describe call -- scripted here so tests whose mismatch is checked AFTER values_file (e.g. test_18) can legitimately reach and correctly fail it; tests whose mismatch is checked earlier (environment/deployment_id/release_name) never invoke it at all, so scripting it is harmless for them.
         state = _reconcile_state_fixture(**state_overrides)
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_resolve_live_inputs, args)
-            self.assertEqual(scripted.calls, [], "a cross-runtime/malformed reconcile state must result in ZERO calls (no deployment-model describe, no ECR describe-images)")
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            non_describe_calls = [c for c in scripted.calls if not is_describe_call(c["argv"])]
+            self.assertEqual(non_describe_calls, [], "a cross-runtime/malformed reconcile state must result in ZERO AWS/ECR/Kubernetes calls (the local, offline deployment-model describe call itself is never one of those)")
 
     def test_10_environment_mismatch_fails_before_mutation(self):
         self._resolve_live_inputs_fails_zero_calls(environment="staging")
@@ -2365,10 +2388,14 @@ class CrossRuntimeReconcileStateTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            # Pipeline-Aware Descriptor Hierarchy: see _resolve_live_inputs_fails_zero_calls() above -- scripted so a mismatch checked after values_file (e.g. test_15's helm_chart_ref) can legitimately reach and correctly fail there.
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
                     _run_quiet(phase5_runtime.cmd_reconcile_runtime, args)
-            self.assertEqual(scripted.calls, [], "a cross-runtime/malformed reconcile state must result in ZERO Kubernetes calls (no _connect_to_eks, no kubectl apply/annotate)")
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            non_describe_calls = [c for c in scripted.calls if not is_describe_call(c["argv"])]
+            self.assertEqual(non_describe_calls, [], "a cross-runtime/malformed reconcile state must result in ZERO Kubernetes calls (no _connect_to_eks, no kubectl apply/annotate; the local, offline deployment-model describe call itself is never one of those)")
             return str(ctx.exception)
 
     def test_13_wrong_argocd_app_name_fails_before_connect_to_eks(self):
@@ -2391,10 +2418,14 @@ class CrossRuntimeReconcileStateTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            # Pipeline-Aware Descriptor Hierarchy: see _resolve_live_inputs_fails_zero_calls() above -- scripted so a mismatch checked after values_file (e.g. test_16/17's helm_push_url/helm_ecr_repository) can legitimately reach and correctly fail there.
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [], "a cross-runtime/malformed reconcile state must result in ZERO AWS/ECR calls")
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            non_describe_calls = [c for c in scripted.calls if not is_describe_call(c["argv"])]
+            self.assertEqual(non_describe_calls, [], "a cross-runtime/malformed reconcile state must result in ZERO AWS/ECR calls (the local, offline deployment-model describe call itself is never one of those)")
 
     def test_16_wrong_helm_push_url_fails_before_ecr_publish(self):
         self._publish_chart_fails_zero_aws_calls(helm_push_url="oci://evil-registry.example.com/helm")
@@ -2770,16 +2801,22 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
 
     def test_2_wrong_chart_version_fails_static_identity(self):
         state = _reconcile_state_fixture(chart_version="9.9.9-EVIL")
-        with _env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
                 phase5_runtime._validate_reconcile_state_identity(state, ENVIRONMENT, DEPLOYMENT_ID)
+        self.assertIn("chart_version", str(ctx.exception))
 
     def test_3_missing_chart_version_fails(self):
         state = _reconcile_state_fixture()
         del state["chart_version"]
-        with _env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
+        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
                 phase5_runtime._validate_reconcile_state_identity(state, ENVIRONMENT, DEPLOYMENT_ID)
+        self.assertIn("chart_version", str(ctx.exception))
 
     def test_4_wrong_package_path_fails_before_any_aws_call(self):
         """Confirmed reproduction of the current bug: a canonical reconcile identity with package_path=packaged/totally-unrelated-chart.tgz previously reached helm push/aws ecr calls."""
@@ -2790,10 +2827,13 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": "packaged/totally-unrelated-chart.tgz"}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            # Pipeline-Aware Descriptor Hierarchy: _validate_reconcile_state_identity()'s own local, offline, read-only describe call (never AWS/ECR/helm) is the only call this now makes before failing -- still zero AWS/ECR/helm calls, the actual property this test proves.
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c["argv"] for c in scripted.calls if not is_describe_call(c["argv"])], [])
             self.assertIn("totally-unrelated-chart.tgz", str(ctx.exception))
 
     def test_5_package_path_traversal_escape_fails(self):
@@ -2802,10 +2842,12 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": f"packaged/../../etc/goldengate-{CHART_VERSION}.tgz"}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def test_6_absolute_package_path_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2813,10 +2855,12 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": "/etc/passwd"}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def test_7_symlink_escaping_packaged_dir_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2837,10 +2881,12 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def test_8_missing_expected_package_fails_before_aws(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2848,10 +2894,12 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": f"packaged/goldengate-{CHART_VERSION}.tgz"}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def _publish_with_package(self, **package_overrides):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2860,6 +2908,7 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "pw"))
             scripted.when(_starts_with("helm", "registry", "login"), FakeProc(0, ""))
             scripted.when(_starts_with("aws", "ecr", "describe-repositories"), FakeProc(0, ""))
@@ -2878,10 +2927,12 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def test_10_packaged_chart_yaml_wrong_version_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2890,10 +2941,12 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def test_11_packaged_chart_yaml_wrong_app_version_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2902,10 +2955,12 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def test_12_packaged_missing_values_deployment_yaml_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2914,10 +2969,12 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def test_13_packaged_values_deployment_belongs_to_another_deployment_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2926,10 +2983,12 @@ class ChartVersionAndPackageBindingTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(Path(tmp)), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def test_14_canonical_package_containing_exact_current_values_passes(self):
         scripted = self._publish_with_package()
@@ -3128,7 +3187,8 @@ class ReconcileMutationPayloadTests(unittest.TestCase):
 
     def test_40_wrong_chart_version_fails_before_cluster_access(self):
         scripted = self._run_reconcile(state_overrides={"chart_version": "9.9.9-EVIL"})
-        self.assertEqual(scripted.calls, [])
+        is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+        self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def test_41_wrong_admin_secret_fails_before_cluster_access(self):
         scripted = self._run_reconcile(state_overrides={"admin_secret_name": "dev/goldengate/target/admin"})
@@ -3218,6 +3278,7 @@ class ValidateLocalDiagnosticsTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun(default=FakeProc(1, "", "not found"))
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
             with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 _run_quiet(phase5_runtime.cmd_post_deploy_diagnostics, args)
@@ -3231,6 +3292,7 @@ class PackagedChartIntegrityTests(unittest.TestCase):
         phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
         args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
         scripted = ScriptedRun()
+        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
         scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "pw"))
         scripted.when(_starts_with("helm", "registry", "login"), FakeProc(0, ""))
         scripted.when(_starts_with("aws", "ecr", "describe-repositories"), FakeProc(0, ""))
@@ -3489,10 +3551,12 @@ class PackageDirectoryContainmentTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
     def test_24_canonical_package_path_missing_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3685,6 +3749,7 @@ class ChartSourceRootIntegrityTests(unittest.TestCase):
             phase5_runtime.update_state(state_path, {**_reconcile_state_fixture(), "package_path": package_path_rel}, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             scripted.when(_starts_with("aws", "ecr", "get-login-password"), FakeProc(0, "pw"))
             scripted.when(_starts_with("helm", "registry", "login"), FakeProc(0, ""))
             scripted.when(_starts_with("aws", "ecr", "describe-repositories"), FakeProc(0, ""))
@@ -3727,7 +3792,8 @@ class ChartSourceRootIntegrityTests(unittest.TestCase):
             with mock.patch.multiple(phase5_runtime, REPO_ROOT=repo_root, HELM_CHART_PATH=repo_root / "helm" / "goldengate"), mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     _run_quiet(phase5_runtime.cmd_publish_chart, args)
-            self.assertEqual(scripted.calls, [])
+            is_describe_call = _starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL))
+            self.assertEqual([c for c in scripted.calls if not is_describe_call(c["argv"])], [])
 
 
 class ValidateLocalChartRootOrderingTests(unittest.TestCase):
@@ -3965,6 +4031,7 @@ class PackagedOutputRootTests(unittest.TestCase):
             (repo_root / values_rel).parent.mkdir(parents=True)
             (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run", scripted):
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
@@ -3984,6 +4051,7 @@ class PackagedOutputRootTests(unittest.TestCase):
             (repo_root / values_rel).parent.mkdir(parents=True)
             (repo_root / values_rel).write_text("runtime:\n  containerName: goldengate\n")
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(repo_root), mock.patch.object(phase5_runtime, "run", scripted):
                 with self.assertRaises(phase5_runtime.Phase5Error):
                     phase5_runtime._package_runtime_chart(DEPLOYMENT_ID, values_rel, CHART_VERSION)
@@ -4323,6 +4391,7 @@ class ChartSourceTreeIntegrityTests(unittest.TestCase):
                 return result
 
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(repo_root), \
                  mock.patch.object(phase5_runtime, "run", scripted), \
                  mock.patch.object(phase5_runtime.shutil, "copy", side_effect=poisoning_copy):
@@ -4348,6 +4417,7 @@ class ChartSourceTreeIntegrityTests(unittest.TestCase):
                 return result
 
             scripted = ScriptedRun()
+            scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_descriptor())))
             with _mock_repo_root_with_real_chart(repo_root), \
                  mock.patch.object(phase5_runtime, "run", scripted), \
                  mock.patch.object(phase5_runtime.shutil, "copy", side_effect=poisoning_copy):

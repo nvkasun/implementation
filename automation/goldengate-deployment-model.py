@@ -61,6 +61,23 @@ _EFS_FILESYSTEM_ID_RE = re.compile(r"^fs-[0-9a-f]+\Z")
 _VALID_EFS_MODES = ("managed", "existing")
 _EFS_CREATION_TOKEN_MAX_LENGTH = 64
 
+# Pipeline-Aware Descriptor Hierarchy: pipeline IDs and deployment (runtime) IDs must both end in exactly a 3-digit operator-visible correlation suffix (-NNN), and a pipeline's suffix must exactly equal the suffix of every deployment ID declared under it (deployment.pipeline). This is an ADDITIONAL constraint layered on top of the existing _safe_token() grammar -- it never replaces or loosens it.
+_THREE_DIGIT_SUFFIX_RE = re.compile(r"-([0-9]{3})\Z")
+
+
+def _three_digit_suffix(value):
+    match = _THREE_DIGIT_SUFFIX_RE.search(value or "")
+    return match.group(1) if match else None
+
+
+# Pipeline-Aware Descriptor Hierarchy Migration: exactly four intentional deployment-ID renames (the folder migration to envs/<environment>/pipelines/<pipeline-id>/<deployment-id>/ with 3-digit pipeline/runtime correlation suffixes) must NOT change the underlying managed EFS filesystem's immutable creation_token -- creation_token is a ForceNew argument on the real aws_efs_file_system resource (envs/dev/efs.tf, via the approved aws-tf-module-efs), so changing it would destroy and recreate the filesystem. This is a narrowly scoped, explicit, auditable mapping of (environment, NEW deployment ID) -> the EXACT creation token the existing AWS filesystem was already created with under its OLD deployment ID -- it is NOT a general runtime-identity override: any (environment, deployment_id) pair absent from this map always derives its token normally via the formula below. Never add a future entry here for a genuinely new runtime -- this exists ONLY to bridge these four specific pre-existing managed EFS filesystems across this one intentional rename. Mirrored (never imported) by automation/phases/phase1/managed_efs_inventory_guard.py's own copy (its derive_expected_creation_token(), which derives from an ACTUAL AWS filesystem's own tags) and by envs/dev/efs.tf's own goldengate_legacy_managed_efs_creation_tokens local -- a dedicated drift test proves all three agree.
+LEGACY_MANAGED_EFS_CREATION_TOKENS = {
+    ("dev", "gg-postgresql-repltest-001"): "dev-gg-postgresql-repltest-01-efs",
+    ("dev", "gg-mssql-repltest-001"): "dev-gg-mssql-repltest-01-efs",
+    ("dev", "gg-oracle-repltest-002"): "dev-gg-oracle-repltest-01-efs",
+    ("dev", "gg-postgresql-repltest-002"): "dev-gg-postgresql-repltest-02-efs",
+}
+
 _CREDENTIAL_KEY_FRAGMENTS = (
     "password", "passwd", "pwd", "secretvalue", "connectionstring", "conn_str",
     "username", "token", "apikey", "api_key", "dburl", "database_url", "databaseurl",
@@ -129,12 +146,24 @@ def load_yaml_strict(path):
 
 
 def find_values_files(environment):
-    pattern = os.path.join(REPO_ROOT, "envs", environment, "*", "values.yaml")
+    """Pipeline-Aware Descriptor Hierarchy: the ONLY canonical runtime descriptor shape is exactly two levels under envs/<environment>/pipelines/ -- envs/<environment>/pipelines/<pipeline-id>/<deployment-id>/values.yaml. This exact two-star glob is itself the complete discovery-boundary contract: envs/<environment>/argocd/values.yaml, envs/<environment>/goldengate-monitor/values.yaml (both siblings of pipelines/, never inside it), and any values.yaml at the wrong depth under pipelines/ (e.g. pipelines/<pipeline-id>/values.yaml with no deployment-id leaf, or a third nesting level) are never matched -- never silently adopted, never even reported as "invalid" (they are structurally outside discovery entirely, not merely filtered by name)."""
+    pattern = os.path.join(REPO_ROOT, "envs", environment, "pipelines", "*", "*", "values.yaml")
     return sorted(glob.glob(pattern))
 
 
 def _folder_name(path):
+    """The leaf directory -- the canonical deployment (runtime) ID."""
     return os.path.basename(os.path.dirname(path))
+
+
+def _pipeline_folder_name(path):
+    """The parent-of-leaf directory under envs/<environment>/pipelines/ -- the canonical pipeline ID folder, expected to exactly equal that descriptor's own deployment.pipeline value (enforced in parse_descriptor)."""
+    return os.path.basename(os.path.dirname(os.path.dirname(path)))
+
+
+def _repo_relative_values_file(path):
+    """Deterministic, repository-relative, traversal-safe descriptor path (POSIX separators) -- the single non-secret field downstream consumers (Phase 5) read/validate the current deployment values file through, instead of ever reconstructing envs/<environment>/<deployment_id>/values.yaml themselves. path is always produced by find_values_files() above (a real glob match under REPO_ROOT), never caller-supplied, so relpath can never escape REPO_ROOT here."""
+    return os.path.relpath(path, REPO_ROOT).replace(os.sep, "/")
 
 
 def _require_dict(value, reason):
@@ -272,7 +301,10 @@ def _parse_csi_structure(runtime):
 
 
 def derive_efs_creation_token(environment, deployment_id):
-    """Deterministic managed-EFS identity; fails closed rather than silently truncating or hashing the deployment ID."""
+    """Deterministic managed-EFS identity; fails closed rather than silently truncating or hashing the deployment ID. Checks LEGACY_MANAGED_EFS_CREATION_TOKENS FIRST -- exactly four current (environment, deployment_id) pairs must keep their pre-existing AWS filesystem's immutable creation_token across this task's intentional deployment-ID rename; every other pair (including any future deployment ID) always derives the normal deterministic formula below."""
+    legacy_token = LEGACY_MANAGED_EFS_CREATION_TOKENS.get((environment, deployment_id))
+    if legacy_token is not None:
+        return legacy_token
     token = f"{environment}-{deployment_id}-efs"
     if len(token) > _EFS_CREATION_TOKEN_MAX_LENGTH:
         raise DescriptorError(f"invalid persistence configuration: derived EFS creation token exceeds the {_EFS_CREATION_TOKEN_MAX_LENGTH}-character AWS limit")
@@ -318,13 +350,16 @@ def _parse_efs(deployment_id, environment, doc):
     return {"mode": mode, "fileSystemId": None, "creationToken": creation_token, "pvcClaimName": pvc_claim_name}
 
 
-def parse_descriptor(deployment_id, environment, doc, shared=None):
-    """Fully validates one values.yaml document; raises DescriptorError with a fixed, safe reason on any problem."""
+def parse_descriptor(deployment_id, environment, doc, shared=None, pipeline_folder=None, values_file=None):
+    """Fully validates one values.yaml document; raises DescriptorError with a fixed, safe reason on any problem. pipeline_folder/values_file are OPTIONAL, supplied only by the real folder-driven scan (classify_folder below) -- a direct unit-scoped call (no real file on disk) leaves them None and skips the filesystem-shape-specific pipeline_folder==deployment.pipeline check, but the 3-digit suffix/correlation rules (E/F/G) below are unconditional descriptor-validity rules, not filesystem-shape checks, and always apply."""
     if shared is None:
         shared = _load_shared_environment_metadata(environment, None, None)
 
     if not _safe_token(deployment_id, _MAX_ID_LENGTH):
         raise DescriptorError("invalid folder name: deployment ID must be a safe lowercase token")
+    deployment_id_suffix = _three_digit_suffix(deployment_id)
+    if deployment_id_suffix is None:
+        raise DescriptorError("invalid folder name: deployment ID must end in a 3-digit pipeline correlation suffix (-NNN), e.g. gg-oracle-repltest-002")
 
     if doc.get("deploymentModel") != "singleRuntime":
         raise DescriptorError("missing or invalid deploymentModel: must be exactly \"singleRuntime\"")
@@ -340,6 +375,13 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
     pipeline = deployment.get("pipeline")
     if not _safe_token(pipeline, _MAX_PIPELINE_LENGTH):
         raise DescriptorError("invalid deployment metadata: deployment.pipeline must be a safe non-empty identifier")
+    pipeline_suffix = _three_digit_suffix(pipeline)
+    if pipeline_suffix is None:
+        raise DescriptorError("invalid deployment metadata: deployment.pipeline must end in a 3-digit pipeline correlation suffix (-NNN), e.g. repltest-ora-to-pg-002")
+    if pipeline_suffix != deployment_id_suffix:
+        raise DescriptorError(f"pipeline/deployment correlation mismatch: deployment.pipeline suffix -{pipeline_suffix} does not match deployment ID suffix -{deployment_id_suffix}")
+    if pipeline_folder is not None and pipeline_folder != pipeline:
+        raise DescriptorError(f"canonical path mismatch: the parent pipeline folder ({pipeline_folder!r}) must exactly equal deployment.pipeline ({pipeline!r})")
     role = deployment.get("role")
     if role not in _VALID_ROLES:
         raise DescriptorError("invalid deployment metadata: deployment.role must be exactly \"source\" or \"target\"")
@@ -416,6 +458,8 @@ def parse_descriptor(deployment_id, environment, doc, shared=None):
         "deploymentId": deployment_id,
         "environment": environment,
         "pipeline": pipeline,
+        # Deterministic, repository-relative, traversal-safe descriptor path -- e.g. "envs/dev/pipelines/repltest-ora-to-pg-002/gg-oracle-repltest-002/values.yaml". None only for a direct unit-scoped parse_descriptor() call with no real file on disk (values_file=None, the default); every folder-driven descriptor (classify_folder below) always supplies it. Phase 5 (automation/phases/phase5/phase5_runtime.py) consumes this field instead of ever reconstructing the path itself -- this module remains the single canonical descriptor-path resolver.
+        "valuesFile": values_file,
         "role": role,
         "enabled": enabled,
         "deploymentType": deployment_type,
@@ -470,7 +514,7 @@ def classify_folder(path, environment, shared):
         return "invalid", None, "document is not a mapping"
 
     try:
-        descriptor = parse_descriptor(name, environment, doc, shared=shared)
+        descriptor = parse_descriptor(name, environment, doc, shared=shared, pipeline_folder=_pipeline_folder_name(path), values_file=_repo_relative_values_file(path))
     except DescriptorError as exc:
         return "invalid", None, exc.reason
 

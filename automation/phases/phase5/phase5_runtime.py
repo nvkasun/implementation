@@ -207,7 +207,8 @@ def _validate_reconcile_state_identity(state, environment, deployment_id):
     _require_exact("release_name", deployment_id)
     _require_exact("argocd_app_name", _canonical_argocd_app_name(environment, deployment_id))
     _require_exact("target_namespace", require_env("RUNTIME_NAMESPACE"))
-    _require_exact("values_file", f"envs/{environment}/{deployment_id}/values.yaml")
+    # Pipeline-Aware Descriptor Hierarchy: the canonical descriptor path (envs/<environment>/pipelines/<pipeline-id>/<deployment-id>/values.yaml) is resolved ONCE by automation/goldengate-deployment-model.py itself (parse_descriptor's own valuesFile field) -- never reconstructed here as a flat envs/<environment>/<deployment_id>/ path, which no longer exists. This module remains the single canonical descriptor-path resolver; Phase 5 only ever consumes/validates its output.
+    _require_exact("values_file", _describe_deployment_json(environment, deployment_id).get("valuesFile"))
     _require_exact("helm_ecr_repository", HELM_ECR_REPOSITORY)
 
     ecr_registry = require_env("ECR_REGISTRY")
@@ -784,7 +785,8 @@ def _validate_packaged_chart_contents(resolved_package_path, chart_version, envi
     if packaged_chart_yaml != expected_chart_yaml:
         raise Phase5Error(f"packaged {chart_yaml_member} {packaged_chart_yaml!r} does not match the expected canonical Chart.yaml (current helm/goldengate/Chart.yaml with only version/appVersion set to the canonical chart version {chart_version!r}): expected {expected_chart_yaml!r}.")
 
-    expected_values_path = REPO_ROOT / "envs" / environment / deployment_id / "values.yaml"
+    # Pipeline-Aware Descriptor Hierarchy: the canonical descriptor path is resolved via the deployment model's own valuesFile field, never reconstructed as a flat envs/<environment>/<deployment_id>/ path here.
+    expected_values_path = REPO_ROOT / _describe_deployment_json(environment, deployment_id)["valuesFile"]
     if not expected_values_path.is_file():
         raise Phase5Error(f"expected current deployment values file does not exist: {expected_values_path}")
     expected_values_bytes = expected_values_path.read_bytes()
@@ -816,7 +818,8 @@ def cmd_prepare_deployment(args):
 
     argocd_app_name = _canonical_argocd_app_name(environment, deployment_id)
 
-    values_file = f"envs/{environment}/{deployment_id}/values.yaml"
+    # Pipeline-Aware Descriptor Hierarchy: the canonical descriptor path (envs/<environment>/pipelines/<pipeline-id>/<deployment-id>/values.yaml) comes from automation/goldengate-deployment-model.py's own valuesFile field -- never reconstructed as a flat envs/<environment>/<deployment_id>/ path here. That module remains the single canonical descriptor-path resolver.
+    values_file = _describe_deployment_json(environment, deployment_id)["valuesFile"]
 
     chart_version = _canonical_chart_version(deployment_id)
     ecr_registry = require_env("ECR_REGISTRY")

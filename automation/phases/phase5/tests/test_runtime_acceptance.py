@@ -1,4 +1,4 @@
-"""Offline tests for automation/phases/phase5/runtime_acceptance.py; run directly via `python3 automation/phases/phase5/tests/test_runtime_acceptance.py`. No live Kubernetes/AWS -- every kubectl response is a fake, injected fixture, and the expected EFS filesystem ID is passed in exactly as the real workflow would after its own read-only AWS resolution. Exercises the classifier's actual logic (never merely greps its source). Fixtures are shaped after the real, currently-inactive envs/dev/gg-postgresql-repltest-01 descriptor (source role, managed EFS, ingress enabled) -- describe_deployment() reads the real repository, never a scratch root, EXCEPT the dedicated RuntimeAcceptanceExternalClaimTests class below, which uses an isolated scratch environment to exercise the supported explicit-existingClaim shape those real descriptors do not use."""
+"""Offline tests for automation/phases/phase5/runtime_acceptance.py; run directly via `python3 automation/phases/phase5/tests/test_runtime_acceptance.py`. No live Kubernetes/AWS -- every kubectl response is a fake, injected fixture, and the expected EFS filesystem ID is passed in exactly as the real workflow would after its own read-only AWS resolution. Exercises the classifier's actual logic (never merely greps its source). Fixtures are shaped after the real, currently-active envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001 descriptor (source role, managed EFS, ingress enabled) -- describe_deployment() reads the real repository, never a scratch root, EXCEPT the dedicated RuntimeAcceptanceExternalClaimTests class below, which uses an isolated scratch environment to exercise the supported explicit-existingClaim shape those real descriptors do not use."""
 from __future__ import annotations
 
 import importlib.util
@@ -24,7 +24,8 @@ def _load_tool():
 runtime_acceptance = _load_tool()
 
 ENVIRONMENT = "dev"
-DEPLOYMENT_ID = "gg-postgresql-repltest-01"
+# Pipeline-Aware Descriptor Hierarchy: the real descriptor this class exercises now lives at envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml (migrated from the pre-migration gg-postgresql-repltest-01).
+DEPLOYMENT_ID = "gg-postgresql-repltest-001"
 ARGOCD_NAMESPACE = "argocd"
 RUNTIME_NAMESPACE = "goldengate-dev"
 ECR_REGISTRY = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
@@ -34,7 +35,7 @@ ACM_CERTIFICATE_ARN = "arn:aws:acm:eu-west-1:668311715351:certificate/9e53e28e-3
 AWS_REGION = "eu-west-1"
 EXPECTED_FS_ID = "fs-0123456789abcdef0"
 
-APP_NAME = f"goldengate-{ENVIRONMENT}-postgresql-repltest-01"
+APP_NAME = f"goldengate-{ENVIRONMENT}-postgresql-repltest-001"
 SC_NAME = f"gg-efs-{ENVIRONMENT}-{DEPLOYMENT_ID}"
 CONTAINER_NAME = "ogg-postgresql"
 SA_NAME = "gg-runtime-sa"
@@ -46,7 +47,7 @@ ADMIN_MOUNT_PATH = "/mnt/secrets-store/admin"
 CERTIFICATE_MOUNT_PATH = "/etc/nginx/cert"
 EXPECTED_SELECTOR = {"app.kubernetes.io/name": "goldengate", "app.kubernetes.io/instance": DEPLOYMENT_ID}
 
-# Real gg-postgresql-repltest-01 descriptor: source role -> https/dist/metrics, no receiver.
+# Real gg-postgresql-repltest-001 descriptor: source role -> https/dist/metrics, no receiver.
 DEFAULT_SERVICE_PORT_VALUES = {"https": 8443, "dist": 9013, "receiver": 9014, "metrics": 9015}
 MAIN_CONTAINER_PORTS = [
     {"name": "https", "containerPort": 8443, "protocol": "TCP"},
@@ -907,7 +908,7 @@ class RuntimeAcceptanceServiceRoutingTests(unittest.TestCase):
         self.assertTrue(any(f"service/{DEPLOYMENT_ID} ports=" in r and "'dist'" in r for r in result["reasons"]))
 
     def test_source_service_unexpected_receiver_port_is_broken(self):
-        # gg-postgresql-repltest-01 is a SOURCE runtime -- its canonical servicePorts has receiver=None, so a Service that adds a receiver port anyway is a contract mismatch, never silently accepted.
+        # gg-postgresql-repltest-001 is a SOURCE runtime -- its canonical servicePorts has receiver=None, so a Service that adds a receiver port anyway is a contract mismatch, never silently accepted.
         cluster = _populate_healthy_cluster(FakeCluster())
         cluster.put("service", DEPLOYMENT_ID, RUNTIME_NAMESPACE, _service_obj(DEPLOYMENT_ID, ports=_service_ports(names=("https", "dist", "receiver", "metrics"))))
         result = _classify(cluster)
@@ -987,9 +988,10 @@ tags:
   dataClassification: General
 """
 
-EXTERNAL_CLAIM_DEPLOYMENT_ID = "gg-existingclaim-01"
+EXTERNAL_CLAIM_PIPELINE_ID = "existing-claim-pipeline-001"
+EXTERNAL_CLAIM_DEPLOYMENT_ID = "gg-existingclaim-001"
 EXTERNAL_CLAIM_NAME = "external-claim-01"
-EXTERNAL_CLAIM_APP_NAME = f"goldengate-dev-existingclaim-01"
+EXTERNAL_CLAIM_APP_NAME = f"goldengate-dev-existingclaim-001"
 EXTERNAL_CLAIM_IMAGE = f"{ECR_REGISTRY}/ogg-oracle:1.0.0"
 EXTERNAL_CLAIM_CONTAINER_NAME = "ogg-oracle"
 EXTERNAL_CLAIM_SELECTOR = {"app.kubernetes.io/name": "goldengate", "app.kubernetes.io/instance": EXTERNAL_CLAIM_DEPLOYMENT_ID}
@@ -1008,7 +1010,7 @@ class RuntimeAcceptanceExternalClaimTests(unittest.TestCase):
             f.write(_SYNTHETIC_ENVIRONMENT_YAML)
 
         doc = {
-            "deployment": {"enabled": True, "pipeline": "existing-claim-pipeline", "role": "target"},
+            "deployment": {"enabled": True, "pipeline": EXTERNAL_CLAIM_PIPELINE_ID, "role": "target"},
             "deploymentModel": "singleRuntime",
             "runtime": {
                 "deploymentType": "oracle",
@@ -1021,7 +1023,8 @@ class RuntimeAcceptanceExternalClaimTests(unittest.TestCase):
             },
             "ingress": {"enabled": False},
         }
-        deployment_dir = os.path.join(env_dir, EXTERNAL_CLAIM_DEPLOYMENT_ID)
+        # Pipeline-Aware Descriptor Hierarchy: envs/<environment>/pipelines/<pipeline-id>/<deployment-id>/values.yaml, never the pre-migration flat layout.
+        deployment_dir = os.path.join(env_dir, "pipelines", EXTERNAL_CLAIM_PIPELINE_ID, EXTERNAL_CLAIM_DEPLOYMENT_ID)
         os.makedirs(deployment_dir, exist_ok=True)
         with open(os.path.join(deployment_dir, "values.yaml"), "w") as f:
             yaml.safe_dump(doc, f)

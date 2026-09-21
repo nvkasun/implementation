@@ -40,6 +40,20 @@ PHASE5_RUNTIME_TOOL="automation/phases/phase5/phase5_runtime.py"
 RUNTIME_STATE_TOOL="automation/phases/phase5/runtime_state.py"
 RUNTIME_ACCEPTANCE_TOOL="automation/phases/phase5/runtime_acceptance.py"
 
+# Pipeline-Aware Descriptor Hierarchy: resolves the single envs/dev/pipelines/<pipeline-id>/<deployment-id>/values.yaml path for a given deployment ID against the REAL repository tree -- the sole real-repo-side path resolver this regression script uses, mirroring automation/phases/phase1/detect-goldengate-deployments.sh's own resolve_current_values_file(); prints nothing and fails if zero or more than one match exists, never guesses.
+resolve_dev_values_file() {
+  local dep_id="$1"
+  local matches=()
+  shopt -s nullglob
+  matches=(envs/dev/pipelines/*/"${dep_id}"/values.yaml)
+  shopt -u nullglob
+  if [ "${#matches[@]}" -eq 1 ]; then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  fi
+  return 1
+}
+
 # runtime.image.repository/ingress.hostDomain/ingress.alb.groupName/ingress.alb.certificateArn/runtime.csi.region are shared environment configuration -- resolved once here via the same resolver the deploy workflow uses, never an independently maintained literal.
 RESOLVED_DNS_DOMAIN="$(python3 "$ENVIRONMENT_TOOL" --environment dev get DNS_DOMAIN)"
 RESOLVED_ALB_GROUP_NAME="$(python3 "$ENVIRONMENT_TOOL" --environment dev get ALB_GROUP_NAME)"
@@ -63,8 +77,8 @@ RESOLVED_MONITOR_LOG_GROUP="$(python3 "$ENVIRONMENT_TOOL" --environment dev get 
 PLATFORM_SHARED_OVERRIDES=(--set-string environment="$RESOLVED_GG_ENVIRONMENT" --set-string namespaces.runtime.name="$RESOLVED_RUNTIME_NAMESPACE" --set-string fluentBit.namespaces.runtime="$RESOLVED_RUNTIME_NAMESPACE" --set-string fluentBit.namespaces.monitoring="$RESOLVED_MONITOR_NAMESPACE" --set-string fluentBit.cloudwatch.runtimeLogGroupName="$RESOLVED_RUNTIME_LOG_GROUP" --set-string fluentBit.cloudwatch.monitorLogGroupName="$RESOLVED_MONITOR_LOG_GROUP")
 
 # Shared-secret identities (role-derived admin secret) plus the restored shared gg-runtime-sa identity the deploy workflow injects via --set; direct helm invocations against the two known historical fixtures below must mirror them. Image repository is now resolved per-deployment (below) since it depends on the descriptor's own runtime.image.repositoryName.
-ORACLE_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/source/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set-string runtime.csi.region="$RESOLVED_AWS_REGION" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa "${SHARED_INGRESS_OVERRIDES[@]}" --set-string runtime.image.repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-postgresql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')")
-POSTGRESQL_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/target/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set-string runtime.csi.region="$RESOLVED_AWS_REGION" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa "${SHARED_INGRESS_OVERRIDES[@]}" --set-string runtime.image.repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-mssql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')")
+ORACLE_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/source/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set-string runtime.csi.region="$RESOLVED_AWS_REGION" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa "${SHARED_INGRESS_OVERRIDES[@]}" --set-string runtime.image.repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-postgresql-repltest-001 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')")
+POSTGRESQL_SHARED_OVERRIDES=(--set runtime.csi.admin.objectName=dev/goldengate/target/admin --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate --set-string runtime.csi.region="$RESOLVED_AWS_REGION" --set runtime.serviceAccount.create=false --set runtime.serviceAccount.name=gg-runtime-sa "${SHARED_INGRESS_OVERRIDES[@]}" --set-string runtime.image.repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-mssql-repltest-001 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')")
 
 # Self-service: for any REAL-repository render loop that dynamically iterates the live inventory (never a fixed ID list), overrides are derived from the deployment model's own `describe` output -- never a hardcoded oracle-vs-postgresql binary -- so a newly onboarded folder of any deploymentType/role is rendered correctly without touching this file. Sets the global array SHARED_OVERRIDES. Uses the exact same dry-run managed-EFS placeholder the real deploy=false workflow uses (fs-0dead0000000beef0); mode=existing already carries its own committed fileSystemId in the descriptor's own values.yaml, so no override is needed there.
 derive_shared_overrides_for_deployment() {
@@ -289,9 +303,8 @@ for d in doc['deployments']:
   fi
   while IFS= read -r name; do
     [ -z "$name" ] && continue
-    VALUES_FILE="envs/dev/${name}/values.yaml"
-    if [ ! -f "$VALUES_FILE" ]; then
-      fail "no environment values file found for enabled deployment ${name} (expected ${VALUES_FILE})"
+    if ! VALUES_FILE="$(resolve_dev_values_file "$name")"; then
+      fail "no environment values file found for enabled deployment ${name} (expected envs/dev/pipelines/<pipeline-id>/${name}/values.yaml)"
       continue
     fi
     if grep -qE '^\s*enabled:\s*true' "$VALUES_FILE" && grep -qE '^\s*enabled:\s*true\s*$' <(sed -n '/^deployment:/,/^[a-zA-Z]/p' "$VALUES_FILE"); then
@@ -339,8 +352,8 @@ fi
 echo ""
 echo "--- Helm lint ---"
 if [ "$HELM_AVAILABLE" = "true" ]; then
-  # deploymentModel has no usable default and assertSupportedDeploymentModel fires at render time, so lint against a real canonical values file (declares deploymentModel: singleRuntime), never bare/values-less -- matches how the chart is linted in production. gg-postgresql-repltest-01 is role=source, so it takes the source-secret override set (ORACLE_SHARED_OVERRIDES is named for the historical oracle=source descriptor but its objectName values are role-based, not engine-based).
-  if helm lint "$RUNTIME_CHART" -f "${REPO_ROOT}/envs/dev/gg-postgresql-repltest-01/values.yaml" --set global.environment=dev "${ORACLE_SHARED_OVERRIDES[@]}" >"${WORKDIR}/lint-runtime.log" 2>&1; then
+  # deploymentModel has no usable default and assertSupportedDeploymentModel fires at render time, so lint against a real canonical values file (declares deploymentModel: singleRuntime), never bare/values-less -- matches how the chart is linted in production. gg-postgresql-repltest-001 is role=source, so it takes the source-secret override set (ORACLE_SHARED_OVERRIDES is named for the historical oracle=source descriptor but its objectName values are role-based, not engine-based).
+  if helm lint "$RUNTIME_CHART" -f "${REPO_ROOT}/envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml" --set global.environment=dev "${ORACLE_SHARED_OVERRIDES[@]}" >"${WORKDIR}/lint-runtime.log" 2>&1; then
     pass "helm lint ${RUNTIME_CHART} (canonical singleRuntime values)"
   else
     fail "helm lint ${RUNTIME_CHART} (canonical singleRuntime values)"
@@ -1726,7 +1739,10 @@ echo "--- Render enabled runtimes; one StatefulSet each, no sidecar ---"
 if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
   while IFS= read -r name; do
     [ -z "$name" ] && continue
-    VALUES_FILE="envs/dev/${name}/values.yaml"
+    if ! VALUES_FILE="$(resolve_dev_values_file "$name")"; then
+      fail "no environment values file found for enabled deployment ${name} (expected envs/dev/pipelines/<pipeline-id>/${name}/values.yaml)"
+      continue
+    fi
     RENDERED="${WORKDIR}/${name}.yaml"
 
     derive_shared_overrides_for_deployment "$name"
@@ -2506,7 +2522,7 @@ if [ -f "$DETECT_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
 
   awk '/^is_active_deployment_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh" > "${WORKDIR}/is_active_fn.sh"
 
-  # is_goldengate_deployment_values_file and its git-revision sibling both depend on _classify_deployment_model_yaml -- all three must be extracted and sourced together, in dependency order, or the classifier fails with a silent, useless "command not found". _efs_mode_from_yaml is also bundled here since the deletion loop below (deletion_loop.sh) calls it and only sources this same file.
+  # is_goldengate_deployment_values_file and its git-revision sibling both depend on _classify_deployment_model_yaml -- all three must be extracted and sourced together, in dependency order, or the classifier fails with a silent, useless "command not found". _efs_mode_from_yaml is also bundled here since the deletion loop below (deletion_loop.sh) calls it and only sources this same file. Pipeline-Aware Descriptor Hierarchy: resolve_current_values_file/compute_old_values_file_by_id/lookup_old_values_file and the KNOWN_DEPLOYMENT_ID_MIGRATIONS map are ALSO bundled here -- the deletion loop's own body now calls all four (never a second, independently-maintained copy of any of them).
   {
     awk '/^_classify_deployment_model_yaml\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
     echo ""
@@ -2515,14 +2531,25 @@ if [ -f "$DETECT_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
     awk '/^is_goldengate_deployment_values_file_at_ref\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
     echo ""
     awk '/^_efs_mode_from_yaml\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
+    echo ""
+    awk '/^resolve_current_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
+    echo ""
+    awk '/^declare -A KNOWN_DEPLOYMENT_ID_MIGRATIONS=\(/,/^\)$/' "${WORKDIR}/detect_script.sh"
+    echo ""
+    awk '/^compute_old_values_file_by_id\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
+    echo ""
+    awk '/^lookup_old_values_file\(\) \{/,/^\}$/' "${WORKDIR}/detect_script.sh"
   } > "${WORKDIR}/is_gg_fn.sh"
 
   # Fails loudly if any expected function body failed to extract -- an empty/missing body would make every downstream source-and-call test meaningless.
-  for required_fn in _classify_deployment_model_yaml is_goldengate_deployment_values_file is_goldengate_deployment_values_file_at_ref _efs_mode_from_yaml; do
+  for required_fn in _classify_deployment_model_yaml is_goldengate_deployment_values_file is_goldengate_deployment_values_file_at_ref _efs_mode_from_yaml resolve_current_values_file compute_old_values_file_by_id lookup_old_values_file; do
     if ! grep -q "^${required_fn}() {" "${WORKDIR}/is_gg_fn.sh"; then
       fail "could not extract ${required_fn}() from ${DETECT_SCRIPT} -- the classifier test harness cannot run"
     fi
   done
+  if ! grep -q "^declare -A KNOWN_DEPLOYMENT_ID_MIGRATIONS=(" "${WORKDIR}/is_gg_fn.sh"; then
+    fail "could not extract KNOWN_DEPLOYMENT_ID_MIGRATIONS from ${DETECT_SCRIPT} -- the classifier test harness cannot run"
+  fi
 
   cat > "${WORKDIR}/run_is_active_checks.sh" <<HARNESS
 #!/bin/bash
@@ -2542,8 +2569,8 @@ check_one() {
   fi
 }
 
-check_one "envs/dev/gg-postgresql-repltest-01/values.yaml" 0 "postgresql-repltest-active"
-check_one "envs/dev/gg-mssql-repltest-01/values.yaml" 0 "mssql-repltest-active"
+check_one "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml" 0 "postgresql-repltest-active"
+check_one "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml" 0 "mssql-repltest-active"
 HARNESS
 
   ACTIVE_CHECK_OUTPUT="$(bash "${WORKDIR}/run_is_active_checks.sh" 2>&1 || true)"
@@ -2567,8 +2594,8 @@ check_one() {
   fi
 }
 
-check_one "envs/dev/gg-postgresql-repltest-01/values.yaml" 0 "postgresql-repltest-is-gg"
-check_one "envs/dev/gg-mssql-repltest-01/values.yaml" 0 "mssql-repltest-is-gg"
+check_one "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml" 0 "postgresql-repltest-is-gg"
+check_one "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml" 0 "mssql-repltest-is-gg"
 check_one "envs/dev/goldengate-monitor/values.yaml" 1 "monitor-is-not-gg"
 check_one "envs/dev/argocd/values.yaml" 1 "argocd-is-not-gg"
 HARNESS
@@ -2596,20 +2623,20 @@ HARNESS
     fail "one or both canonical folders are not reported active by the real workflow function"
   fi
 
-  # A shared-chart-change selection scans every envs/dev/<id>/values.yaml (excluding argocd/) exactly as the workflow does, filtered through the same two real functions in the same order, proving the exact resulting active set.
-  CANDIDATE_IDS="$(find envs/dev -mindepth 2 -maxdepth 2 -name values.yaml -not -path 'envs/dev/argocd/*' \
-    | sed -E 's#^envs/dev/([^/]+)/values\.yaml$#\1#' | sort -u)"
+  # A shared-chart-change selection scans every envs/dev/pipelines/<pipeline-id>/<deployment-id>/values.yaml exactly as the workflow does, filtered through the same two real functions in the same order, proving the exact resulting active set. Pipeline-Aware Descriptor Hierarchy: the depth-3 find pattern itself excludes envs/dev/argocd/ and envs/dev/goldengate-monitor/ structurally (both are siblings of pipelines/, never inside it) -- there is no longer a separate -not -path exclusion to maintain.
+  CANDIDATE_FILES="$(find envs/dev/pipelines -mindepth 3 -maxdepth 3 -name values.yaml | sort -u)"
   ACTIVE_IDS=""
-  for id in $CANDIDATE_IDS; do
+  for values_file in $CANDIDATE_FILES; do
+    id="$(basename "$(dirname "$values_file")")"
     set +e
-    bash -c "source '${WORKDIR}/is_gg_fn.sh'; is_goldengate_deployment_values_file 'envs/dev/${id}/values.yaml'" >/dev/null 2>&1
+    bash -c "source '${WORKDIR}/is_gg_fn.sh'; is_goldengate_deployment_values_file '${values_file}'" >/dev/null 2>&1
     gg_st=$?
     set -e
     if [ "$gg_st" -ne 0 ]; then
       continue
     fi
     set +e
-    bash -c "source '${WORKDIR}/is_active_fn.sh'; is_active_deployment_values_file 'envs/dev/${id}/values.yaml'" >/dev/null 2>&1
+    bash -c "source '${WORKDIR}/is_active_fn.sh'; is_active_deployment_values_file '${values_file}'" >/dev/null 2>&1
     st=$?
     set -e
     [ "$st" -eq 0 ] && ACTIVE_IDS="${ACTIVE_IDS} ${id}"
@@ -2647,29 +2674,30 @@ HARNESS
     rm -rf "$DELETION_REPO"
     mkdir -p "$DELETION_REPO"
 
-    mkdir -p "${DELETION_REPO}/envs/dev/case2-removed-canonical" \
+    # Pipeline-Aware Descriptor Hierarchy: every GoldenGate-shaped candidate lives at its own envs/dev/pipelines/<case-id>-pl/<case-id>/values.yaml -- the pipeline folder name is otherwise arbitrary here (these tests exercise only the content-based/path-existence classifiers, never deployment.pipeline correlation). goldengate-monitor/argocd deliberately remain OUTSIDE pipelines/ (real siblings of it), proving they are never even resolvable as removed GoldenGate candidates at all.
+    mkdir -p "${DELETION_REPO}/envs/dev/pipelines/case2-removed-canonical-pl/case2-removed-canonical" \
              "${DELETION_REPO}/envs/dev/goldengate-monitor" \
              "${DELETION_REPO}/envs/dev/argocd" \
-             "${DELETION_REPO}/envs/dev/case6-malformed" \
-             "${DELETION_REPO}/envs/dev/case7-unknown-model" \
-             "${DELETION_REPO}/envs/dev/case-empty-zerobyte" \
-             "${DELETION_REPO}/envs/dev/case-empty-comment" \
-             "${DELETION_REPO}/envs/dev/case-empty-whitespace" \
-             "${DELETION_REPO}/envs/dev/case-empty-null" \
-             "${DELETION_REPO}/envs/dev/case3-historical-legacypair-removed" \
-             "${DELETION_REPO}/envs/dev/case8-deployment-disabled"
+             "${DELETION_REPO}/envs/dev/pipelines/case6-malformed-pl/case6-malformed" \
+             "${DELETION_REPO}/envs/dev/pipelines/case7-unknown-model-pl/case7-unknown-model" \
+             "${DELETION_REPO}/envs/dev/pipelines/case-empty-zerobyte-pl/case-empty-zerobyte" \
+             "${DELETION_REPO}/envs/dev/pipelines/case-empty-comment-pl/case-empty-comment" \
+             "${DELETION_REPO}/envs/dev/pipelines/case-empty-whitespace-pl/case-empty-whitespace" \
+             "${DELETION_REPO}/envs/dev/pipelines/case-empty-null-pl/case-empty-null" \
+             "${DELETION_REPO}/envs/dev/pipelines/case3-historical-legacypair-removed-pl/case3-historical-legacypair-removed" \
+             "${DELETION_REPO}/envs/dev/pipelines/case8-deployment-disabled-pl/case8-deployment-disabled"
 
-    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case2-removed-canonical/values.yaml"
-    printf 'deploymentModel: singleRuntime\ndeployment:\n  enabled: true\npersistence:\n  enabled: true\n  provider: efs\n  efs:\n    mode: managed\n' > "${DELETION_REPO}/envs/dev/case8-deployment-disabled/values.yaml"
+    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/pipelines/case2-removed-canonical-pl/case2-removed-canonical/values.yaml"
+    printf 'deploymentModel: singleRuntime\ndeployment:\n  enabled: true\npersistence:\n  enabled: true\n  provider: efs\n  efs:\n    mode: managed\n' > "${DELETION_REPO}/envs/dev/pipelines/case8-deployment-disabled-pl/case8-deployment-disabled/values.yaml"
     printf 'global:\n  environment: dev\nnamespace:\n  create: true\n' > "${DELETION_REPO}/envs/dev/goldengate-monitor/values.yaml"
     printf 'server:\n  extraArgs: []\n' > "${DELETION_REPO}/envs/dev/argocd/values.yaml"
-    printf 'deploymentModel: singleRuntime\n  bad indent: [unterminated\n' > "${DELETION_REPO}/envs/dev/case6-malformed/values.yaml"
-    printf 'deploymentModel: someUnknownModel\n' > "${DELETION_REPO}/envs/dev/case7-unknown-model/values.yaml"
-    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-zerobyte/values.yaml"
-    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-comment/values.yaml"
-    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-whitespace/values.yaml"
-    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case-empty-null/values.yaml"
-    printf 'deploymentModel: legacyPair\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/case3-historical-legacypair-removed/values.yaml"
+    printf 'deploymentModel: singleRuntime\n  bad indent: [unterminated\n' > "${DELETION_REPO}/envs/dev/pipelines/case6-malformed-pl/case6-malformed/values.yaml"
+    printf 'deploymentModel: someUnknownModel\n' > "${DELETION_REPO}/envs/dev/pipelines/case7-unknown-model-pl/case7-unknown-model/values.yaml"
+    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/pipelines/case-empty-zerobyte-pl/case-empty-zerobyte/values.yaml"
+    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/pipelines/case-empty-comment-pl/case-empty-comment/values.yaml"
+    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/pipelines/case-empty-whitespace-pl/case-empty-whitespace/values.yaml"
+    printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/pipelines/case-empty-null-pl/case-empty-null/values.yaml"
+    printf 'deploymentModel: legacyPair\nrunning: at-base-revision\n' > "${DELETION_REPO}/envs/dev/pipelines/case3-historical-legacypair-removed-pl/case3-historical-legacypair-removed/values.yaml"
 
     git -C "$DELETION_REPO" init -q
     git -C "$DELETION_REPO" config user.email "test@test.invalid"
@@ -2679,18 +2707,18 @@ HARNESS
     DELETION_BEFORE_SHA="$(git -C "$DELETION_REPO" rev-parse HEAD)"
 
     # Mutates the working tree to the "after" state the loop evaluates: case2/3/4/5/6/7 removed (case3 proves the HISTORICAL DELETION CONTRACT still classifies a legacyPair deployment from the base revision); case1 added fresh, uncommitted (a "still exists, now inactive" candidate, invisible to the active-only path since it's legacyPair); case-empty-* files overwritten in place with the four "deliberately empty" shapes.
-    git -C "$DELETION_REPO" rm -rq envs/dev/case2-removed-canonical envs/dev/goldengate-monitor envs/dev/argocd envs/dev/case6-malformed envs/dev/case7-unknown-model envs/dev/case3-historical-legacypair-removed
+    git -C "$DELETION_REPO" rm -rq envs/dev/pipelines/case2-removed-canonical-pl envs/dev/goldengate-monitor envs/dev/argocd envs/dev/pipelines/case6-malformed-pl envs/dev/pipelines/case7-unknown-model-pl envs/dev/pipelines/case3-historical-legacypair-removed-pl
 
-    mkdir -p "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained"
-    printf 'deploymentModel: legacyPair\ndeployment:\n  enabled: false\n' > "${DELETION_REPO}/envs/dev/case1-retired-legacypair-retained/values.yaml"
+    mkdir -p "${DELETION_REPO}/envs/dev/pipelines/case1-retired-legacypair-retained-pl/case1-retired-legacypair-retained"
+    printf 'deploymentModel: legacyPair\ndeployment:\n  enabled: false\n' > "${DELETION_REPO}/envs/dev/pipelines/case1-retired-legacypair-retained-pl/case1-retired-legacypair-retained/values.yaml"
 
     # case8: the file is NOT removed -- only its content changes to deployment.enabled=false, proving the physical-removal/deployment-disabled distinction (the descriptor and its managed EFS declaration are still physically present). GoldenGate Runtime Desired-State Simplification: deployment.enabled=false is now the sole shape that produces this "still present, application decommission" deletion-matrix entry -- lifecycle.state is retired and no longer a second mechanism for it.
-    printf 'deploymentModel: singleRuntime\ndeployment:\n  enabled: false\npersistence:\n  enabled: true\n  provider: efs\n  efs:\n    mode: managed\n' > "${DELETION_REPO}/envs/dev/case8-deployment-disabled/values.yaml"
+    printf 'deploymentModel: singleRuntime\ndeployment:\n  enabled: false\npersistence:\n  enabled: true\n  provider: efs\n  efs:\n    mode: managed\n' > "${DELETION_REPO}/envs/dev/pipelines/case8-deployment-disabled-pl/case8-deployment-disabled/values.yaml"
 
-    : > "${DELETION_REPO}/envs/dev/case-empty-zerobyte/values.yaml"
-    printf '# retired\n# nothing here\n' > "${DELETION_REPO}/envs/dev/case-empty-comment/values.yaml"
-    printf '   \n\n   \n' > "${DELETION_REPO}/envs/dev/case-empty-whitespace/values.yaml"
-    printf 'null\n' > "${DELETION_REPO}/envs/dev/case-empty-null/values.yaml"
+    : > "${DELETION_REPO}/envs/dev/pipelines/case-empty-zerobyte-pl/case-empty-zerobyte/values.yaml"
+    printf '# retired\n# nothing here\n' > "${DELETION_REPO}/envs/dev/pipelines/case-empty-comment-pl/case-empty-comment/values.yaml"
+    printf '   \n\n   \n' > "${DELETION_REPO}/envs/dev/pipelines/case-empty-whitespace-pl/case-empty-whitespace/values.yaml"
+    printf 'null\n' > "${DELETION_REPO}/envs/dev/pipelines/case-empty-null-pl/case-empty-null/values.yaml"
 
     DELETION_TEST_OUTPUT="$(cd "$DELETION_REPO" && bash -c '
       set -euo pipefail
@@ -2707,6 +2735,9 @@ HARNESS
         echo "[ADDED id=${id} model=${model} reason=${reason}]"
       }
       BEFORE_SHA="'"$DELETION_BEFORE_SHA"'"
+      DEPLOYMENT_CANDIDATE_IDS=""
+      NAME_STATUS="$(git diff --name-status "$BEFORE_SHA" -- '"'"'envs/dev/**'"'"' || true)"
+      OLD_VALUES_FILE_BY_ID="$(compute_old_values_file_by_id "$NAME_STATUS" || true)"
 
       for id in case1-retired-legacypair-retained case2-removed-canonical case3-historical-legacypair-removed goldengate-monitor argocd case6-malformed case7-unknown-model case-empty-zerobyte case-empty-comment case-empty-whitespace case-empty-null case8-deployment-disabled; do
         DELETION_MATRIX_ITEMS="[]"
@@ -3069,9 +3100,9 @@ def classify_state(state_word, deployment_model="singleRuntime"):
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"
         phase5_runtime.update_state(state_path, {
-            "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "deployment_model": deployment_model,
+            "environment": "dev", "deployment_id": "gg-postgresql-repltest-001", "deployment_model": deployment_model,
             "efs_mode": "", "reason": "deployment-disabled", "runtime_namespace": "goldengate-dev",
-            "argocd_namespace": "argocd", "argocd_app_name": "goldengate-dev-postgresql-repltest-01",
+            "argocd_namespace": "argocd", "argocd_app_name": "goldengate-dev-postgresql-repltest-001",
         }, phase5_runtime.REMOVAL_ALLOWED_STATE_KEYS)
 
         def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
@@ -3081,10 +3112,10 @@ def classify_state(state_word, deployment_model="singleRuntime"):
                 return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
             if str(phase5_runtime.RUNTIME_STATE_TOOL) in argv:
                 complete_footprint = {k: False for k in phase5_runtime._load_runtime_state_module().RUNTIME_FOOTPRINT_KEYS}
-                return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"state": state_word, "environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "namespace": "goldengate-dev", "reasons": [], "checks": {"application_found": False, "applicationset_found": False, "footprint_found": complete_footprint}}), "stderr": ""})()
+                return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"state": state_word, "environment": "dev", "deployment_id": "gg-postgresql-repltest-001", "namespace": "goldengate-dev", "reasons": [], "checks": {"application_found": False, "applicationset_found": False, "footprint_found": complete_footprint}}), "stderr": ""})()
             return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-        args = type("Args", (), {"environment": "dev", "deployment_id": "gg-postgresql-repltest-01", "state_path": state_path})()
+        args = type("Args", (), {"environment": "dev", "deployment_id": "gg-postgresql-repltest-001", "state_path": state_path})()
         with mock.patch.object(phase5_runtime, "run", fake_run), mock.patch.dict(__import__("os").environ, {
             "AWS_REGION": "eu-west-1", "EKS_CLUSTER_NAME": "x", "EKS_DEPLOY_ROLE_ARN": "arn:aws:iam::668311715351:role/x",
             "RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd",
@@ -3134,15 +3165,15 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
   # 15: malformed CURRENT YAML (file exists, has bytes, but isn't valid YAML) must abort the whole detection script with a clear error -- never treated as intentional deletion, never silently ignored.
   MALFORMED_REPO="${WORKDIR}/malformed-repo"
   rm -rf "$MALFORMED_REPO"
-  mkdir -p "${MALFORMED_REPO}/envs/dev/case-malformed-current"
-  printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${MALFORMED_REPO}/envs/dev/case-malformed-current/values.yaml"
+  mkdir -p "${MALFORMED_REPO}/envs/dev/pipelines/case-malformed-current-pl/case-malformed-current"
+  printf 'deploymentModel: singleRuntime\nrunning: at-base-revision\n' > "${MALFORMED_REPO}/envs/dev/pipelines/case-malformed-current-pl/case-malformed-current/values.yaml"
   git -C "$MALFORMED_REPO" init -q
   git -C "$MALFORMED_REPO" config user.email "test@test.invalid"
   git -C "$MALFORMED_REPO" config user.name "test"
   git -C "$MALFORMED_REPO" add -A
   git -C "$MALFORMED_REPO" commit -q -m "base revision"
   MALFORMED_BEFORE_SHA="$(git -C "$MALFORMED_REPO" rev-parse HEAD)"
-  printf 'deploymentModel: singleRuntime\n  bad indent: [unterminated\n' > "${MALFORMED_REPO}/envs/dev/case-malformed-current/values.yaml"
+  printf 'deploymentModel: singleRuntime\n  bad indent: [unterminated\n' > "${MALFORMED_REPO}/envs/dev/pipelines/case-malformed-current-pl/case-malformed-current/values.yaml"
 
   set +e
   MALFORMED_CURRENT_OUTPUT="$(cd "$MALFORMED_REPO" && bash -c '
@@ -3154,6 +3185,8 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
     DELETION_MATRIX_ITEMS="[]"
     INACTIVE_LOG=""
     DELETION_CANDIDATE_IDS="case-malformed-current"
+    NAME_STATUS="$(git diff --name-status "$BEFORE_SHA" -- "envs/dev/**" || true)"
+    OLD_VALUES_FILE_BY_ID="$(compute_old_values_file_by_id "$NAME_STATUS" || true)"
     source "'"${WORKDIR}"'/deletion_loop.sh"
     echo "RESULT case-malformed-current => ${DELETION_MATRIX_ITEMS}"
   ' 2>&1)"
@@ -3180,9 +3213,9 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
     run_discovery_case() {
       local label="$1" setup_fn="$2" expect_pattern="$3" unexpected_pattern="$4"
       rm -rf "$DISCOVERY_REPO"
-      mkdir -p "${DISCOVERY_REPO}/envs/dev/gg-oracle-payments-01" "${DISCOVERY_REPO}/envs/dev/gg-postgresql-payments-01"
-      printf 'deploymentModel: singleRuntime\nname: oracle\n' > "${DISCOVERY_REPO}/envs/dev/gg-oracle-payments-01/values.yaml"
-      printf 'deploymentModel: singleRuntime\nname: postgresql\n' > "${DISCOVERY_REPO}/envs/dev/gg-postgresql-payments-01/values.yaml"
+      mkdir -p "${DISCOVERY_REPO}/envs/dev/pipelines/payments-fixture-pipeline/gg-oracle-payments-01" "${DISCOVERY_REPO}/envs/dev/pipelines/payments-fixture-pipeline/gg-postgresql-payments-01"
+      printf 'deploymentModel: singleRuntime\nname: oracle\n' > "${DISCOVERY_REPO}/envs/dev/pipelines/payments-fixture-pipeline/gg-oracle-payments-01/values.yaml"
+      printf 'deploymentModel: singleRuntime\nname: postgresql\n' > "${DISCOVERY_REPO}/envs/dev/pipelines/payments-fixture-pipeline/gg-postgresql-payments-01/values.yaml"
       mkdir -p "${DISCOVERY_REPO}/envs/dev/goldengate-monitor"
       printf 'global:\n  environment: dev\n' > "${DISCOVERY_REPO}/envs/dev/goldengate-monitor/values.yaml"
       "$setup_fn" "$DISCOVERY_REPO"
@@ -3225,6 +3258,8 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
         DELETION_MATRIX_ITEMS="[]"
         INACTIVE_LOG=""
         CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- "envs/dev/**" "helm/goldengate/**" || true)"
+        NAME_STATUS="$(git diff --name-status "$BEFORE_SHA" "$AFTER_SHA" -- "envs/dev/**" || true)"
+        OLD_VALUES_FILE_BY_ID="$(compute_old_values_file_by_id "$NAME_STATUS" || true)"
         source "'"${WORKDIR}"'/discovery_only.sh"
         source "'"${WORKDIR}"'/deletion_loop.sh"
         echo "FINAL_DELETION_MATRIX=${DELETION_MATRIX_ITEMS}"
@@ -3243,7 +3278,7 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
 
     # Test 4: deleting an entire canonical deployment folder.
     setup_folder_delete() { :; }
-    setup_folder_delete_mutate() { rm -rf "$1/envs/dev/gg-postgresql-payments-01"; }
+    setup_folder_delete_mutate() { rm -rf "$1/envs/dev/pipelines/payments-fixture-pipeline/gg-postgresql-payments-01"; }
     run_discovery_case "4: deleting an entire canonical deployment folder creates its deletion entry" \
       setup_folder_delete \
       'ADDED id=gg-postgresql-payments-01 model=singleRuntime' \
@@ -3259,7 +3294,7 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
 
     # Test 10: renaming a deployment folder deletes the old ID and the new ID is discovered as an independent candidate (build-matrix discovery is a separate path) -- proves the OLD id is queued for deletion and the NEW id never appears as a deletion entry.
     setup_rename() { :; }
-    setup_rename_mutate() { git -C "$1" mv envs/dev/gg-oracle-payments-01 envs/dev/gg-oracle-payments-01-renamed; }
+    setup_rename_mutate() { git -C "$1" mv envs/dev/pipelines/payments-fixture-pipeline/gg-oracle-payments-01 envs/dev/pipelines/payments-fixture-pipeline/gg-oracle-payments-01-renamed; }
     run_discovery_case "10: renaming a deployment folder deletes the old ID (and never queues the new ID for deletion)" \
       setup_rename \
       'ADDED id=gg-oracle-payments-01 model=singleRuntime' \
@@ -3268,8 +3303,8 @@ if [ -f "${WORKDIR}/detect_script.sh" ] && [ -s "${WORKDIR}/detect_script.sh" ] 
     # RETIREMENT PROOF: fully self-contained -- synthetic existing-mode source/target descriptors (never read from this repo's own Git history, so the test survives a shallow checkout or any future commit that moves HEAD) committed then physically deleted in one commit, replayed through the real discovery+deletion logic against a genuine Git diff, confirming deploymentModel/efs_mode/reason for BOTH.
     RETIREMENT_PROOF_REPO="${WORKDIR}/retirement-proof-repo"
     rm -rf "$RETIREMENT_PROOF_REPO"
-    mkdir -p "${RETIREMENT_PROOF_REPO}/envs/dev/gg-oracle-payments-01" "${RETIREMENT_PROOF_REPO}/envs/dev/gg-postgresql-payments-01"
-    cat > "${RETIREMENT_PROOF_REPO}/envs/dev/gg-oracle-payments-01/values.yaml" <<'EOF'
+    mkdir -p "${RETIREMENT_PROOF_REPO}/envs/dev/pipelines/payments-fixture-pipeline/gg-oracle-payments-01" "${RETIREMENT_PROOF_REPO}/envs/dev/pipelines/payments-fixture-pipeline/gg-postgresql-payments-01"
+    cat > "${RETIREMENT_PROOF_REPO}/envs/dev/pipelines/payments-fixture-pipeline/gg-oracle-payments-01/values.yaml" <<'EOF'
 deploymentModel: singleRuntime
 deployment:
   enabled: true
@@ -3281,7 +3316,7 @@ persistence:
     mode: existing
     fileSystemId: fs-0123456789abcdef1
 EOF
-    cat > "${RETIREMENT_PROOF_REPO}/envs/dev/gg-postgresql-payments-01/values.yaml" <<'EOF'
+    cat > "${RETIREMENT_PROOF_REPO}/envs/dev/pipelines/payments-fixture-pipeline/gg-postgresql-payments-01/values.yaml" <<'EOF'
 deploymentModel: singleRuntime
 deployment:
   enabled: true
@@ -3299,7 +3334,7 @@ EOF
     git -C "$RETIREMENT_PROOF_REPO" add -A
     git -C "$RETIREMENT_PROOF_REPO" commit -q -m "base revision: both historical descriptors present"
     RETIREMENT_BEFORE_SHA="$(git -C "$RETIREMENT_PROOF_REPO" rev-parse HEAD)"
-    rm -rf "${RETIREMENT_PROOF_REPO}/envs/dev/gg-oracle-payments-01" "${RETIREMENT_PROOF_REPO}/envs/dev/gg-postgresql-payments-01"
+    rm -rf "${RETIREMENT_PROOF_REPO}/envs/dev/pipelines/payments-fixture-pipeline/gg-oracle-payments-01" "${RETIREMENT_PROOF_REPO}/envs/dev/pipelines/payments-fixture-pipeline/gg-postgresql-payments-01"
     git -C "$RETIREMENT_PROOF_REPO" add -A
     git -C "$RETIREMENT_PROOF_REPO" commit -q -m "physical removal of both retired descriptors"
 
@@ -3329,6 +3364,8 @@ EOF
       DELETION_MATRIX_ITEMS="[]"
       INACTIVE_LOG=""
       DELETION_CANDIDATE_IDS="gg-oracle-payments-01 gg-postgresql-payments-01"
+      NAME_STATUS="$(git diff --name-status "$BEFORE_SHA" -- "envs/dev/**" || true)"
+      OLD_VALUES_FILE_BY_ID="$(compute_old_values_file_by_id "$NAME_STATUS" || true)"
       source "'"${WORKDIR}"'/deletion_loop.sh"
       echo "FINAL_DELETION_MATRIX=${DELETION_MATRIX_ITEMS}"
     ' 2>&1)"
@@ -3470,7 +3507,10 @@ fi
 if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
   while IFS= read -r id; do
     [ -z "$id" ] && continue
-    VALUES_FILE="envs/dev/${id}/values.yaml"
+    if ! VALUES_FILE="$(resolve_dev_values_file "$id")"; then
+      fail "no environment values file found for enabled deployment ${id} (expected envs/dev/pipelines/<pipeline-id>/${id}/values.yaml)"
+      continue
+    fi
     RENDERED="${WORKDIR}/${id}-observer-check.yaml"
     ns="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe "$id" 2>/dev/null | python3 -c 'import json, sys; print(json.load(sys.stdin)["runtimeNamespace"])')"
     derive_shared_overrides_for_deployment "$id"
@@ -3902,7 +3942,7 @@ else
 fi
 
 if [ ! -e "envs/dev/gg-oracle-payments-01" ] && [ ! -e "envs/dev/gg-postgresql-payments-01" ]; then
-  pass "the retired gg-oracle-payments-01/gg-postgresql-payments-01 descriptor folders are physically absent (replaced by the live managed pair gg-postgresql-repltest-01/gg-mssql-repltest-01; still available via Git history)"
+  pass "the retired gg-oracle-payments-01/gg-postgresql-payments-01 descriptor folders are physically absent (replaced by the live managed pair gg-postgresql-repltest-001/gg-mssql-repltest-001; still available via Git history)"
 else
   fail "envs/dev/gg-oracle-payments-01 and/or envs/dev/gg-postgresql-payments-01 still exist -- they must be fully removed"
 fi
@@ -3915,8 +3955,8 @@ fi
 
 CANONICAL_PRESENCE_MISSING=""
 for f in \
-  envs/dev/gg-postgresql-repltest-01/values.yaml \
-  envs/dev/gg-mssql-repltest-01/values.yaml \
+  envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml \
+  envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml \
   envs/dev/goldengate-monitor/values.yaml \
   helm/goldengate/templates/runtime-statefulset.yaml \
   helm/goldengate/templates/runtime-ingress.yaml \
@@ -4074,8 +4114,8 @@ def make_existing_fixture(src_path, dst_path, fs_id):
     with open(dst_path, 'w') as f:
         yaml.dump(data, f)
 
-make_existing_fixture('envs/dev/gg-postgresql-repltest-01/values.yaml', '${ORACLE_EXISTING_FIXTURE}', 'fs-0123456789abcdef1')
-make_existing_fixture('envs/dev/gg-mssql-repltest-01/values.yaml', '${POSTGRESQL_EXISTING_FIXTURE}', 'fs-0123456789abcdef1')
+make_existing_fixture('envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml', '${ORACLE_EXISTING_FIXTURE}', 'fs-0123456789abcdef1')
+make_existing_fixture('envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml', '${POSTGRESQL_EXISTING_FIXTURE}', 'fs-0123456789abcdef1')
 "
 
   helm template gg-oracle-payments-01 "$RUNTIME_CHART" --namespace goldengate-dev \
@@ -5094,8 +5134,8 @@ else
   fail "26: the deployment-model tool reported a validation problem against the real DEV descriptors"
 fi
 
-if python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry 2>/dev/null | grep -q "gg-postgresql-repltest-01" \
-    && python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry 2>/dev/null | grep -q "gg-mssql-repltest-01"; then
+if python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry 2>/dev/null | grep -q "gg-postgresql-repltest-001" \
+    && python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev registry 2>/dev/null | grep -q "gg-mssql-repltest-001"; then
   pass "26: the generated registry contains both existing live deployments"
 else
   fail "26: the generated registry is missing an existing live deployment"
@@ -5228,7 +5268,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
 
   # Adding a brand-new deploymentType (e.g. mysql, mssql) must have ZERO effect on the platform chart's rendered ServiceAccount set -- it is driven entirely by fixed values.yaml data, never by the folder-driven deployment inventory.
   if ! echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-mysql-sa" && ! echo "$PLATFORM_SA_RENDER" | grep -q "name: gg-mssql-sa"; then
-    pass "26: the real gg-mssql-repltest-01 descriptor (and any synthetic mysql deployment) never causes the platform chart to render gg-mssql-sa/gg-mysql-sa -- the ServiceAccount set is fixed values.yaml data, not folder-derived"
+    pass "26: the real gg-mssql-repltest-001 descriptor (and any synthetic mysql deployment) never causes the platform chart to render gg-mssql-sa/gg-mysql-sa -- the ServiceAccount set is fixed values.yaml data, not folder-derived"
   else
     fail "26: an engine-specific ServiceAccount (gg-mssql-sa/gg-mysql-sa) was rendered by the platform chart -- self-service onboarding must never create one"
   fi
@@ -5795,19 +5835,19 @@ echo ""
 echo "--- Restored shared identity: existing Oracle/PostgreSQL now resolve gg-runtime-sa (intentional migration) ---"
 
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
-  SOURCE_RESOLVED_SA="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-postgresql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' 2>/dev/null || true)"
-  TARGET_RESOLVED_SA="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-mssql-repltest-01 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' 2>/dev/null || true)"
+  SOURCE_RESOLVED_SA="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-postgresql-repltest-001 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' 2>/dev/null || true)"
+  TARGET_RESOLVED_SA="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe gg-mssql-repltest-001 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeServiceAccountName"])' 2>/dev/null || true)"
   if [ "$SOURCE_RESOLVED_SA" = "gg-runtime-sa" ] && [ "$TARGET_RESOLVED_SA" = "gg-runtime-sa" ]; then
-    pass "28: gg-postgresql-repltest-01 and gg-mssql-repltest-01 both resolve the restored shared gg-runtime-sa identity -- their values.yaml files remain byte-identical since runtime.serviceAccount was never a settable field"
+    pass "28: gg-postgresql-repltest-001 and gg-mssql-repltest-001 both resolve the restored shared gg-runtime-sa identity -- their values.yaml files remain byte-identical since runtime.serviceAccount was never a settable field"
   else
-    fail "28: gg-postgresql-repltest-01/gg-mssql-repltest-01 resolved to (${SOURCE_RESOLVED_SA}, ${TARGET_RESOLVED_SA}), expected (gg-runtime-sa, gg-runtime-sa)"
+    fail "28: gg-postgresql-repltest-001/gg-mssql-repltest-001 resolved to (${SOURCE_RESOLVED_SA}, ${TARGET_RESOLVED_SA}), expected (gg-runtime-sa, gg-runtime-sa)"
   fi
 else
   skip "28: runtime identity stability check -- python3 unavailable"
 fi
 
 if [ "$HELM_AVAILABLE" = "true" ]; then
-  for pair in "gg-postgresql-repltest-01:dev/goldengate/source/admin:gg-runtime-sa" "gg-mssql-repltest-01:dev/goldengate/target/admin:gg-runtime-sa"; do
+  for pair in "gg-postgresql-repltest-001:dev/goldengate/source/admin:gg-runtime-sa" "gg-mssql-repltest-001:dev/goldengate/target/admin:gg-runtime-sa"; do
     id="${pair%%:*}"
     rest="${pair#*:}"
     admin_secret="${rest%%:*}"
@@ -5817,11 +5857,12 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
     RENDER_OTHER="${WORKDIR}/identity-other-${id}.yaml"
 
     id_image_repository="$(python3 "$DEPLOYMENT_MODEL_TOOL" --environment dev describe "$id" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRepository"])')"
+    id_values_file="$(resolve_dev_values_file "$id")"
 
     # The chart must not couple ServiceAccount identity to any other field, regardless of the name compared. Both current descriptors are persistence.efs.mode=managed, so the workflow-resolved fileSystemId is supplied here exactly as the deploy workflow would.
     if helm template "$id" "$RUNTIME_CHART" \
         --namespace goldengate-dev \
-        --values "envs/dev/${id}/values.yaml" \
+        --values "$id_values_file" \
         --set global.environment=dev \
         --set runtime.csi.admin.objectName="$admin_secret" \
         --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
@@ -5834,7 +5875,7 @@ if [ "$HELM_AVAILABLE" = "true" ]; then
         > "$RENDER_APPROVED" 2>"${WORKDIR}/identity-approved-${id}.log" \
       && helm template "$id" "$RUNTIME_CHART" \
         --namespace goldengate-dev \
-        --values "envs/dev/${id}/values.yaml" \
+        --values "$id_values_file" \
         --set global.environment=dev \
         --set runtime.csi.admin.objectName="$admin_secret" \
         --set runtime.csi.certificate.objectName=dev/goldengate/tls-certificate \
@@ -5925,10 +5966,15 @@ fi
 echo ""
 echo "--- Phase 6D0-Final: Terraform cross-pipeline plan-blocking fixtures ---"
 
+# Pipeline-Aware Descriptor Hierarchy: this fixture exercises the two migrated repltest-pg-to-mssql-001 runtimes (gg-postgresql-repltest-001 source, gg-mssql-repltest-001 target) at their new canonical envs/dev/pipelines/<pipeline-id>/<deployment-id>/values.yaml paths -- never the pre-migration flat layout.
+TF_PLAN_PG_PIPELINE="repltest-pg-to-mssql-001"
+TF_PLAN_PG_ID="gg-postgresql-repltest-001"
+TF_PLAN_MSSQL_ID="gg-mssql-repltest-001"
+
 TF_PLAN_SCRATCH=""
 if command -v terraform >/dev/null 2>&1; then
   TF_PLAN_SCRATCH="$(mktemp -d)"
-  mkdir -p "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01" "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01" \
+  mkdir -p "${TF_PLAN_SCRATCH}/envs/dev/pipelines/${TF_PLAN_PG_PIPELINE}/${TF_PLAN_PG_ID}" "${TF_PLAN_SCRATCH}/envs/dev/pipelines/${TF_PLAN_PG_PIPELINE}/${TF_PLAN_MSSQL_ID}" \
     "${TF_PLAN_SCRATCH}/platform/dev/goldengate-platform" "${TF_PLAN_SCRATCH}/envs/dev/goldengate-monitor" \
     "${TF_PLAN_SCRATCH}/envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy"
   cp envs/dev/goldengate_inventory.tf "${TF_PLAN_SCRATCH}/envs/dev/goldengate_inventory.tf"
@@ -5948,8 +5994,8 @@ print(f'  gg_env_target_admin_secret_name = \"{v[\"TARGET_ADMIN_SECRET_NAME\"]}\
 print(f'  gg_env_tls_secret_name          = \"{v[\"TLS_SECRET_NAME\"]}\"')
 print('}')
 " > "${TF_PLAN_SCRATCH}/envs/dev/environment_stub.tf"
-  cp envs/dev/gg-postgresql-repltest-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
-  cp envs/dev/gg-mssql-repltest-01/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
+  cp "envs/dev/pipelines/${TF_PLAN_PG_PIPELINE}/${TF_PLAN_PG_ID}/values.yaml" "${TF_PLAN_SCRATCH}/envs/dev/pipelines/${TF_PLAN_PG_PIPELINE}/${TF_PLAN_PG_ID}/values.yaml"
+  cp "envs/dev/pipelines/${TF_PLAN_PG_PIPELINE}/${TF_PLAN_MSSQL_ID}/values.yaml" "${TF_PLAN_SCRATCH}/envs/dev/pipelines/${TF_PLAN_PG_PIPELINE}/${TF_PLAN_MSSQL_ID}/values.yaml"
   cp platform/dev/goldengate-platform/values.yaml "${TF_PLAN_SCRATCH}/platform/dev/goldengate-platform/values.yaml"
   cp envs/dev/goldengate-monitor/values.yaml "${TF_PLAN_SCRATCH}/envs/dev/goldengate-monitor/values.yaml"
   cp envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json \
@@ -5995,8 +6041,11 @@ EOF
       cat "${TF_PLAN_SCRATCH}/plan-baseline.log"
     fi
 
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/target-backup.yaml"
-    sed -i 's/role: target/role: source/' "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
+    TF_PLAN_MSSQL_FILE="${TF_PLAN_SCRATCH}/envs/dev/pipelines/${TF_PLAN_PG_PIPELINE}/${TF_PLAN_MSSQL_ID}/values.yaml"
+    TF_PLAN_PG_FILE="${TF_PLAN_SCRATCH}/envs/dev/pipelines/${TF_PLAN_PG_PIPELINE}/${TF_PLAN_PG_ID}/values.yaml"
+
+    cp "$TF_PLAN_MSSQL_FILE" "${TF_PLAN_SCRATCH}/target-backup.yaml"
+    sed -i 's/role: target/role: source/' "$TF_PLAN_MSSQL_FILE"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-dup-source.log" 2>&1
     TF_PLAN_DUP_SOURCE_STATUS=$?
@@ -6007,10 +6056,10 @@ EOF
       fail "30: a duplicate enabled source did not block Terraform plan as expected (exit=${TF_PLAN_DUP_SOURCE_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-dup-source.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/target-backup.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/target-backup.yaml" "$TF_PLAN_MSSQL_FILE"
 
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/source-backup.yaml"
-    sed -i 's/role: source/role: target/' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
+    cp "$TF_PLAN_PG_FILE" "${TF_PLAN_SCRATCH}/source-backup.yaml"
+    sed -i 's/role: source/role: target/' "$TF_PLAN_PG_FILE"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-dup-target.log" 2>&1
     TF_PLAN_DUP_TARGET_STATUS=$?
@@ -6021,10 +6070,10 @@ EOF
       fail "30: a duplicate enabled target did not block Terraform plan as expected (exit=${TF_PLAN_DUP_TARGET_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-dup-target.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/source-backup.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/source-backup.yaml" "$TF_PLAN_PG_FILE"
 
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/target-backup2.yaml"
-    sed -i 's/groupOrder: "113"/groupOrder: "112"/' "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
+    cp "$TF_PLAN_MSSQL_FILE" "${TF_PLAN_SCRATCH}/target-backup2.yaml"
+    sed -i 's/groupOrder: "113"/groupOrder: "112"/' "$TF_PLAN_MSSQL_FILE"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-dup-alb.log" 2>&1
     TF_PLAN_DUP_ALB_STATUS=$?
@@ -6035,10 +6084,10 @@ EOF
       fail "30: a duplicate ALB group order did not block Terraform plan as expected (exit=${TF_PLAN_DUP_ALB_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-dup-alb.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/target-backup2.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-mssql-repltest-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/target-backup2.yaml" "$TF_PLAN_MSSQL_FILE"
 
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/source-backup2.yaml"
-    sed -i 's/deploymentType: postgresql/deploymentType: Postgresql/' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
+    cp "$TF_PLAN_PG_FILE" "${TF_PLAN_SCRATCH}/source-backup2.yaml"
+    sed -i 's/deploymentType: postgresql/deploymentType: Postgresql/' "$TF_PLAN_PG_FILE"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-unsafe-type.log" 2>&1
     TF_PLAN_UNSAFE_TYPE_STATUS=$?
@@ -6049,11 +6098,11 @@ EOF
       fail "30: an unsafe runtime.deploymentType did not block Terraform plan as expected (exit=${TF_PLAN_UNSAFE_TYPE_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-unsafe-type.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/source-backup2.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/source-backup2.yaml" "$TF_PLAN_PG_FILE"
 
     # Restored shared identity: a brand-new deploymentType (never seen by IAM before) must plan CLEANLY -- it shares the already-trusted gg-runtime-sa, so no new IAM trust subject is ever required.
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/source-backup2b.yaml"
-    sed -i 's/deploymentType: postgresql/deploymentType: mysql/' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
+    cp "$TF_PLAN_PG_FILE" "${TF_PLAN_SCRATCH}/source-backup2b.yaml"
+    sed -i 's/deploymentType: postgresql/deploymentType: mysql/' "$TF_PLAN_PG_FILE"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-new-type-shared-identity.log" 2>&1
     TF_PLAN_NEW_TYPE_STATUS=$?
@@ -6064,10 +6113,10 @@ EOF
       fail "30: a brand-new safe deploymentType (mysql) did not plan cleanly -- the shared gg-runtime-sa self-service promise is broken (exit=${TF_PLAN_NEW_TYPE_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-new-type-shared-identity.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/source-backup2b.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/source-backup2b.yaml" "$TF_PLAN_PG_FILE"
 
-    cp "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml" "${TF_PLAN_SCRATCH}/source-backup3.yaml"
-    sed -i '/^runtime:/a\  serviceAccount: gg-operator-chosen-sa' "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
+    cp "$TF_PLAN_PG_FILE" "${TF_PLAN_SCRATCH}/source-backup3.yaml"
+    sed -i '/^runtime:/a\  serviceAccount: gg-operator-chosen-sa' "$TF_PLAN_PG_FILE"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-sa-override.log" 2>&1
     TF_PLAN_SA_OVERRIDE_STATUS=$?
@@ -6078,7 +6127,7 @@ EOF
       fail "30: an operator-supplied runtime.serviceAccount did not block Terraform plan as expected (exit=${TF_PLAN_SA_OVERRIDE_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-sa-override.log"
     fi
-    cp "${TF_PLAN_SCRATCH}/source-backup3.yaml" "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml"
+    cp "${TF_PLAN_SCRATCH}/source-backup3.yaml" "$TF_PLAN_PG_FILE"
 
     # Exact-trust-equality edge cases (F is already proven by the clean baseline plan above, run against this same untouched real sts.json). H/J/K mutate a scratch copy and restore it after each -- G/I (removing a transitional/legacy subject) no longer apply: Fresh-EKS Phase A's one-subject architecture never has those subjects to remove in the first place.
     STS_JSON_PATH="${TF_PLAN_SCRATCH}/envs/dev/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"
@@ -6130,12 +6179,12 @@ subs.append("system:serviceaccount:goldengate-dev:gg-runtime-sa")
 with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
 ' "plan-duplicate-subject.log"
 
-    # L: a brand-new deployment type requires ZERO sts.json change and still plans cleanly against the SAME exact one-subject trust set (sts.json here is the untouched real file, restored after each H/J/K mutation above).
-    mkdir -p "${TF_PLAN_SCRATCH}/envs/dev/gg-mysql-fixture-01"
+    # L: a brand-new deployment type requires ZERO sts.json change and still plans cleanly against the SAME exact one-subject trust set (sts.json here is the untouched real file, restored after each H/J/K mutation above). Pipeline-Aware Descriptor Hierarchy: the new pipeline (payments-mysql-fixture-001) and its runtime (gg-mysql-fixture-001) both carry the matching 3-digit correlation suffix required by contract E/F/G -- this is also test requirement 14 (a future valid pipeline/runtime enters the model with zero central code-list edit).
+    mkdir -p "${TF_PLAN_SCRATCH}/envs/dev/pipelines/payments-mysql-fixture-001/gg-mysql-fixture-001"
     sed -e 's/deploymentType: postgresql/deploymentType: mysql/' \
         -e 's/pipeline: repltest-pg-to-mssql-001/pipeline: payments-mysql-fixture-001/' \
         -e 's/groupOrder: "112"/groupOrder: "197"/' \
-        "${TF_PLAN_SCRATCH}/envs/dev/gg-postgresql-repltest-01/values.yaml" > "${TF_PLAN_SCRATCH}/envs/dev/gg-mysql-fixture-01/values.yaml"
+        "$TF_PLAN_PG_FILE" > "${TF_PLAN_SCRATCH}/envs/dev/pipelines/payments-mysql-fixture-001/gg-mysql-fixture-001/values.yaml"
     set +e
     (cd "${TF_PLAN_SCRATCH}/envs/dev" && terraform plan -input=false) >"${TF_PLAN_SCRATCH}/plan-new-type-onboarded.log" 2>&1
     TF_PLAN_NEW_TYPE_ONBOARDED_STATUS=$?
@@ -6146,7 +6195,7 @@ with open(sys.argv[1], "w") as f: json.dump(doc, f, indent=2)
       fail "30: onboarding a brand-new safe deployment type via folder data alone did not produce a clean Terraform plan (exit=${TF_PLAN_NEW_TYPE_ONBOARDED_STATUS})"
       cat "${TF_PLAN_SCRATCH}/plan-new-type-onboarded.log"
     fi
-    rm -rf "${TF_PLAN_SCRATCH}/envs/dev/gg-mysql-fixture-01"
+    rm -rf "${TF_PLAN_SCRATCH}/envs/dev/pipelines/payments-mysql-fixture-001"
   fi
   rm -rf "${TF_PLAN_SCRATCH}"
 else
@@ -6378,7 +6427,7 @@ ids_match = re.search(r"goldengate_managed_efs_decommission_ids\s*=\s*toset\(\[(
 check("1: goldengate_managed_efs_decommission_ids exists as a literal toset([...])", ids_match is not None)
 decommission_ids = sorted(re.findall(r"\"([^\"]+)\"", ids_match.group(1))) if ids_match else []
 
-check("2 (GoldenGate Runtime Presence Contract Finalization): the decommission set is empty -- the two prior EFS-hold descriptors (gg-mssql-repltest-01, gg-postgresql-repltest-01) are no longer decommission-authorized now that their runtimes are activated (deployment.enabled=true); this explicit, independently-verified edit removed exactly those two false authorizations",
+check("2 (GoldenGate Runtime Presence Contract Finalization): the decommission set is empty -- the two prior EFS-hold descriptors (gg-mssql-repltest-001, gg-postgresql-repltest-001) are no longer decommission-authorized now that their runtimes are activated (deployment.enabled=true); this explicit, independently-verified edit removed exactly those two false authorizations",
       decommission_ids == [])
 
 decommission_block = ids_match.group(0) if ids_match else ""
@@ -6413,13 +6462,12 @@ active, inactive, invalid = gdm.scan("dev")
 check("scan(dev): no invalid descriptors", invalid == [])
 # Read persistence intent independently of parsed efsMode; deployment.enabled never filters retained storage.
 expected_managed = []
-for path in sorted(Path("envs/dev").glob("*/values.yaml")):
-    if path.parent.name in gdm.IGNORED_NON_RUNTIME_FOLDER_NAMES:
-        continue
+for path in sorted(Path("envs/dev/pipelines").glob("*/*/values.yaml")):
     doc = gdm.load_yaml_strict(path)
     persistence = doc.get("persistence") or {}
     if persistence.get("enabled") is True and persistence.get("provider") == "efs" and (persistence.get("efs") or {}).get("mode") == "managed":
-        expected_managed.append({"deploymentId": path.parent.name, "efsCreationToken": "dev-%s-efs" % path.parent.name})
+        deployment_id = path.parent.name
+        expected_managed.append({"deploymentId": deployment_id, "efsCreationToken": gdm.derive_efs_creation_token("dev", deployment_id)})
 
 
 def exact_managed_inventory(rows, expected):
@@ -6496,7 +6544,7 @@ fi
 
 # Fresh-EKS Phase A: the SG description is now sourced from envs/dev/environment.yaml (local.gg_env_efs_shared_security_group_description) instead of a local Terraform variable with a hardcoded default -- still a single environment-level configuration point, never a per-deployment values.yaml setting.
 if grep -qF 'local.gg_env_efs_shared_security_group_description' envs/dev/efs.tf 2>/dev/null \
-    && ! grep -lq 'goldengate_efs_shared_security_group_description\|sharedSecurityGroupDescription' envs/dev/gg-*-repltest-01/values.yaml 2>/dev/null; then
+    && ! grep -lq 'goldengate_efs_shared_security_group_description\|sharedSecurityGroupDescription' envs/dev/pipelines/*/gg-*-repltest-*/values.yaml 2>/dev/null; then
   pass "the shared EFS security group is a single environment-level configuration point (envs/dev/environment.yaml), never a per-deployment values.yaml setting"
 else
   fail "the shared EFS security group configuration point is missing or leaked into a per-deployment values.yaml"
@@ -6537,11 +6585,11 @@ if [ "$PYTHON_AVAILABLE" = "true" ]; then
   LIVE_VALIDATE_STATUS=$?
   set -e
   if [ "$LIVE_VALIDATE_STATUS" -eq 0 ] \
-      && grep -qE '^\s*mode:\s*managed\s*$' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null \
-      && grep -qE '^\s*mode:\s*managed\s*$' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null \
-      && ! grep -q 'fileSystemId:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null \
-      && ! grep -q 'fileSystemId:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null; then
-    pass "33: both live gg-postgresql-repltest-01/gg-mssql-repltest-01 descriptors carry persistence.efs.mode=managed with no committed fileSystemId, and dev validate still passes"
+      && grep -qE '^\s*mode:\s*managed\s*$' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml 2>/dev/null \
+      && grep -qE '^\s*mode:\s*managed\s*$' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml 2>/dev/null \
+      && ! grep -q 'fileSystemId:' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml 2>/dev/null \
+      && ! grep -q 'fileSystemId:' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml 2>/dev/null; then
+    pass "33: both live gg-postgresql-repltest-001/gg-mssql-repltest-001 descriptors carry persistence.efs.mode=managed with no committed fileSystemId, and dev validate still passes"
   else
     fail "33: the two live managed-EFS descriptors did not validate cleanly: ${LIVE_VALIDATE_OUTPUT}"
   fi
@@ -7993,10 +8041,10 @@ else
 fi
 
 # VDR 13: Automated Replication Implementation Removal superseded this assertion -- the two live descriptors no longer declare a replication: block at all (retired outright, not merely left at enabled=false); retargeted to prove that absence instead.
-if grep -q 'replication:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null || grep -q 'replication:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null; then
+if grep -q 'replication:' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml 2>/dev/null || grep -q 'replication:' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml 2>/dev/null; then
   fail "VDR 13: a retired replication: block has reappeared in a live descriptor"
 else
-  pass "VDR 13: gg-postgresql-repltest-01/gg-mssql-repltest-01 values.yaml carry no replication: block at all (Automated Replication Implementation Removal)"
+  pass "VDR 13: gg-postgresql-repltest-001/gg-mssql-repltest-001 values.yaml carry no replication: block at all (Automated Replication Implementation Removal)"
 fi
 
 echo ""
@@ -8339,8 +8387,8 @@ for d in active:
     check(f"{prefix}: TLS secret derives from environment", d["tlsSecretName"] == gdm.resolve_tls_secret(d["environment"]))
     check(f"{prefix}: admin secret derives from role", d["adminSecretName"] == gdm.resolve_admin_secret(d["environment"], d["role"]))
 
-    # Supplementary raw-YAML read for fields the parsed descriptor does not surface (service ports, StorageClass) -- keyed by the deploymentId gdm.scan() already discovered above; this is not a second discovery mechanism, only a follow-up read of one already-discovered folder.
-    with open(f"envs/dev/{dep_id}/values.yaml") as f:
+    # Supplementary raw-YAML read for fields the parsed descriptor does not surface (service ports, StorageClass) -- keyed by the deploymentId gdm.scan() already discovered above via the descriptor'"'"'s own valuesFile field, never a reconstructed/guessed path; this is not a second discovery mechanism, only a follow-up read of one already-discovered folder.
+    with open(d["valuesFile"]) as f:
         raw = yaml.safe_load(f)
 
     if d["albGroupOrder"] is not None:
@@ -8382,8 +8430,8 @@ else
 fi
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # Repo-wide scan of envs/dev/*.tf (excluding efs.tf, exempted for the reviewed EFS decommission allowlist) for a deployment-ID-specific carve-out.
-  TF_CARVEOUT_MATCHES="$(grep -lF "gg-mssql-repltest-01" envs/dev/*.tf 2>/dev/null | grep -vF "envs/dev/efs.tf" || true)"
+  # Repo-wide scan of envs/dev/*.tf (excluding efs.tf and goldengate_inventory.tf, both exempted for the same reviewed, narrowly-scoped, explicit 4-ID legacy-migration/EFS-decommission carve-out -- bridging this one intentional deployment-ID rename without destroying/recreating a pre-existing managed EFS filesystem, never a general onboarding mechanism) for a deployment-ID-specific carve-out.
+  TF_CARVEOUT_MATCHES="$(grep -lF "gg-mssql-repltest-001" envs/dev/*.tf 2>/dev/null | grep -vF "envs/dev/efs.tf" | grep -vF "envs/dev/goldengate_inventory.tf" || true)"
   if [ -z "$TF_CARVEOUT_MATCHES" ]; then
     pass "no deployment-specific Terraform carve-out exists for the MSSQL runtime anywhere under envs/dev/*.tf (tracked or untracked) outside the explicit, reviewed EFS decommission allowlist -- the generic local.goldengate_managed_efs_deployments for_each and the restored shared gg-runtime-sa identity own it automatically"
   else
@@ -8548,18 +8596,18 @@ else
 fi
 
 # 12/13 (GoldenGate Runtime Desired-State Simplification): both runtime descriptors no longer carry a lifecycle block at all -- deployment.enabled is the sole runtime-presence control, and both are now enabled=true (active runtime deployment intents).
-if ! grep -q '^lifecycle:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null \
-    && ! grep -q '^lifecycle:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null \
-    && grep -A1 '^deployment:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null | grep -q 'enabled: true' \
-    && grep -A1 '^deployment:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null | grep -q 'enabled: true'; then
+if ! grep -q '^lifecycle:' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml 2>/dev/null \
+    && ! grep -q '^lifecycle:' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml 2>/dev/null \
+    && grep -A1 '^deployment:' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml 2>/dev/null | grep -q 'enabled: true' \
+    && grep -A1 '^deployment:' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml 2>/dev/null | grep -q 'enabled: true'; then
   pass "12: both runtime descriptors carry no lifecycle block and are deployment.enabled=true"
 else
   fail "12: a runtime descriptor still carries a lifecycle block, or is no longer deployment.enabled=true"
 fi
 
 # 12b: Automated Replication Implementation Removal superseded this assertion -- both runtime descriptors no longer carry a replication: block at all (retired outright, not merely left at enabled=false); retargeted to prove that absence instead.
-if grep -q '^replication:' envs/dev/gg-postgresql-repltest-01/values.yaml 2>/dev/null \
-    || grep -q '^replication:' envs/dev/gg-mssql-repltest-01/values.yaml 2>/dev/null; then
+if grep -q '^replication:' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml 2>/dev/null \
+    || grep -q '^replication:' envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml 2>/dev/null; then
   fail "12b: a retired replication: block has reappeared in a runtime descriptor"
 else
   pass "12b: both runtime descriptors carry no replication: block at all (Automated Replication Implementation Removal)"
@@ -8860,15 +8908,15 @@ third_scratch_dir = tempfile.mkdtemp(prefix="detect-third-enabled-")
 shutil.copytree(os.path.join(repo_root_for_fixture, "automation"), os.path.join(third_scratch_dir, "automation"))
 os.makedirs(os.path.join(third_scratch_dir, "envs", "dev"))
 shutil.copy2(os.path.join(repo_root_for_fixture, "envs", "dev", "environment.yaml"), os.path.join(third_scratch_dir, "envs", "dev", "environment.yaml"))
-# A full structurally-valid descriptor (real CSI/service/storage/ingress/persistence shape), never a hand-trimmed minimal stub -- built from the real gg-postgresql-repltest-01 descriptor with only the pipeline/ALB-group-order identity changed (both must be unique across descriptors, per the canonical model's own cross-descriptor validation), so parse_descriptor()'s full validation genuinely passes rather than being accidentally short-circuited by an unrelated field error.
-with open(os.path.join(repo_root_for_fixture, "envs", "dev", "gg-postgresql-repltest-01", "values.yaml")) as f:
+# A full structurally-valid descriptor (real CSI/service/storage/ingress/persistence shape), never a hand-trimmed minimal stub -- built from the real gg-postgresql-repltest-001 descriptor with only the pipeline/ALB-group-order identity changed (both must be unique across descriptors, per the canonical model's own cross-descriptor validation), so parse_descriptor()'s full validation genuinely passes rather than being accidentally short-circuited by an unrelated field error. Pipeline-Aware Descriptor Hierarchy: written at its own canonical envs/dev/pipelines/<pipeline-id>/<deployment-id>/values.yaml path, with a deployment ID ending in the SAME 3-digit correlation suffix (-001) as its own pipeline ID, exactly like the real descriptor it was built from.
+with open(os.path.join(repo_root_for_fixture, "envs", "dev", "pipelines", "repltest-pg-to-mssql-001", "gg-postgresql-repltest-001", "values.yaml")) as f:
     THIRD_SYNTHETIC_VALUES_YAML = (
         f.read()
         .replace("repltest-pg-to-mssql-001", "repltest-third-synthetic-001")
         .replace('groupOrder: "112"', 'groupOrder: "199"')
     )
-os.makedirs(os.path.join(third_scratch_dir, "envs", "dev", "gg-third-synthetic-01"), exist_ok=True)
-with open(os.path.join(third_scratch_dir, "envs", "dev", "gg-third-synthetic-01", "values.yaml"), "w") as f:
+os.makedirs(os.path.join(third_scratch_dir, "envs", "dev", "pipelines", "repltest-third-synthetic-001", "gg-third-synthetic-001"), exist_ok=True)
+with open(os.path.join(third_scratch_dir, "envs", "dev", "pipelines", "repltest-third-synthetic-001", "gg-third-synthetic-001", "values.yaml"), "w") as f:
     f.write(THIRD_SYNTHETIC_VALUES_YAML)
 
 proc, outputs = run_detect("", "true", cwd=third_scratch_dir)
@@ -8876,19 +8924,19 @@ THIRD_MATRIX = json.loads(outputs.get("deployment_matrix", "null")) if outputs.g
 check("18: the isolated environment-wide Deploy matrix contains exactly the active synthetic fixture, with no real runtime inventory leakage",
       proc.returncode == 0
       and THIRD_MATRIX is not None
-      and THIRD_MATRIX == [{"environment": "dev", "deployment_id": "gg-third-synthetic-01", "deployment_model": "singleRuntime", "deploy": True}]
+      and THIRD_MATRIX == [{"environment": "dev", "deployment_id": "gg-third-synthetic-001", "deployment_model": "singleRuntime", "deploy": True}]
       and outputs.get("deletion_matrix") == "[]",
       proc, outputs)
 
-# Add a fully valid disabled descriptor to the isolated fixture: Deploy routes it only to desired absence, while the active fixture remains in reconciliation.
+# Add a fully valid disabled descriptor to the isolated fixture: Deploy routes it only to desired absence, while the active fixture remains in reconciliation. Pipeline-Aware Descriptor Hierarchy: its own deployment ID (gg-fourth-disabled-synthetic-001) carries the same -001 suffix as its own pipeline (repltest-fourth-disabled-001).
 FOURTH_SYNTHETIC_VALUES_YAML = (
     THIRD_SYNTHETIC_VALUES_YAML
     .replace("repltest-third-synthetic-001", "repltest-fourth-disabled-001")
     .replace('groupOrder: "199"', 'groupOrder: "198"')
     .replace("enabled: true\n  pipeline:", "enabled: false\n  pipeline:")
 )
-os.makedirs(os.path.join(third_scratch_dir, "envs", "dev", "gg-fourth-disabled-synthetic-01"), exist_ok=True)
-with open(os.path.join(third_scratch_dir, "envs", "dev", "gg-fourth-disabled-synthetic-01", "values.yaml"), "w") as f:
+os.makedirs(os.path.join(third_scratch_dir, "envs", "dev", "pipelines", "repltest-fourth-disabled-001", "gg-fourth-disabled-synthetic-001"), exist_ok=True)
+with open(os.path.join(third_scratch_dir, "envs", "dev", "pipelines", "repltest-fourth-disabled-001", "gg-fourth-disabled-synthetic-001", "values.yaml"), "w") as f:
     f.write(FOURTH_SYNTHETIC_VALUES_YAML)
 
 proc, outputs = run_detect("", "true", cwd=third_scratch_dir)
@@ -8897,29 +8945,30 @@ FOURTH_DELETION_MATRIX = json.loads(outputs.get("deletion_matrix", "null")) if o
 check("19: the isolated disabled fixture enters only the deletion matrix; the active fixture remains exactly once in Deploy",
       proc.returncode == 0
       and FOURTH_DEPLOYMENT_MATRIX is not None
-      and FOURTH_DEPLOYMENT_MATRIX == [{"environment": "dev", "deployment_id": "gg-third-synthetic-01", "deployment_model": "singleRuntime", "deploy": True}]
+      and FOURTH_DEPLOYMENT_MATRIX == [{"environment": "dev", "deployment_id": "gg-third-synthetic-001", "deployment_model": "singleRuntime", "deploy": True}]
       and FOURTH_DELETION_MATRIX is not None
       and len(FOURTH_DELETION_MATRIX) == 1
-      and FOURTH_DELETION_MATRIX[0]["deployment_id"] == "gg-fourth-disabled-synthetic-01"
+      and FOURTH_DELETION_MATRIX[0]["deployment_id"] == "gg-fourth-disabled-synthetic-001"
       and FOURTH_DELETION_MATRIX[0]["reason"] == "deployment-disabled",
       proc, outputs)
 
 proc, outputs = run_detect("", "false", cwd=third_scratch_dir)
 check("19b: isolated environment-wide Validate includes only the active fixture with deploy=false and never schedules disabled-runtime deletion",
       proc.returncode == 0
-      and json.loads(outputs.get("deployment_matrix", "null")) == [{"environment": "dev", "deployment_id": "gg-third-synthetic-01", "deployment_model": "singleRuntime", "deploy": False}]
+      and json.loads(outputs.get("deployment_matrix", "null")) == [{"environment": "dev", "deployment_id": "gg-third-synthetic-001", "deployment_model": "singleRuntime", "deploy": False}]
       and outputs.get("deletion_matrix") == "[]"
       and outputs.get("has_deletions") == "false", proc, outputs)
 shutil.rmtree(third_scratch_dir)
 
 import tempfile as _tempfile
 scratch_dir = _tempfile.mkdtemp(prefix="detect-manual-disabled-")
-os.makedirs(os.path.join(scratch_dir, "envs", "dev", "gg-manual-disabled-synthetic-01"), exist_ok=True)
-with open(os.path.join(scratch_dir, "envs", "dev", "gg-manual-disabled-synthetic-01", "values.yaml"), "w") as f:
+# Pipeline-Aware Descriptor Hierarchy: the workflow_dispatch targeted-deploy branch resolves this descriptor's path via resolve_current_values_file() (pipelines/*/<deployment-id>/), so it must live there even though this minimal fixture is otherwise only ever classified by the cheap bash-level deploymentModel/deployment.enabled heuristics (never the full Python schema) -- its pipeline folder name is otherwise arbitrary for that reason.
+os.makedirs(os.path.join(scratch_dir, "envs", "dev", "pipelines", "manual-disabled-pipeline-001", "gg-manual-disabled-synthetic-001"), exist_ok=True)
+with open(os.path.join(scratch_dir, "envs", "dev", "pipelines", "manual-disabled-pipeline-001", "gg-manual-disabled-synthetic-001", "values.yaml"), "w") as f:
     f.write("deploymentModel: singleRuntime\ndeployment:\n  enabled: false\n")
 
 # GoldenGate Runtime Presence Contract Finalization, Defect 1: a manually selected deployment.enabled=false descriptor is a legitimate desired-absence request, never rejected merely because it is disabled -- Deploy routes it through the safe removal path (exit 0, has_deletions=true, one deletion_matrix entry reason=deployment-disabled), while Validate remains a strict read-only no-op.
-proc, outputs = run_detect("gg-manual-disabled-synthetic-01", "true", cwd=scratch_dir)
+proc, outputs = run_detect("gg-manual-disabled-synthetic-001", "true", cwd=scratch_dir)
 N_DELETION_MATRIX = json.loads(outputs.get("deletion_matrix", "null")) if outputs.get("deletion_matrix") else None
 check("N: manual selected deployment.enabled=false descriptor + Deploy is routed through the safe removal path (exit 0, deployment_matrix=[], one deletion_matrix entry reason=deployment-disabled), never rejected",
       proc.returncode == 0
@@ -8928,11 +8977,11 @@ check("N: manual selected deployment.enabled=false descriptor + Deploy is routed
       and outputs.get("has_deletions") == "true"
       and N_DELETION_MATRIX is not None
       and len(N_DELETION_MATRIX) == 1
-      and N_DELETION_MATRIX[0]["deployment_id"] == "gg-manual-disabled-synthetic-01"
+      and N_DELETION_MATRIX[0]["deployment_id"] == "gg-manual-disabled-synthetic-001"
       and N_DELETION_MATRIX[0]["reason"] == "deployment-disabled",
       proc, outputs)
 
-proc, outputs = run_detect("gg-manual-disabled-synthetic-01", "false", cwd=scratch_dir)
+proc, outputs = run_detect("gg-manual-disabled-synthetic-001", "false", cwd=scratch_dir)
 check("N2: manual selected deployment.enabled=false descriptor + Validate is a strict, non-mutating no-op (exit 0, both matrices empty, no deletion evaluation)",
       proc.returncode == 0
       and outputs.get("has_changes") == "false"
@@ -8963,7 +9012,7 @@ fi
 
 # GoldenGate Runtime Desired-State Simplification: manually selecting either REAL current DEV descriptor now succeeds (they are genuinely active, deployment.enabled=true, no lifecycle block) -- REALLY EXECUTE the committed detector against the real repository working tree, proving the "IMPORTANT CONSEQUENCE" the task itself calls out.
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
-  for real_id in gg-postgresql-repltest-01 gg-mssql-repltest-01; do
+  for real_id in gg-postgresql-repltest-001 gg-mssql-repltest-001; do
     REAL_SELECT_OUTPUT_FILE="$(mktemp)"
     REAL_SELECT_STDOUT="$(EVENT_NAME="workflow_dispatch" INPUT_ENVIRONMENT="dev" INPUT_DEPLOYMENT_ID="$real_id" INPUT_DEPLOY="true" BEFORE_SHA="" AFTER_SHA="" GITHUB_OUTPUT="$REAL_SELECT_OUTPUT_FILE" bash "$DETECT_SCRIPT" 2>&1)"
     REAL_SELECT_STATUS=$?
@@ -8981,11 +9030,11 @@ fi
 # L/M: manual SELECTED ACTIVE deployment behavior is unchanged for both actions -- a minimal synthetic singleRuntime descriptor (deploymentModel: singleRuntime is the entire active-classification contract; no other field is required) in an isolated scratch copy, never touching the real envs/dev descriptors (both of which are now genuinely active deployment.enabled=true deployments themselves, proven separately above).
 if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
   LIVE_UX_FIX_2_ACTIVE_SCRATCH="${WORKDIR}/live-ux-fix-2-active-synthetic"
-  mkdir -p "${LIVE_UX_FIX_2_ACTIVE_SCRATCH}/envs/dev/gg-live-ux-fix-2-synthetic-01"
-  echo "deploymentModel: singleRuntime" > "${LIVE_UX_FIX_2_ACTIVE_SCRATCH}/envs/dev/gg-live-ux-fix-2-synthetic-01/values.yaml"
+  mkdir -p "${LIVE_UX_FIX_2_ACTIVE_SCRATCH}/envs/dev/pipelines/live-ux-fix-2-pipeline-001/gg-live-ux-fix-2-synthetic-001"
+  echo "deploymentModel: singleRuntime" > "${LIVE_UX_FIX_2_ACTIVE_SCRATCH}/envs/dev/pipelines/live-ux-fix-2-pipeline-001/gg-live-ux-fix-2-synthetic-001/values.yaml"
 
   L_OUTPUT_FILE="$(mktemp)"
-  L_STDOUT="$(cd "$LIVE_UX_FIX_2_ACTIVE_SCRATCH" && EVENT_NAME="workflow_dispatch" INPUT_ENVIRONMENT="dev" INPUT_DEPLOYMENT_ID="gg-live-ux-fix-2-synthetic-01" INPUT_DEPLOY="true" BEFORE_SHA="" AFTER_SHA="" GITHUB_OUTPUT="$L_OUTPUT_FILE" bash "${REPO_ROOT}/${DETECT_SCRIPT}" 2>&1)"
+  L_STDOUT="$(cd "$LIVE_UX_FIX_2_ACTIVE_SCRATCH" && EVENT_NAME="workflow_dispatch" INPUT_ENVIRONMENT="dev" INPUT_DEPLOYMENT_ID="gg-live-ux-fix-2-synthetic-001" INPUT_DEPLOY="true" BEFORE_SHA="" AFTER_SHA="" GITHUB_OUTPUT="$L_OUTPUT_FILE" bash "${REPO_ROOT}/${DETECT_SCRIPT}" 2>&1)"
   L_STATUS=$?
   if [ "$L_STATUS" -eq 0 ] && grep -q '"deploy":true' "$L_OUTPUT_FILE" && grep -q 'deployment_matrix=\[{' "$L_OUTPUT_FILE"; then
     pass "Live Deploy UX Fix 2: L: manual selected ACTIVE deployment + action=deploy produces a one-item matrix with deploy=true"
@@ -8995,7 +9044,7 @@ if [ "$PYTHON_AVAILABLE" = "true" ] && [ -f "$DETECT_SCRIPT" ]; then
   rm -f "$L_OUTPUT_FILE"
 
   M_OUTPUT_FILE="$(mktemp)"
-  M_STDOUT="$(cd "$LIVE_UX_FIX_2_ACTIVE_SCRATCH" && EVENT_NAME="workflow_dispatch" INPUT_ENVIRONMENT="dev" INPUT_DEPLOYMENT_ID="gg-live-ux-fix-2-synthetic-01" INPUT_DEPLOY="false" BEFORE_SHA="" AFTER_SHA="" GITHUB_OUTPUT="$M_OUTPUT_FILE" bash "${REPO_ROOT}/${DETECT_SCRIPT}" 2>&1)"
+  M_STDOUT="$(cd "$LIVE_UX_FIX_2_ACTIVE_SCRATCH" && EVENT_NAME="workflow_dispatch" INPUT_ENVIRONMENT="dev" INPUT_DEPLOYMENT_ID="gg-live-ux-fix-2-synthetic-001" INPUT_DEPLOY="false" BEFORE_SHA="" AFTER_SHA="" GITHUB_OUTPUT="$M_OUTPUT_FILE" bash "${REPO_ROOT}/${DETECT_SCRIPT}" 2>&1)"
   M_STATUS=$?
   if [ "$M_STATUS" -eq 0 ] && grep -q '"deploy":false' "$M_OUTPUT_FILE" && grep -q 'deployment_matrix=\[{' "$M_OUTPUT_FILE"; then
     pass "Live Deploy UX Fix 2: M: manual selected ACTIVE deployment + action=validate produces a one-item matrix with deploy=false"
@@ -12486,7 +12535,7 @@ fi
 
 # Runtime descriptors remain untouched by THIS fix (defense in depth -- re-confirmed here even though this fix never touches runtime files at all). GoldenGate Runtime Desired-State Simplification (a later, independent task) legitimately removed lifecycle.state from both descriptors and made them deployment.enabled=true active runtime deployment intents -- the invariant this check re-confirms is now "no lifecycle block, no replication: block at all", never the older lifecycle.state=absent shape or the retired replication.enabled=false shape (superseded outright by Automated Replication Implementation Removal).
 FIX_ALB_FROZEN_OK="true"
-for frozen_descriptor in envs/dev/gg-postgresql-repltest-01/values.yaml envs/dev/gg-mssql-repltest-01/values.yaml; do
+for frozen_descriptor in envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml; do
   if grep -q '^lifecycle:' "$frozen_descriptor" || grep -q '^replication:' "$frozen_descriptor"; then
     FIX_ALB_FROZEN_OK="false"
   fi
@@ -12824,7 +12873,7 @@ else
 fi
 # This MAIN deployment intent is reached only once monitor_sync_once actually runs, which itself requires an active runtime. GoldenGate Runtime Desired-State Simplification (a later, independent task) legitimately activated both current runtime descriptors (deployment.enabled=true, lifecycle.state removed) -- this check now re-confirms the still-relevant invariant this Fix 3 originally cared about: flipping the MAIN-level monitor cloudwatch intent is not itself a replication-activation or EFS-hold change, so no lifecycle block reappears. Automated Replication Implementation Removal superseded the replication.enabled=false half of this assertion -- both descriptors no longer carry a replication: block at all (retired outright); retargeted to prove that absence instead.
 FROZEN_LIFECYCLE_OK="true"
-for frozen_descriptor in envs/dev/gg-postgresql-repltest-01/values.yaml envs/dev/gg-mssql-repltest-01/values.yaml; do
+for frozen_descriptor in envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml; do
   if grep -q '^lifecycle:' "$frozen_descriptor" || grep -q '^replication:' "$frozen_descriptor"; then
     FROZEN_LIFECYCLE_OK="false"
   fi
@@ -13147,9 +13196,7 @@ spec = importlib.util.spec_from_file_location("gdm_active_matrix", "automation/g
 gdm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gdm)
 expected_ids, expected_inactive, pipeline_roles = [], [], []
-for path in sorted(Path("envs/dev").glob("*/values.yaml")):
-    if path.parent.name in gdm.IGNORED_NON_RUNTIME_FOLDER_NAMES:
-        continue
+for path in sorted(Path("envs/dev/pipelines").glob("*/*/values.yaml")):
     values = gdm.load_yaml_strict(path)
     deployment = values["deployment"]
     if deployment["enabled"] is True:
@@ -15403,7 +15450,7 @@ for registry in ("quay.io", "ghcr.io", "docker.io", "public.ecr.aws", "registry.
 
 # AJ: the runtime architecture remains untouched by this Phase 3 task -- both frozen runtime descriptors still carry no lifecycle block and (Automated Replication Implementation Removal superseded the replication.enabled=false half of this assertion) no replication: block at all.
 runtime_check_ok = True
-for frozen_descriptor in ("envs/dev/gg-postgresql-repltest-01/values.yaml", "envs/dev/gg-mssql-repltest-01/values.yaml"):
+for frozen_descriptor in ("envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml", "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml"):
     with open(frozen_descriptor) as f:
         descriptor_text = f.read()
     descriptor_doc = yaml.safe_load(descriptor_text)
@@ -16315,7 +16362,7 @@ e2e_if_ae = str(phase6_monitor_jobs.get("end_to_end_deployment_acceptance", {}).
 results.append(("AE: end_to_end_deployment_acceptance remains downstream of validate_active_runtimes -- its if: references inputs.result_validate_active_runtimes/inputs.has_active_deployments", "inputs.result_validate_active_runtimes" in e2e_if_ae and "inputs.has_active_deployments" in e2e_if_ae))
 
 # AF: Automated Replication Implementation Removal superseded the replication.enabled=false half of this assertion -- both current descriptors no longer carry a replication: block at all.
-for descriptor_path in ("envs/dev/gg-postgresql-repltest-01/values.yaml", "envs/dev/gg-mssql-repltest-01/values.yaml"):
+for descriptor_path in ("envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml", "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml"):
     with open(descriptor_path) as f:
         descriptor_doc = yaml.safe_load(f)
     deployment_enabled = ((descriptor_doc.get("deployment") or {}).get("enabled"))
@@ -16791,7 +16838,13 @@ class Recorder:
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
+        if str(phase5_runtime.DEPLOYMENT_MODEL_TOOL) in argv:
+            return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml"}), "stderr": ""})()
         return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+def is_describe_call(argv):
+    return str(phase5_runtime.DEPLOYMENT_MODEL_TOOL) in argv
 
 
 def args_for(state_path):
@@ -16831,7 +16884,7 @@ tmp.cleanup()
 results.append(("B: reconcile state environment mismatch fails cmd_resolve_live_inputs before any call, binding state to the current CLI identity", b_ok))
 
 # C: the runtime Application name is derived from ONE canonical helper -- reused by prepare-deployment, prepare-removal, and both identity validators (never independently duplicated).
-results.append(("C: _canonical_argocd_app_name() produces the documented gg- stripping contract", phase5_runtime._canonical_argocd_app_name("dev", "gg-postgresql-repltest-01") == "goldengate-dev-postgresql-repltest-01" and phase5_runtime._canonical_argocd_app_name("dev", "gg-gg-test") == "goldengate-dev-gg-test"))
+results.append(("C: _canonical_argocd_app_name() produces the documented gg- stripping contract", phase5_runtime._canonical_argocd_app_name("dev", "gg-postgresql-repltest-001") == "goldengate-dev-postgresql-repltest-001" and phase5_runtime._canonical_argocd_app_name("dev", "gg-gg-test") == "goldengate-dev-gg-test"))
 for fn_name in ("cmd_prepare_deployment", "cmd_prepare_removal", "_validate_reconcile_state_identity", "_validate_removal_state_identity"):
     results.append((f"C: {fn_name}() calls the single canonical _canonical_argocd_app_name() helper (never a second, independently-duplicated derivation)", "_canonical_argocd_app_name(" in fn_source(fn_name)))
 
@@ -16881,7 +16934,8 @@ with mock.patch.object(phase5_runtime, "run", recorder), mock.patch.dict(os.envi
         phase5_runtime.cmd_publish_chart(args_for(state_path))
         f_ok = False
     except phase5_runtime.Phase5Error:
-        f_ok = recorder.calls == []
+        # _validate_reconcile_state_identity legitimately makes ONE local describe call (never an AWS/ECR/kubectl call) while binding values_file -- filtered out here, never counted as the AWS/ECR call this check guards against.
+        f_ok = all(is_describe_call(c) for c in recorder.calls)
 tmp.cleanup()
 results.append(("F: publish-chart with deploy=false fails closed with ZERO AWS/ECR calls, even when invoked directly", f_ok))
 
@@ -17000,6 +17054,7 @@ DESCRIPTOR = {
     "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
     "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
     "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
+    "valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
 }
 
 
@@ -17041,6 +17096,10 @@ class Recorder:
         if argv[:1] == [sys.executable] and str(phase5_runtime.DEPLOYMENT_MODEL_TOOL) in argv:
             return type("Proc", (), {"returncode": 0, "stdout": json.dumps(DESCRIPTOR), "stderr": ""})()
         return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+def is_describe_call(argv):
+    return str(phase5_runtime.DEPLOYMENT_MODEL_TOOL) in argv
 
 
 def args_for(state_path):
@@ -17107,7 +17166,7 @@ with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp.name)), mock.patch.
         phase5_runtime.cmd_publish_chart(args_for(state_path))
         c_ok = False
     except phase5_runtime.Phase5Error as exc:
-        c_ok = recorder.calls == [] and "totally-unrelated-chart.tgz" in str(exc)
+        c_ok = all(is_describe_call(c) for c in recorder.calls) and "totally-unrelated-chart.tgz" in str(exc)
 tmp.cleanup()
 results.append(("C: confirmed reproduction -- publish-chart rejects package_path=packaged/totally-unrelated-chart.tgz with ZERO AWS/ECR calls", c_ok))
 
@@ -17121,7 +17180,7 @@ with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp.name)), mock.patch.
         phase5_runtime.cmd_publish_chart(args_for(state_path))
         d_ok = False
     except phase5_runtime.Phase5Error:
-        d_ok = recorder.calls == []
+        d_ok = all(is_describe_call(c) for c in recorder.calls)
 tmp.cleanup()
 results.append(("D: publish-chart rejects a packaged Chart.yaml whose version does not match the canonical chart version, with ZERO AWS/ECR calls", d_ok))
 package_contents_src = fn_source("_validate_packaged_chart_contents")
@@ -17137,7 +17196,7 @@ with mock.patch.object(phase5_runtime, "REPO_ROOT", Path(tmp.name)), mock.patch.
         phase5_runtime.cmd_publish_chart(args_for(state_path))
         e_ok = False
     except phase5_runtime.Phase5Error:
-        e_ok = recorder.calls == []
+        e_ok = all(is_describe_call(c) for c in recorder.calls)
 tmp.cleanup()
 results.append(("E: publish-chart rejects a packaged values-deployment.yaml that does not byte-for-byte match the current deployment values file, with ZERO AWS/ECR calls", e_ok))
 
@@ -17403,6 +17462,9 @@ def publish_zero_network(repo_root, package_path_rel):
     calls = []
 
     def recorder(argv, **kwargs):
+        # _validate_reconcile_state_identity legitimately makes ONE local describe call (never network/AWS/ECR/Helm/kubectl) while binding values_file -- answered here, but deliberately excluded from `calls` since every caller's "zero calls" assertion means zero of the calls this helper's name promises: zero network.
+        if str(phase5_runtime.DEPLOYMENT_MODEL_TOOL) in argv:
+            return type("Proc", (), {"returncode": 0, "stdout": json.dumps({"valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml"}), "stderr": ""})()
         calls.append(list(argv))
         return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
@@ -17816,6 +17878,7 @@ DESCRIPTOR = {
     "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
     "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
     "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
+    "valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
 }
 
 
@@ -18059,6 +18122,7 @@ DESCRIPTOR = {
     "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
     "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
     "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
+    "valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
 }
 
 

@@ -1,21 +1,21 @@
-# Oracle GoldenGate runtime, single-runtime deployment model. SOURCE side of the logical Oracle -> PostgreSQL pipeline repltest-ora-to-pg-001, paired with gg-postgresql-repltest-02. Platform/runtime deployment is automated by GitHub Actions/Argo CD/Helm. Database connections, credentials, Extract, trails, Distribution Path, and process starts are configured MANUALLY through the GoldenGate UI. deployment.pipeline is logical topology metadata only.
+# PostgreSQL GoldenGate runtime, single-runtime deployment model. TARGET side of the logical Oracle -> PostgreSQL pipeline repltest-ora-to-pg-002, paired with gg-oracle-repltest-002. Platform/runtime deployment is automated by GitHub Actions/Argo CD/Helm. Database connections, credentials, checkpoint configuration, Replicat, and process starts are configured MANUALLY through the GoldenGate UI. deployment.pipeline is logical topology metadata only. Pipeline-Aware Descriptor Hierarchy: this descriptor's canonical path is envs/dev/pipelines/repltest-ora-to-pg-002/gg-postgresql-repltest-002/values.yaml; both the pipeline ID (repltest-ora-to-pg-001 -> repltest-ora-to-pg-002) and the deployment ID (gg-postgresql-repltest-02 -> gg-postgresql-repltest-002) were renamed together to carry the matching 3-digit pipeline correlation suffix -002. Its pre-existing managed EFS filesystem's identity/state is explicitly preserved across this rename -- see automation/goldengate-deployment-model.py's LEGACY_MANAGED_EFS_CREATION_TOKENS.
 
 deployment:
   enabled: true
-  pipeline: repltest-ora-to-pg-001
-  role: source
+  pipeline: repltest-ora-to-pg-002
+  role: target
 
 deploymentModel: singleRuntime
 
 runtime:
-  deploymentType: oracle
+  deploymentType: postgresql
   businessDomain: repltest
-  containerName: ogg-oracle
+  containerName: ogg-postgresql
 
   replicas: 1
 
   image:
-    repositoryName: ogg-oracle
+    repositoryName: ogg-postgresql
     tag: "23.26.2.0.1"
     pullPolicy: IfNotPresent
 
@@ -52,8 +52,8 @@ runtime:
     type: ClusterIP
     ports:
       https: 8443
-      dist: 9013
-      receiver: null
+      dist: null
+      receiver: 9014
       metrics: 9015
 
   storage:
@@ -80,7 +80,7 @@ ingress:
   className: alb
 
   alb:
-    groupOrder: "114"
+    groupOrder: "115"
     backendProtocol: HTTPS
     listenPorts: '[{"HTTPS":443}]'
     targetType: ip

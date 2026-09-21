@@ -447,24 +447,24 @@ class RuntimeConsoleUrlTopologyTests(unittest.TestCase):
 
     def test_real_postgresql_and_mssql_runtimes_have_ingress_enabled_and_canonical_resolved_hosts(self):
         # A/Section 8: proven against the REAL generated registry, never a hand-built dictionary; neither real DEV descriptor declares an explicit ingress.host, so both resolve to the "<deploymentId>.<dnsDomain>" default.
-        pg = self.by_name["gg-postgresql-repltest-01"]
-        mssql = self.by_name["gg-mssql-repltest-01"]
+        pg = self.by_name["gg-postgresql-repltest-001"]
+        mssql = self.by_name["gg-mssql-repltest-001"]
         self.assertIs(pg["ingressEnabled"], True)
         self.assertIs(mssql["ingressEnabled"], True)
-        self.assertEqual(pg["ingressHost"], f"gg-postgresql-repltest-01.{self.doc['dnsDomain']}")
-        self.assertEqual(mssql["ingressHost"], f"gg-mssql-repltest-01.{self.doc['dnsDomain']}")
-        self.assertEqual(pg["consoleUrl"], f"https://gg-postgresql-repltest-01.{self.doc['dnsDomain']}/")
-        self.assertEqual(mssql["consoleUrl"], f"https://gg-mssql-repltest-01.{self.doc['dnsDomain']}/")
+        self.assertEqual(pg["ingressHost"], f"gg-postgresql-repltest-001.{self.doc['dnsDomain']}")
+        self.assertEqual(mssql["ingressHost"], f"gg-mssql-repltest-001.{self.doc['dnsDomain']}")
+        self.assertEqual(pg["consoleUrl"], f"https://gg-postgresql-repltest-001.{self.doc['dnsDomain']}/")
+        self.assertEqual(mssql["consoleUrl"], f"https://gg-mssql-repltest-001.{self.doc['dnsDomain']}/")
 
     def test_l_two_real_runtimes_resolve_to_different_urls_automatically(self):
-        pg = self.by_name["gg-postgresql-repltest-01"]
-        mssql = self.by_name["gg-mssql-repltest-01"]
+        pg = self.by_name["gg-postgresql-repltest-001"]
+        mssql = self.by_name["gg-mssql-repltest-001"]
         self.assertNotEqual(pg["ingressHost"], mssql["ingressHost"])
         self.assertNotEqual(pg["consoleUrl"], mssql["consoleUrl"])
 
     def test_m_no_deployment_hostname_or_domain_literal_hardcoded_in_ui_module(self):
         ui_source = inspect.getsource(ui)
-        for literal in (self.doc["dnsDomain"], "gg-postgresql-repltest-01", "gg-mssql-repltest-01"):
+        for literal in (self.doc["dnsDomain"], "gg-postgresql-repltest-001", "gg-mssql-repltest-001"):
             self.assertNotIn(literal, ui_source)
 
     def test_no_deployment_hostname_or_domain_literal_in_monitor_image_build_files(self):
@@ -472,7 +472,7 @@ class RuntimeConsoleUrlTopologyTests(unittest.TestCase):
         dockerfile_path = os.path.join(REPO_ROOT, "monitoring", "monitor", "Dockerfile")
         with open(dockerfile_path) as f:
             dockerfile_text = f.read()
-        for literal in (self.doc["dnsDomain"], "gg-postgresql-repltest-01", "gg-mssql-repltest-01"):
+        for literal in (self.doc["dnsDomain"], "gg-postgresql-repltest-001", "gg-mssql-repltest-001"):
             self.assertNotIn(literal, dockerfile_text)
 
     def test_c_ingress_disabled_yields_no_console_url(self):
@@ -1301,14 +1301,14 @@ class RuntimeConsoleLinkRenderTests(unittest.TestCase):
         self.assertIn('title="Open GoldenGate UI"', rendered)
 
     def test_two_deployments_resolve_to_different_urls_neither_hardcoded_in_ui(self):
-        payload = self._payload(console_url="https://gg-postgresql-repltest-01.goldengate-dev.adcbmis.local/")
+        payload = self._payload(console_url="https://gg-postgresql-repltest-001.goldengate-dev.adcbmis.local/")
         second = dict(payload["logicalPipelines"][0]["runtimes"][0])
-        second.update(deploymentName="gg-mssql-repltest-01", role="target",
-                      consoleUrl="https://gg-mssql-repltest-01.goldengate-dev.adcbmis.local/")
+        second.update(deploymentName="gg-mssql-repltest-001", role="target",
+                      consoleUrl="https://gg-mssql-repltest-001.goldengate-dev.adcbmis.local/")
         payload["logicalPipelines"][0]["runtimes"].append(second)
         rendered = monitor.render_html(payload, make_config())
-        self.assertIn('href="https://gg-postgresql-repltest-01.goldengate-dev.adcbmis.local/"', rendered)
-        self.assertIn('href="https://gg-mssql-repltest-01.goldengate-dev.adcbmis.local/"', rendered)
+        self.assertIn('href="https://gg-postgresql-repltest-001.goldengate-dev.adcbmis.local/"', rendered)
+        self.assertIn('href="https://gg-mssql-repltest-001.goldengate-dev.adcbmis.local/"', rendered)
         self.assertEqual(rendered.count('class="card-link-external"'), 2)
         self.assertNotIn("goldengate-dev.adcbmis.local", inspect.getsource(ui))
 

@@ -42,8 +42,20 @@ def _is_safe_creation_token(value):
     return isinstance(value, str) and bool(_SAFE_CREATION_TOKEN_RE.match(value)) and len(value) <= _EFS_CREATION_TOKEN_MAX_LENGTH
 
 
+# Pipeline-Aware Descriptor Hierarchy Migration: mirrors automation/goldengate-deployment-model.py's own LEGACY_MANAGED_EFS_CREATION_TOKENS exactly (never imported, matching this file's existing self-contained convention already used for derive_expected_creation_token below) -- an actual AWS filesystem's own tags (GoldenGateEnvironment/GoldenGateDeploymentId) are the self-consistency input here, and after the real, separately-approved live migration those tags carry the NEW deployment ID while CreationToken itself remains the OLD, immutable value; this map is what lets that self-consistency check keep passing instead of failing closed on every future run. A dedicated drift test proves this copy and the canonical one agree.
+LEGACY_MANAGED_EFS_CREATION_TOKENS = {
+    ("dev", "gg-postgresql-repltest-001"): "dev-gg-postgresql-repltest-01-efs",
+    ("dev", "gg-mssql-repltest-001"): "dev-gg-mssql-repltest-01-efs",
+    ("dev", "gg-oracle-repltest-002"): "dev-gg-oracle-repltest-01-efs",
+    ("dev", "gg-postgresql-repltest-002"): "dev-gg-postgresql-repltest-02-efs",
+}
+
+
 def derive_expected_creation_token(environment, deployment_id):
-    """Mirrors automation/goldengate-deployment-model.py's derive_efs_creation_token() exactly -- a separate, dependency-free copy rather than an import, since that module unconditionally requires PyYAML at import time and this one is kept free of it. Regression-tested against the real function to catch any future drift. Takes the FILESYSTEM'S OWN GoldenGateEnvironment/GoldenGateDeploymentId tags, not the current run's environment -- this proves an actual filesystem's CreationToken is self-consistent with its own claimed identity, independent of whether that identity happens to belong to the current environment."""
+    """Mirrors automation/goldengate-deployment-model.py's derive_efs_creation_token() exactly -- a separate, dependency-free copy rather than an import, since that module unconditionally requires PyYAML at import time and this one is kept free of it. Regression-tested against the real function to catch any future drift. Takes the FILESYSTEM'S OWN GoldenGateEnvironment/GoldenGateDeploymentId tags, not the current run's environment -- this proves an actual filesystem's CreationToken is self-consistent with its own claimed identity, independent of whether that identity happens to belong to the current environment. Checks LEGACY_MANAGED_EFS_CREATION_TOKENS first, exactly like the canonical function."""
+    legacy_token = LEGACY_MANAGED_EFS_CREATION_TOKENS.get((environment, deployment_id))
+    if legacy_token is not None:
+        return legacy_token
     return f"{environment}-{deployment_id}-efs"
 
 

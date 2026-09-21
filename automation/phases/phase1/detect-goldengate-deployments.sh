@@ -256,6 +256,20 @@ elif h_mode == "existing":
 ' "$historical_json" "$current_json"
 }
 
+# Pipeline-Aware Descriptor Hierarchy: the ONLY canonical runtime descriptor shape is envs/<environment>/pipelines/<pipeline-id>/<deployment-id>/values.yaml -- resolves it against the CURRENT working tree only (never a removed/renamed-away path; a NAME_STATUS-derived historical-path lookup below the push-trigger section handles that case). Mirrors automation/goldengate-deployment-model.py's own find_values_files() glob exactly. Prints the one matching path and returns 0; prints nothing and returns 1 for zero or more than one match (absent, or an ambiguous/unsupported shape) -- never guesses. Used by both the workflow_dispatch targeted-deploy branch below and the push-trigger change-detection section further down, so both agree on exactly one resolution rule.
+resolve_current_values_file() {
+  local environment="$1" deployment_id="$2"
+  local matches=()
+  shopt -s nullglob
+  matches=(envs/"${environment}"/pipelines/*/"${deployment_id}"/values.yaml)
+  shopt -u nullglob
+  if [ "${#matches[@]}" -eq 1 ]; then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  fi
+  return 1
+}
+
 # ACTIVE CONTRACT: qualifies only a non-empty, valid YAML mapping whose deploymentModel is exactly "singleRuntime" (legacyPair and unrecognized values fail closed); content-based only, independent of the enabled check above.
 is_goldengate_deployment_values_file() {
   local values_file="$1"
@@ -354,7 +368,12 @@ if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
     exit 1
   fi
 
-  VALUES_FILE="envs/${ENVIRONMENT}/${DEPLOYMENT_ID}/values.yaml"
+  # Pipeline-Aware Descriptor Hierarchy: deployment_id alone no longer determines the values file path -- its pipeline folder is resolved dynamically against the current working tree (never reconstructed as a flat envs/<environment>/<deployment_id>/ path). Absent, or ambiguously present under more than one pipeline folder, fails closed with a clear message before any further classification.
+  if ! VALUES_FILE="$(resolve_current_values_file "$ENVIRONMENT" "$DEPLOYMENT_ID")"; then
+    echo "Could not resolve exactly one canonical values file for deployment_id=${DEPLOYMENT_ID} under envs/${ENVIRONMENT}/pipelines/*/${DEPLOYMENT_ID}/."
+    echo "${DEPLOYMENT_ID} is not a known GoldenGate runtime deployment under envs/${ENVIRONMENT}/pipelines/. Refusing to build a matrix for it."
+    exit 1
+  fi
 
   echo "Manual workflow_dispatch trigger for deployment_id=${DEPLOYMENT_ID}, environment=${ENVIRONMENT}."
   echo "Validating deployment values file: ${VALUES_FILE}"
@@ -448,6 +467,14 @@ if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000
   BEFORE_SHA="$EMPTY_TREE_SHA"
 fi
 
+# Pipeline-Aware Descriptor Hierarchy Migration (CRITICAL, explicitly modeled -- never relies on Git rename detection alone): these exactly four intentional deployment-ID renames are the one-time source-tree identity migration this task performs. If Git's own similarity heuristic detects a rename (R<score>) with a high enough score, the old path is skipped entirely below (its OLD deployment ID never enters deletion-candidate evaluation as a rename source) and the NEW path is picked up as a completely normal ACTIVE candidate through the exact same path every future onboarded runtime uses. If Git instead reports the old path as a plain deletion (D) -- e.g. because the content similarity ended up below Git's detection threshold -- the OLD deployment ID is explicitly recognized as "migrated, not physically removed" here (provided its mapped NEW deployment ID is genuinely present as an active candidate in this SAME push) and is excluded from the deletion matrix outright, rather than being routed through physical-removal (which the existing managed-EFS guard would refuse anyway for efs_mode=managed, but that is a safe FAILURE, not the successful migration this task requires). This map is intentionally bounded to exactly these four known (old -> new) pairs -- it is never consulted for any other deployment ID, and no future rename may be added to it; it exists solely to bridge this one historical migration.
+declare -A KNOWN_DEPLOYMENT_ID_MIGRATIONS=(
+  ["gg-postgresql-repltest-01"]="gg-postgresql-repltest-001"
+  ["gg-mssql-repltest-01"]="gg-mssql-repltest-001"
+  ["gg-oracle-repltest-01"]="gg-oracle-repltest-002"
+  ["gg-postgresql-repltest-02"]="gg-postgresql-repltest-002"
+)
+
 CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' 'helm/goldengate/**' || true)"
 
 echo "Changed files under envs/dev/ and helm/goldengate/:"
@@ -465,25 +492,27 @@ DELETION_MATRIX_ITEMS="[]"
 ACTIVE_LOG=""
 INACTIVE_LOG=""
 
-# Excludes envs/dev/argocd/ (Argo CD's own values, not a GoldenGate deployment); chart-wide changes select all active deployments, otherwise only changed folders.
+# envs/dev/argocd/ and envs/dev/goldengate-monitor/ (both siblings of pipelines/, never inside it) are structurally excluded by the pipelines/*/*/values.yaml pattern itself below -- there is no longer a separate "-not -path .../argocd/*" filter to maintain. Chart-wide changes select all active deployments, otherwise only changed deployment (leaf) folders.
 if [ "$CHART_CHANGED" = "true" ]; then
   echo "Selection reason: shared GoldenGate Helm chart changed. Selecting all active dev deployments."
 
-  DEPLOYMENT_CANDIDATE_IDS="$(find envs/dev -mindepth 2 -maxdepth 2 -name values.yaml -not -path 'envs/dev/argocd/*' \
-    | sed -E 's#^envs/dev/([^/]+)/values\.yaml$#\1#' \
+  DEPLOYMENT_CANDIDATE_IDS="$(find envs/dev/pipelines -mindepth 3 -maxdepth 3 -name values.yaml \
+    | sed -E 's#^envs/dev/pipelines/[^/]+/([^/]+)/values\.yaml$#\1#' \
     | sort -u || true)"
 else
-  echo "Selection reason: only envs/dev/<deployment> changed. Selecting changed deployment folders."
+  echo "Selection reason: only envs/dev/pipelines/<pipeline-id>/<deployment-id> changed. Selecting changed deployment folders."
 
   DEPLOYMENT_CANDIDATE_IDS="$(echo "$CHANGED_FILES" \
-    | grep -E '^envs/dev/[^/]+/' \
-    | grep -v '^envs/dev/argocd/' \
-    | sed -E 's#^envs/dev/([^/]+)/.*#\1#' \
+    | grep -E '^envs/dev/pipelines/[^/]+/[^/]+/' \
+    | sed -E 's#^envs/dev/pipelines/[^/]+/([^/]+)/.*#\1#' \
     | sort -u || true)"
 fi
 
 for DEPLOYMENT_ID in $DEPLOYMENT_CANDIDATE_IDS; do
-  VALUES_FILE="envs/dev/${DEPLOYMENT_ID}/values.yaml"
+  if ! VALUES_FILE="$(resolve_current_values_file "dev" "$DEPLOYMENT_ID")"; then
+    echo "Not an actively deployable GoldenGate deployment: ${DEPLOYMENT_ID} (no resolvable current envs/dev/pipelines/*/${DEPLOYMENT_ID}/values.yaml -- absent, or ambiguously present under more than one pipeline folder) -- excluded from the build/update matrix."
+    continue
+  fi
 
   # Only a values file whose own deploymentModel is singleRuntime is ever eligible (never inferred from folder name).
   set +e
@@ -524,28 +553,50 @@ NAME_STATUS="$(git diff --name-status "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**
 echo "Name-status diff under envs/dev/ and helm/goldengate/:"
 echo "${NAME_STATUS:-<none>}"
 
-# Deletion candidates are removed (D) or renamed-away (R) envs/dev/<id>/ paths; helm/goldengate/** changes never produce a deletion.
+# Deletion candidates are removed (D) or renamed-away (R) envs/dev/pipelines/<pipeline-id>/<deployment-id>/ paths (the OLD path, for an R entry); helm/goldengate/** changes never produce a deletion.
 REMOVED_PATH_IDS="$(echo "$NAME_STATUS" \
   | awk '$1 ~ /^D/ { print $2 } $1 ~ /^R/ { print $2 }' \
-  | grep -E '^envs/dev/[^/]+/' \
-  | grep -v '^envs/dev/argocd/' \
-  | sed -E 's#^envs/dev/([^/]+)/.*#\1#' \
+  | grep -E '^envs/dev/pipelines/[^/]+/[^/]+/' \
+  | sed -E 's#^envs/dev/pipelines/[^/]+/([^/]+)/.*#\1#' \
   | sort -u || true)"
+
+# Records the exact OLD full path for every removed/renamed-away deployment ID, keyed by that ID -- git show below must read the descriptor's HISTORICAL path (which the current working tree, and therefore resolve_current_values_file, can never resolve for a candidate that no longer exists there), never a reconstructed/guessed one. Takes the NAME_STATUS diff text as $1 (rather than reading a global) so it can be extracted and exercised standalone by the test harness, exactly like every other classifier function in this script.
+compute_old_values_file_by_id() {
+  local name_status="$1"
+  echo "$name_status" \
+    | awk '$1 ~ /^D/ { print $2 } $1 ~ /^R/ { print $2 }' \
+    | grep -E '^envs/dev/pipelines/[^/]+/[^/]+/values\.yaml$' \
+    | while IFS= read -r REMOVED_PATH; do
+        printf '%s %s\n' "$(basename "$(dirname "$REMOVED_PATH")")" "$REMOVED_PATH"
+      done \
+    | sort -u -k1,1
+}
+
+OLD_VALUES_FILE_BY_ID="$(compute_old_values_file_by_id "$NAME_STATUS" || true)"
+
+lookup_old_values_file() {
+  local deployment_id="$1"
+  echo "$OLD_VALUES_FILE_BY_ID" | awk -v id="$deployment_id" '$1 == id { print $2; exit }'
+}
 
 # Also re-check deployments whose values.yaml changed in this push -- it may have just become comment-only/empty/disabled.
 CHANGED_VALUES_IDS="$(echo "$CHANGED_FILES" \
-  | grep -E '^envs/dev/[^/]+/values\.yaml$' \
-  | grep -v '^envs/dev/argocd/' \
-  | sed -E 's#^envs/dev/([^/]+)/values\.yaml$#\1#' \
+  | grep -E '^envs/dev/pipelines/[^/]+/[^/]+/values\.yaml$' \
+  | sed -E 's#^envs/dev/pipelines/[^/]+/([^/]+)/values\.yaml$#\1#' \
   | sort -u || true)"
 
 DELETION_CANDIDATE_IDS="$(printf '%s\n%s\n' "$REMOVED_PATH_IDS" "$CHANGED_VALUES_IDS" | sed '/^$/d' | sort -u || true)"
 
 for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
-  VALUES_FILE="envs/dev/${CANDIDATE_ID}/values.yaml"
+  # Pipeline-Aware Descriptor Hierarchy Migration (CRITICAL): a candidate whose OLD deployment ID is a known intentional migration source, and whose mapped NEW deployment ID genuinely entered the build/update matrix as an active candidate in this SAME push, is a migration -- never physical removal, and never even deployment-disabled. It is excluded from deletion evaluation entirely here (before ever resolving a values file for it, working-tree or historical), relying solely on this explicit, bounded, four-pair map -- never on Git's own rename-similarity heuristic, which this push's content edits (deployment.pipeline, deployment ID correlation) could plausibly push below the default detection threshold.
+  MIGRATED_TO="${KNOWN_DEPLOYMENT_ID_MIGRATIONS[$CANDIDATE_ID]:-}"
+  if [ -n "$MIGRATED_TO" ] && echo "$DEPLOYMENT_CANDIDATE_IDS" | grep -qxF "$MIGRATED_TO"; then
+    echo "Migrated (not a deletion): ${CANDIDATE_ID} -> ${MIGRATED_TO} is present as an active build/update candidate in this same push -- explicit intentional-migration mapping, never physical removal."
+    continue
+  fi
 
-  # Classify from the working tree if the file still exists, otherwise from its content at BEFORE_SHA; fails closed either way, never defaults to a model.
-  if [ -f "$VALUES_FILE" ]; then
+  # Classify from the working tree if the file still exists there under its OWN (possibly different) current pipeline folder, otherwise from its content at BEFORE_SHA; fails closed either way, never defaults to a model.
+  if VALUES_FILE="$(resolve_current_values_file "dev" "$CANDIDATE_ID")"; then
     GG_SOURCE="working tree"
     set +e
     GG_REASON="$(is_goldengate_deployment_values_file "$VALUES_FILE")"
@@ -575,6 +626,11 @@ for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
       esac
     fi
   else
+    VALUES_FILE="$(lookup_old_values_file "$CANDIDATE_ID")"
+    if [ -z "$VALUES_FILE" ]; then
+      echo "Not a GoldenGate deployment: ${CANDIDATE_ID} (no resolvable current or historical envs/dev/pipelines/*/${CANDIDATE_ID}/values.yaml) -- ignoring for deletion evaluation."
+      continue
+    fi
     GG_SOURCE="base revision (${BEFORE_SHA})"
     set +e
     GG_REASON="$(is_goldengate_deployment_values_file_at_ref "$BEFORE_SHA" "$VALUES_FILE")"
@@ -646,10 +702,8 @@ echo "Checking changed-and-still-present descriptors for unsafe storage-identity
 TRANSITION_VIOLATIONS="[]"
 
 for CHANGED_ID in $CHANGED_VALUES_IDS; do
-  CHANGED_VALUES_FILE="envs/dev/${CHANGED_ID}/values.yaml"
-
-  # Only a still-present descriptor can undergo a "transition" -- a removed/emptied file is a deletion, already handled by the deletion matrix, not a storage-identity mutation of a still-existing runtime.
-  if [ ! -f "$CHANGED_VALUES_FILE" ] || [ ! -s "$CHANGED_VALUES_FILE" ]; then
+  # Only a still-present descriptor can undergo a "transition" -- a removed/emptied file is a deletion, already handled by the deletion matrix, not a storage-identity mutation of a still-existing runtime. A renamed-away descriptor (this task's own four migrations included) resolves to no CURRENT path under its OLD ID at all -- correctly skipped here, never mistaken for a transition of the SAME runtime.
+  if ! CHANGED_VALUES_FILE="$(resolve_current_values_file "dev" "$CHANGED_ID")" || [ ! -s "$CHANGED_VALUES_FILE" ]; then
     continue
   fi
 

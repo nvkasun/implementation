@@ -22,12 +22,13 @@ runtime_state = _load_tool()
 
 # Uses a real envs/dev descriptor -- describe_deployment() reads the real repository, never a scratch root (this classifier is not itself a second descriptor parser, so its tests exercise it against the real folder-driven model). Its own deployment.enabled value is irrelevant here: describe_deployment() resolves both active and inactive descriptors identically, and classify() itself never inspects deployment.enabled at all.
 ENVIRONMENT = "dev"
-DEPLOYMENT_ID = "gg-postgresql-repltest-01"
+# Pipeline-Aware Descriptor Hierarchy: the real descriptor this class exercises now lives at envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml (migrated from the pre-migration gg-postgresql-repltest-01).
+DEPLOYMENT_ID = "gg-postgresql-repltest-001"
 ARGOCD_NAMESPACE = "argocd"
 RUNTIME_NAMESPACE = "goldengate-dev"
 ECR_REGISTRY = "229410149234.dkr.ecr.eu-west-1.amazonaws.com"
 
-APP_NAME = f"goldengate-{ENVIRONMENT}-postgresql-repltest-01"
+APP_NAME = f"goldengate-{ENVIRONMENT}-postgresql-repltest-001"
 STORAGECLASS_NAME = f"gg-efs-{ENVIRONMENT}-{DEPLOYMENT_ID}"
 
 
@@ -319,7 +320,7 @@ class RuntimeStateClassifierTests(unittest.TestCase):
         with self.assertRaises(runtime_state.ClassifierInspectionError):
             _classify(cluster)
 
-    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: DEPLOYMENT_ID (gg-postgresql-repltest-01) is a real descriptor that declares chart-owned managed EFS persistence (persistence.enabled=true, provider=efs, efs.mode=managed, no existingClaim) -- exactly the shape the retained-PVC safe case requires.
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: DEPLOYMENT_ID (gg-postgresql-repltest-001) is a real descriptor that declares chart-owned managed EFS persistence (persistence.enabled=true, provider=efs, efs.mode=managed, no existingClaim) -- exactly the shape the retained-PVC safe case requires.
 
     def test_19_app_absent_only_owned_retained_pvc_is_owned(self):
         # 25: App absent + owned retained PVC only is considered safe for re-enable -- the recognized "disabled runtime, durable /u02 data retained" shape.

@@ -113,7 +113,7 @@ def ensure_scratch_environment_yaml(root, environment):
     return path
 
 
-def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="test-pipeline", role="source",
+def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="test-pipeline-001", role="source",
                      deployment_type="oracle", repository_name=None, tag="1.0.0",
                      service_account_name=None, service_account_create=None,
                      deployment_admin_secret=None, alb_group_order=None, extra="", raw_override=None,
@@ -121,8 +121,9 @@ def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="t
                      csi_service_account_role_arn=None, ingress_host_domain=None,
                      image_repository_override=None, global_environment_override=None,
                      ingress_alb_group_name=None, ingress_alb_certificate_arn=None):
+    # Pipeline-Aware Descriptor Hierarchy: the ONLY canonical runtime descriptor shape is envs/<environment>/pipelines/<pipeline-id>/<deployment-id>/values.yaml -- pipeline here is ALWAYS the folder-placement value (never independently reconstructed), so the written descriptor's own deployment.pipeline field (below) and its parent folder are identical by construction, exactly satisfying contract B.
     ensure_scratch_environment_yaml(root, environment)
-    folder = os.path.join(root, "envs", environment, deployment_id)
+    folder = os.path.join(root, "envs", environment, "pipelines", pipeline, deployment_id)
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "values.yaml")
     if raw_override is not None:
@@ -187,7 +188,7 @@ def write_descriptor(root, environment, deployment_id, enabled=True, pipeline="t
 def _efs_test_doc(environment="dev", persistence=None):
     """Minimal valid descriptor with an explicit efs-capable u02 storage block, for persistence.efs.mode tests."""
     doc = {
-        "deployment": {"enabled": True, "pipeline": "test-pipeline", "role": "source"},
+        "deployment": {"enabled": True, "pipeline": "test-pipeline-001", "role": "source"},
         "deploymentModel": "singleRuntime",
         "runtime": {
             "deploymentType": "oracle",
@@ -204,7 +205,9 @@ def _efs_test_doc(environment="dev", persistence=None):
 
 
 def write_doc(root, environment, deployment_id, doc):
-    folder = os.path.join(root, "envs", environment, deployment_id)
+    # Pipeline-Aware Descriptor Hierarchy: the pipeline folder is derived from the doc's OWN deployment.pipeline field (never independently reconstructed), so the written descriptor's parent folder and its own deployment.pipeline value are identical by construction, exactly satisfying contract B -- callers that need a specific folder/pipeline mismatch pass a doc whose deployment.pipeline already reflects it.
+    pipeline = ((doc.get("deployment") or {}).get("pipeline")) or "test-pipeline-001"
+    folder = os.path.join(root, "envs", environment, "pipelines", pipeline, deployment_id)
     os.makedirs(folder, exist_ok=True)
     with open(os.path.join(folder, "values.yaml"), "w") as f:
         yaml.safe_dump(doc, f)
@@ -272,10 +275,10 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
             self.assertIs(entry["ingressEnabled"], True)
             self.assertEqual(entry["ingressHost"], f"{d['deploymentId']}.{dns_domain}")
 
-        self.assertIn("gg-postgresql-repltest-01", by_name)
-        self.assertIn("gg-mssql-repltest-01", by_name)
-        self.assertNotEqual(by_name["gg-postgresql-repltest-01"]["ingressHost"],
-                            by_name["gg-mssql-repltest-01"]["ingressHost"])
+        self.assertIn("gg-postgresql-repltest-001", by_name)
+        self.assertIn("gg-mssql-repltest-001", by_name)
+        self.assertNotEqual(by_name["gg-postgresql-repltest-001"]["ingressHost"],
+                            by_name["gg-mssql-repltest-001"]["ingressHost"])
 
     def test_managed_efs_inventory_matches_dynamically_derived_managed_set(self):
         # Self-service: never asserts today's managed count is any particular fixed number -- compares the real cmd_managed_efs_inventory JSON output against a set derived independently from the same scan (efsMode == "managed"), including deployment.enabled=false descriptors (inactive), exactly like the real command.
@@ -316,7 +319,8 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
                 self.assertEqual(d["tlsSecretName"], gdm.resolve_tls_secret(d["environment"]))
                 self.assertEqual(d["adminSecretName"], gdm.resolve_admin_secret(d["environment"], d["role"]))
 
-                with open(os.path.join(REPO_ROOT, "envs", "dev", d["deploymentId"], "values.yaml")) as f:
+                # Pipeline-Aware Descriptor Hierarchy: reads the canonical descriptor path via the deployment model's own valuesFile field, never a reconstructed flat envs/dev/<id>/ path.
+                with open(os.path.join(REPO_ROOT, d["valuesFile"])) as f:
                     raw = yaml.safe_load(f)
                 ports = ((raw.get("runtime") or {}).get("service") or {}).get("ports") or {}
                 if d["role"] == "source":
@@ -369,12 +373,67 @@ class RealRepositoryDescriptorTests(unittest.TestCase):
             self.assertTrue(d["pipeline"])
             self.assertIn(d["role"], ("source", "target"))
 
+    def test_the_four_migrated_dev_runtime_descriptors_are_discovered_correctly(self):
+        # Pipeline-Aware Descriptor Hierarchy Migration (test requirements 1, 2, 6): proves the exact four migrated runtime deployment IDs are discovered, with no more and no fewer active runtimes.
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        active_ids = sorted(d["deploymentId"] for d in active)
+        self.assertEqual(active_ids, [
+            "gg-mssql-repltest-001",
+            "gg-oracle-repltest-002",
+            "gg-postgresql-repltest-001",
+            "gg-postgresql-repltest-002",
+        ])
+        self.assertEqual(len(active_ids), 4)
+
+    def test_exactly_two_logical_pipelines_remain(self):
+        # Test requirement 3.
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        pipelines = sorted({d["pipeline"] for d in active})
+        self.assertEqual(pipelines, ["repltest-ora-to-pg-002", "repltest-pg-to-mssql-001"])
+
+    def test_pipeline_001_contains_postgresql_source_and_mssql_target(self):
+        # Test requirement 4.
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        by_role = {d["role"]: d for d in active if d["pipeline"] == "repltest-pg-to-mssql-001"}
+        self.assertEqual(by_role["source"]["deploymentId"], "gg-postgresql-repltest-001")
+        self.assertEqual(by_role["source"]["deploymentType"], "postgresql")
+        self.assertEqual(by_role["target"]["deploymentId"], "gg-mssql-repltest-001")
+        self.assertEqual(by_role["target"]["deploymentType"], "mssql")
+
+    def test_pipeline_002_contains_oracle_source_and_postgresql_target(self):
+        # Test requirement 5.
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        by_role = {d["role"]: d for d in active if d["pipeline"] == "repltest-ora-to-pg-002"}
+        self.assertEqual(by_role["source"]["deploymentId"], "gg-oracle-repltest-002")
+        self.assertEqual(by_role["source"]["deploymentType"], "oracle")
+        self.assertEqual(by_role["target"]["deploymentId"], "gg-postgresql-repltest-002")
+        self.assertEqual(by_role["target"]["deploymentType"], "postgresql")
+
+    def test_parent_pipeline_folder_equals_deployment_pipeline_for_every_real_descriptor(self):
+        # Test requirement 7.
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        for d in active + inactive:
+            values_file = d["valuesFile"]
+            pipeline_folder = os.path.basename(os.path.dirname(os.path.dirname(values_file)))
+            self.assertEqual(pipeline_folder, d["pipeline"], values_file)
+
+    def test_every_real_descriptor_values_file_matches_its_canonical_path(self):
+        for d in gdm.scan("dev")[0] + gdm.scan("dev")[1]:
+            expected = f"envs/dev/pipelines/{d['pipeline']}/{d['deploymentId']}/values.yaml"
+            self.assertEqual(d["valuesFile"], expected)
+            self.assertTrue(os.path.isfile(os.path.join(REPO_ROOT, expected)))
+
 
 class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
     """runtime.deploymentType is a safe canonical lowercase token; the derived ServiceAccount is deterministic naming, never a fixed allowlist."""
 
     def test_synthetic_postgresql_source_descriptor_parses(self):
-        write_descriptor(self._tmp.name, "dev", "gg-postgresql-payments-mssql-01",
+        write_descriptor(self._tmp.name, "dev", "gg-postgresql-payments-mssql-001",
                          pipeline="payments-pg-to-mssql-001", role="source", deployment_type="postgresql")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
@@ -382,7 +441,7 @@ class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
         self.assertEqual(active[0]["adminSecretName"], "dev/goldengate/source/admin")
 
     def test_synthetic_mssql_target_descriptor_parses(self):
-        write_descriptor(self._tmp.name, "dev", "gg-mssql-payments-01",
+        write_descriptor(self._tmp.name, "dev", "gg-mssql-payments-001",
                          pipeline="payments-pg-to-mssql-001", role="target", deployment_type="mssql")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
@@ -390,39 +449,39 @@ class GenericDeploymentTypeTests(ScratchEnvironmentTestCase):
         self.assertEqual(active[0]["adminSecretName"], "dev/goldengate/target/admin")
 
     def test_any_safe_type_derives_the_shared_service_account_without_a_fixed_allowlist(self):
-        write_descriptor(self._tmp.name, "dev", "gg-mysql-fixture-01", deployment_type="mysql")
+        write_descriptor(self._tmp.name, "dev", "gg-mysql-fixture-001", deployment_type="mysql")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
 
     def test_safe_daa_type_parses(self):
-        write_descriptor(self._tmp.name, "dev", "gg-daa-fixture-01", deployment_type="daa")
+        write_descriptor(self._tmp.name, "dev", "gg-daa-fixture-001", deployment_type="daa")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["deploymentType"], "daa")
 
     def test_unsafe_deployment_type_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-unsafe-fixture-01", deployment_type="oracle/../etc")
+        write_descriptor(self._tmp.name, "dev", "gg-unsafe-fixture-001", deployment_type="oracle/../etc")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_uppercase_deployment_type_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-uppercase-fixture-01", deployment_type="Oracle")
+        write_descriptor(self._tmp.name, "dev", "gg-uppercase-fixture-001", deployment_type="Oracle")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_leading_hyphen_deployment_type_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-leading-hyphen-fixture-01", deployment_type="-oracle")
+        write_descriptor(self._tmp.name, "dev", "gg-leading-hyphen-fixture-001", deployment_type="-oracle")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_trailing_hyphen_deployment_type_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-trailing-hyphen-fixture-01", deployment_type="oracle-")
+        write_descriptor(self._tmp.name, "dev", "gg-trailing-hyphen-fixture-001", deployment_type="oracle-")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_overlength_deployment_type_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-overlength-fixture-01", deployment_type="a" * 33)
+        write_descriptor(self._tmp.name, "dev", "gg-overlength-fixture-001", deployment_type="a" * 33)
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
@@ -463,22 +522,22 @@ class SyntheticFlavourRenderTests(ScratchEnvironmentTestCase):
     """Tests 8, 9, 15, 16: every type shares the one restored gg-runtime-sa identity, image stays values-file-derived, existing Oracle/PostgreSQL unaffected."""
 
     def test_synthetic_mssql_runtime_resolves_gg_runtime_sa(self):
-        write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-01",
-                         pipeline="p1", role="target", deployment_type="mssql")
+        write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-001",
+                         pipeline="p1-001", role="target", deployment_type="mssql")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
 
     def test_synthetic_daa_runtime_resolves_gg_runtime_sa(self):
-        write_descriptor(self._tmp.name, "dev", "gg-daa-fixture-01",
-                         pipeline="p1", role="source", deployment_type="daa")
+        write_descriptor(self._tmp.name, "dev", "gg-daa-fixture-001",
+                         pipeline="p1-001", role="source", deployment_type="daa")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
 
     def test_two_deployments_of_the_same_type_share_one_service_account(self):
-        write_descriptor(self._tmp.name, "dev", "gg-postgresql-fixture-a", pipeline="pa", role="source", deployment_type="postgresql")
-        write_descriptor(self._tmp.name, "dev", "gg-postgresql-fixture-b", pipeline="pb", role="source", deployment_type="postgresql")
+        write_descriptor(self._tmp.name, "dev", "gg-postgresql-fixture-a-001", pipeline="pa-001", role="source", deployment_type="postgresql")
+        write_descriptor(self._tmp.name, "dev", "gg-postgresql-fixture-b-001", pipeline="pb-001", role="source", deployment_type="postgresql")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         sa_names = {d["runtimeServiceAccountName"] for d in active}
@@ -486,18 +545,18 @@ class SyntheticFlavourRenderTests(ScratchEnvironmentTestCase):
 
     def test_different_types_still_share_the_same_service_account(self):
         # Restored shared identity: deploymentType controls image/product/ports/replication semantics, never AWS runtime identity -- different types must NOT produce distinct ServiceAccounts anymore.
-        write_descriptor(self._tmp.name, "dev", "gg-oracle-fixture-a", pipeline="pa", role="source", deployment_type="oracle")
-        write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-b", pipeline="pb", role="target", deployment_type="mssql")
+        write_descriptor(self._tmp.name, "dev", "gg-oracle-fixture-a-001", pipeline="pa-001", role="source", deployment_type="oracle")
+        write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-b-001", pipeline="pb-001", role="target", deployment_type="mssql")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         sa_names = {d["deploymentId"]: d["runtimeServiceAccountName"] for d in active}
-        self.assertEqual(sa_names["gg-oracle-fixture-a"], "gg-runtime-sa")
-        self.assertEqual(sa_names["gg-mssql-fixture-b"], "gg-runtime-sa")
-        self.assertEqual(sa_names["gg-oracle-fixture-a"], sa_names["gg-mssql-fixture-b"])
+        self.assertEqual(sa_names["gg-oracle-fixture-a-001"], "gg-runtime-sa")
+        self.assertEqual(sa_names["gg-mssql-fixture-b-001"], "gg-runtime-sa")
+        self.assertEqual(sa_names["gg-oracle-fixture-a-001"], sa_names["gg-mssql-fixture-b-001"])
 
     def test_mssql_image_comes_from_the_values_file_not_a_mapping(self):
-        write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-01",
-                         pipeline="p1", role="target", deployment_type="mssql",
+        write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-001",
+                         pipeline="p1-001", role="target", deployment_type="mssql",
                          repository_name="ogg-sqlserver", tag="9.9.9")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
@@ -520,7 +579,7 @@ class SyntheticFlavourRenderTests(ScratchEnvironmentTestCase):
             self.assertNotIn(token, source)
 
     def test_no_deployment_name_derived_service_account(self):
-        write_descriptor(self._tmp.name, "dev", "gg-oracle-payments-99", pipeline="p1", role="source", deployment_type="oracle")
+        write_descriptor(self._tmp.name, "dev", "gg-oracle-payments-099", pipeline="p1-099", role="source", deployment_type="oracle")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
@@ -531,17 +590,17 @@ class RuntimeIdentitiesCommandTests(ScratchEnvironmentTestCase):
     """Tests 10, 11: the folder-driven identity inventory command is deterministic and matches the CLI contract."""
 
     def test_runtime_identity_inventory_sorted_unique(self):
-        write_descriptor(self._tmp.name, "dev", "gg-postgresql-fixture-a", pipeline="pa", role="source", deployment_type="postgresql")
-        write_descriptor(self._tmp.name, "dev", "gg-postgresql-fixture-b", pipeline="pb", role="target", deployment_type="postgresql")
-        write_descriptor(self._tmp.name, "dev", "gg-oracle-fixture-a", pipeline="pc", role="source", deployment_type="oracle")
+        write_descriptor(self._tmp.name, "dev", "gg-postgresql-fixture-a-001", pipeline="pa-001", role="source", deployment_type="postgresql")
+        write_descriptor(self._tmp.name, "dev", "gg-postgresql-fixture-b-001", pipeline="pb-001", role="target", deployment_type="postgresql")
+        write_descriptor(self._tmp.name, "dev", "gg-oracle-fixture-a-001", pipeline="pc-001", role="source", deployment_type="oracle")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         inventory = gdm.runtime_identity_inventory(active)
         self.assertEqual(inventory, [("oracle", "gg-runtime-sa"), ("postgresql", "gg-runtime-sa")])
 
     def test_disabled_deployment_excluded_from_identity_inventory(self):
-        write_descriptor(self._tmp.name, "dev", "gg-oracle-fixture-a", pipeline="pa", role="source", deployment_type="oracle")
-        write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-b", pipeline="pb", role="target", deployment_type="mssql", enabled=False)
+        write_descriptor(self._tmp.name, "dev", "gg-oracle-fixture-a-001", pipeline="pa-001", role="source", deployment_type="oracle")
+        write_descriptor(self._tmp.name, "dev", "gg-mssql-fixture-b-001", pipeline="pb-001", role="target", deployment_type="mssql", enabled=False)
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         inventory = gdm.runtime_identity_inventory(active)
@@ -582,8 +641,8 @@ class NoPerDeploymentSecretTests(ScratchEnvironmentTestCase):
     """Test 7: no per-deployment runtime admin secret is ever derived; two deployments of the same role share one secret."""
 
     def test_two_sources_in_different_pipelines_share_the_same_admin_secret(self):
-        write_descriptor(self._tmp.name, "dev", "gg-source-a", pipeline="p1", role="source")
-        write_descriptor(self._tmp.name, "dev", "gg-source-b", pipeline="p2", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-source-a-001", pipeline="p1-001", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-source-b-001", pipeline="p2-001", role="source")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         names = {d["adminSecretName"] for d in active}
@@ -601,41 +660,41 @@ class ForbiddenOverrideTests(ScratchEnvironmentTestCase):
     """Tests 8-12: operator descriptors must not override any shared platform invariant."""
 
     def test_deployment_admin_secret_override_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          deployment_admin_secret="dev/goldengate/source/admin")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("adminSecret", invalid[0][1])
 
     def test_csi_admin_object_name_override_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          csi_admin_object_name="dev/goldengate/source/admin")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("csi.admin.objectName", invalid[0][1])
 
     def test_csi_certificate_object_name_override_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          csi_certificate_object_name="dev/goldengate/tls-certificate")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("csi.certificate.objectName", invalid[0][1])
 
     def test_csi_service_account_role_arn_override_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          csi_service_account_role_arn="arn:aws:iam::668311715351:role/GoldenGateSecretsReadRole-dev")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("serviceAccountRoleArn", invalid[0][1])
 
     def test_wrong_service_account_override_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", service_account_name="gg-something-else")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001", service_account_name="gg-something-else")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("runtime.serviceAccount", invalid[0][1])
 
     def test_service_account_create_override_is_rejected_even_when_literal_false(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          service_account_name="gg-oracle-sa", service_account_create=False)
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
@@ -643,39 +702,39 @@ class ForbiddenOverrideTests(ScratchEnvironmentTestCase):
 
     def test_a_correctly_named_service_account_override_is_still_rejected(self):
         # No operator override is ever tolerated, even one that happens to match the derived identity exactly.
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          service_account_name="gg-oracle-sa", service_account_create=False)
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_service_account_omitted_entirely_is_valid(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
 
     def test_image_repository_override_is_rejected(self):
         # runtime.image.repository is shared identity derived by the deployment model; a descriptor must never declare it directly.
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          image_repository_override="229410149234.dkr.ecr.eu-west-1.amazonaws.com/ogg-oracle")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("runtime.image.repository", invalid[0][1])
 
     def test_global_environment_override_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", global_environment_override="dev")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001", global_environment_override="dev")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("global.environment", invalid[0][1])
 
     def test_ingress_alb_group_name_override_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", ingress_alb_group_name="gg-poc-dev-alb")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001", ingress_alb_group_name="gg-poc-dev-alb")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("ingress.alb.groupName", invalid[0][1])
 
     def test_ingress_alb_certificate_arn_override_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          ingress_alb_certificate_arn="arn:aws:acm:eu-west-1:668311715351:certificate/00000000-0000-0000-0000-000000000000")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
@@ -686,84 +745,84 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
     """Environment-scoped derivation, ECR/name grammar, and EFS identity."""
 
     def test_admin_secret_is_scoped_to_the_selected_environment_not_hardcoded_dev(self):
-        write_descriptor(self._tmp.name, "sit", "gg-fixture-01")
+        write_descriptor(self._tmp.name, "sit", "gg-fixture-001")
         active, _inactive, invalid = gdm.scan("sit")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["adminSecretName"], "sit/goldengate/source/admin")
 
     def test_ingress_host_domain_declared_in_descriptor_fails(self):
         # ingress.hostDomain is shared environment configuration -- declaring it at all is a forbidden override, regardless of value.
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          ingress_host_domain="goldengate-dev.adcbmis.local")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_ecr_repository_name_with_digest_syntax_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          repository_name="ogg-oracle@sha256:" + "a" * 64)
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_ecr_repository_name_with_whitespace_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          repository_name="ogg oracle")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_ecr_repository_name_with_empty_suffix_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          repository_name="ogg-oracle/")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_ecr_repository_name_with_double_slash_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          repository_name="ogg//oracle")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_multi_segment_ecr_repository_name_passes(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001",
                          repository_name="goldengate/ogg-oracle")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
 
     def test_username_key_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", extra="dbUsername: admin\n")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001", extra="dbUsername: admin\n")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_token_key_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", extra="apiToken: xyz\n")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001", extra="apiToken: xyz\n")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_database_url_key_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", extra="databaseUrl: postgres://x\n")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001", extra="databaseUrl: postgres://x\n")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_jdbc_url_key_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", extra="jdbcUrl: jdbc:postgresql://x\n")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001", extra="jdbcUrl: jdbc:postgresql://x\n")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_efs_existing_mode_requires_safe_filesystem_id(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs",
                                              "efs": {"mode": "existing", "fileSystemId": "not-an-fs-id"}}))
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_efs_existing_mode_missing_filesystem_id_fails(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs",
                                              "efs": {"mode": "existing"}}))
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_efs_existing_mode_with_safe_filesystem_id_passes(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs",
                                              "efs": {"mode": "existing", "fileSystemId": "fs-0123456789abcdef0"}}))
         active, _inactive, invalid = gdm.scan("dev")
@@ -773,30 +832,30 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
         self.assertIsNone(active[0]["efsCreationToken"])
 
     def test_efs_managed_mode_forbids_committed_filesystem_id(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs",
                                              "efs": {"mode": "managed", "fileSystemId": "fs-0123456789abcdef0"}}))
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_efs_managed_mode_without_filesystem_id_passes_and_derives_token(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}))
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["efsMode"], "managed")
         self.assertIsNone(active[0]["efsFileSystemId"])
-        self.assertEqual(active[0]["efsCreationToken"], "dev-gg-fixture-01-efs")
+        self.assertEqual(active[0]["efsCreationToken"], "dev-gg-fixture-001-efs")
 
     def test_efs_missing_mode_fails(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs",
                                              "efs": {"fileSystemId": "fs-0123456789abcdef0"}}))
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_efs_invalid_mode_value_fails(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "auto"}}))
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
@@ -804,15 +863,16 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
     def test_efs_enabled_requires_u02_storage_type_efs(self):
         doc = _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}})
         doc["runtime"]["storage"]["u02"]["type"] = "emptyDir"
-        write_doc(self._tmp.name, "dev", "gg-fixture-01", doc)
+        write_doc(self._tmp.name, "dev", "gg-fixture-001", doc)
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_efs_creation_token_derivation_is_deterministic(self):
-        self.assertEqual(gdm.derive_efs_creation_token("dev", "gg-postgresql-repltest-01"),
-                         "dev-gg-postgresql-repltest-01-efs")
-        self.assertEqual(gdm.derive_efs_creation_token("dev", "gg-postgresql-repltest-01"),
-                         gdm.derive_efs_creation_token("dev", "gg-postgresql-repltest-01"))
+        # A generic ID deliberately distinct from the four real LEGACY_MANAGED_EFS_CREATION_TOKENS entries -- this proves the ORDINARY deterministic formula, not the Pipeline-Aware Descriptor Hierarchy Migration's own narrowly-scoped override (see PipelineAwareLegacyEfsTokenMigrationTests below for that).
+        self.assertEqual(gdm.derive_efs_creation_token("dev", "gg-generic-fixture-001"),
+                         "dev-gg-generic-fixture-001-efs")
+        self.assertEqual(gdm.derive_efs_creation_token("dev", "gg-generic-fixture-001"),
+                         gdm.derive_efs_creation_token("dev", "gg-generic-fixture-001"))
 
     def test_efs_creation_token_exceeding_limit_fails_closed(self):
         long_id = "gg-" + ("x" * 60) + "-fixture"
@@ -820,19 +880,19 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
             gdm.derive_efs_creation_token("dev", long_id)
 
     def test_efs_creation_token_never_truncated_or_hashed(self):
-        deployment_id = "gg-postgresql-repltest-01"
+        deployment_id = "gg-generic-fixture-001"
         token = gdm.derive_efs_creation_token("dev", deployment_id)
         self.assertIn(deployment_id, token)
 
     def test_efs_two_different_deployment_ids_derive_distinct_tokens(self):
-        token_a = gdm.derive_efs_creation_token("dev", "gg-postgresql-repltest-01")
-        token_b = gdm.derive_efs_creation_token("dev", "gg-mssql-repltest-01")
+        token_a = gdm.derive_efs_creation_token("dev", "gg-generic-fixture-a-001")
+        token_b = gdm.derive_efs_creation_token("dev", "gg-generic-fixture-b-001")
         self.assertNotEqual(token_a, token_b)
 
     def test_efs_two_managed_runtimes_validate_together_with_distinct_tokens(self):
-        write_doc(self._tmp.name, "dev", "gg-postgresql-repltest-01",
+        write_doc(self._tmp.name, "dev", "gg-postgresql-repltest-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}))
-        write_doc(self._tmp.name, "dev", "gg-mssql-repltest-01",
+        write_doc(self._tmp.name, "dev", "gg-mssql-repltest-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}))
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
@@ -842,49 +902,49 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
         self.assertEqual(len(set(tokens.values())), 2)
 
     def test_efs_disabled_persistence_skips_efs_validation(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": False}))
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertIsNone(active[0]["efsMode"])
 
     def test_persistence_enabled_string_true_fails_closed_not_silently_skipped(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": "true", "provider": "efs", "efs": {"mode": "managed"}}))
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("persistence.enabled must be a literal Boolean", invalid[0][1])
 
     def test_persistence_enabled_string_false_fails_closed(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": "false", "provider": "efs"}))
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("persistence.enabled must be a literal Boolean", invalid[0][1])
 
     def test_persistence_enabled_integer_one_fails_closed(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": 1, "provider": "efs"}))
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("persistence.enabled must be a literal Boolean", invalid[0][1])
 
     def test_persistence_enabled_literal_true_still_supported(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}))
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active[0]["efsMode"], "managed")
 
     def test_persistence_enabled_literal_false_still_supported(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": False}))
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertIsNone(active[0]["efsMode"])
 
     def test_derived_namespace_fields_present(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001")
         active, _inactive, _invalid = gdm.scan("dev")
         self.assertEqual(active[0]["runtimeNamespace"], "goldengate-dev")
         self.assertEqual(active[0]["monitoringNamespace"], "goldengate-monitoring")
@@ -905,14 +965,14 @@ class FullValidationGatingTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_full_validation_gate_trips_when_an_unrelated_folder_is_invalid(self):
-        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
-        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
+        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-001")
+        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-001", tag="latest")
         _active, _inactive, invalid, problems = gdm._run_full_validation("dev")
         self.assertTrue(invalid or problems)
 
     def test_shared_secrets_command_returns_nonzero_when_a_folder_is_invalid(self):
-        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
-        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
+        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-001")
+        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-001", tag="latest")
 
         class Args:
             environment = "dev"
@@ -925,12 +985,12 @@ class FullValidationGatingTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
 
     def test_describe_command_returns_nonzero_when_an_unrelated_folder_is_invalid(self):
-        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
-        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
+        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-001")
+        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-001", tag="latest")
 
         class Args:
             environment = "dev"
-            deployment_id = "gg-good-fixture-01"
+            deployment_id = "gg-good-fixture-001"
 
         import io
         from contextlib import redirect_stdout
@@ -940,8 +1000,8 @@ class FullValidationGatingTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
 
     def test_list_command_returns_nonzero_when_an_unrelated_folder_is_invalid(self):
-        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-01")
-        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
+        write_descriptor(self._tmp.name, "dev", "gg-good-fixture-001")
+        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-001", tag="latest")
 
         class Args:
             environment = "dev"
@@ -971,38 +1031,38 @@ class ManagedEfsInventoryCommandTests(ScratchEnvironmentTestCase):
         return exit_code, json.loads(buf.getvalue())
 
     def test_no_managed_descriptors_yields_empty_inventory(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "existing", "fileSystemId": "fs-0123456789abcdef0"}}))
         exit_code, inventory = self._run()
         self.assertEqual(exit_code, 0)
         self.assertEqual(inventory, [])
 
     def test_managed_descriptor_is_included_with_its_creation_token(self):
-        write_doc(self._tmp.name, "dev", "gg-fixture-01",
+        write_doc(self._tmp.name, "dev", "gg-fixture-001",
                  _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}))
         exit_code, inventory = self._run()
         self.assertEqual(exit_code, 0)
-        self.assertEqual(inventory, [{"deploymentId": "gg-fixture-01", "efsCreationToken": "dev-gg-fixture-01-efs"}])
+        self.assertEqual(inventory, [{"deploymentId": "gg-fixture-001", "efsCreationToken": "dev-gg-fixture-001-efs"}])
 
     def test_deployment_disabled_managed_descriptor_is_still_included(self):
         # GoldenGate Runtime Desired-State Simplification: deployment.enabled=false (never the retired lifecycle.state=absent) is now the shape that keeps a managed-EFS descriptor's storage in the expected/protected inventory while excluding it from the active runtime set -- EFS remains retained, not decommissioned, purely because the descriptor is inactive.
         doc = _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}})
         doc["deployment"]["enabled"] = False
-        write_doc(self._tmp.name, "dev", "gg-fixture-01", doc)
+        write_doc(self._tmp.name, "dev", "gg-fixture-001", doc)
         exit_code, inventory = self._run()
         self.assertEqual(exit_code, 0)
-        self.assertEqual(inventory, [{"deploymentId": "gg-fixture-01", "efsCreationToken": "dev-gg-fixture-01-efs"}])
+        self.assertEqual(inventory, [{"deploymentId": "gg-fixture-001", "efsCreationToken": "dev-gg-fixture-001-efs"}])
 
     def test_two_managed_descriptors_produce_two_distinct_entries(self):
         source_doc = _efs_test_doc(persistence={"enabled": True, "provider": "efs", "efs": {"mode": "managed"}})
         target_doc = copy.deepcopy(source_doc)
         target_doc["deployment"]["role"] = "target"
-        write_doc(self._tmp.name, "dev", "gg-postgresql-repltest-01", source_doc)
-        write_doc(self._tmp.name, "dev", "gg-mssql-repltest-01", target_doc)
+        write_doc(self._tmp.name, "dev", "gg-postgresql-repltest-001", source_doc)
+        write_doc(self._tmp.name, "dev", "gg-mssql-repltest-001", target_doc)
         exit_code, inventory = self._run()
         self.assertEqual(exit_code, 0)
         self.assertEqual(len(inventory), 2)
-        self.assertEqual({i["deploymentId"] for i in inventory}, {"gg-postgresql-repltest-01", "gg-mssql-repltest-01"})
+        self.assertEqual({i["deploymentId"] for i in inventory}, {"gg-postgresql-repltest-001", "gg-mssql-repltest-001"})
         self.assertEqual(len({i["efsCreationToken"] for i in inventory}), 2)
 
 
@@ -1010,7 +1070,7 @@ class SharedSecretsCommandTests(ScratchEnvironmentTestCase):
     """Test 29 support: the shared-secrets command output shape."""
 
     def test_shared_secrets_command_prints_exactly_three_identifiers(self):
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001")
 
         class Args:
             environment = "dev"
@@ -1033,14 +1093,14 @@ class DeploymentEnabledClassificationTests(ScratchEnvironmentTestCase):
     """deployment.enabled is the SOLE runtime-presence control (GoldenGate Runtime Desired-State Simplification): a disabled runtime validates but is excluded from active inventory; lifecycle.state is retired and rejected outright as invalid, never treated as a second source of truth."""
 
     def test_disabled_runtime_validates_but_excluded(self):
-        write_descriptor(self._tmp.name, "dev", "gg-disabled-fixture-01", enabled=False)
+        write_descriptor(self._tmp.name, "dev", "gg-disabled-fixture-001", enabled=False)
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(active, [])
         self.assertEqual(len(inactive), 1)
 
     def test_lifecycle_block_is_rejected_never_a_second_presence_control(self):
-        write_descriptor(self._tmp.name, "dev", "gg-stale-lifecycle-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-stale-lifecycle-fixture-001",
                          extra="\nlifecycle:\n  state: absent\n")
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(active, [])
@@ -1051,7 +1111,7 @@ class DeploymentEnabledClassificationTests(ScratchEnvironmentTestCase):
 
     def test_lifecycle_block_rejected_even_when_deployment_enabled_true(self):
         # A stale lifecycle block must be rejected regardless of deployment.enabled's own value -- never silently ignored merely because enabled=true would otherwise mean "active".
-        write_descriptor(self._tmp.name, "dev", "gg-stale-lifecycle-active-fixture-01", enabled=True,
+        write_descriptor(self._tmp.name, "dev", "gg-stale-lifecycle-active-fixture-001", enabled=True,
                          extra="\nlifecycle:\n  state: active\n")
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(active, [])
@@ -1060,7 +1120,7 @@ class DeploymentEnabledClassificationTests(ScratchEnvironmentTestCase):
 
     def test_descriptor_dict_no_longer_carries_a_lifecycle_state_key(self):
         # Structural proof: the parsed descriptor dict itself no longer has a lifecycleState field at all -- there is no lingering internal second source of truth, even for a caller that bypasses classify_folder's active/inactive decision.
-        write_descriptor(self._tmp.name, "dev", "gg-fixture-01")
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001")
         active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(len(active), 1)
@@ -1071,7 +1131,7 @@ class ReplicationKeyTombstoneTests(ScratchEnvironmentTestCase):
     """Automated Replication Implementation Removal (Task 4): the complete declarative/automated GoldenGate replication-provisioning schema is retired -- a top-level `replication` key, in ANY shape, is rejected outright by _reject_replication_key_presence(), regardless of deployment.enabled. Supersedes the retired ReplicationRequiresDeploymentEnabledTests, which asserted a now-nonexistent replication.enabled=true/deployment.enabled=false interaction."""
 
     def test_replication_key_null_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-legacy-replication-null-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-legacy-replication-null-fixture-001",
                          extra="\nreplication: null\n")
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(active, [])
@@ -1081,21 +1141,21 @@ class ReplicationKeyTombstoneTests(ScratchEnvironmentTestCase):
         self.assertIn("unsupported descriptor key: top-level replication automation has been retired", reason)
 
     def test_replication_key_empty_mapping_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-legacy-replication-empty-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-legacy-replication-empty-fixture-001",
                          extra="\nreplication: {}\n")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("unsupported descriptor key: top-level replication automation has been retired", invalid[0][1])
 
     def test_replication_key_enabled_false_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-legacy-replication-false-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-legacy-replication-false-fixture-001",
                          extra="\nreplication:\n  enabled: false\n")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("unsupported descriptor key: top-level replication automation has been retired", invalid[0][1])
 
     def test_replication_key_enabled_true_is_rejected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-legacy-replication-true-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-legacy-replication-true-fixture-001",
                          extra="\nreplication:\n  enabled: true\n")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
@@ -1103,7 +1163,7 @@ class ReplicationKeyTombstoneTests(ScratchEnvironmentTestCase):
 
     def test_replication_key_rejected_regardless_of_deployment_enabled(self):
         # The tombstone fires before deployment.enabled is even considered -- a disabled runtime with a stale replication key is rejected outright, never silently classified inactive.
-        write_descriptor(self._tmp.name, "dev", "gg-legacy-replication-disabled-fixture-01", enabled=False,
+        write_descriptor(self._tmp.name, "dev", "gg-legacy-replication-disabled-fixture-001", enabled=False,
                          extra="\nreplication:\n  enabled: false\n")
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(active, [])
@@ -1111,7 +1171,7 @@ class ReplicationKeyTombstoneTests(ScratchEnvironmentTestCase):
         self.assertEqual(len(invalid), 1)
 
     def test_descriptor_without_replication_key_is_unaffected(self):
-        write_descriptor(self._tmp.name, "dev", "gg-no-replication-fixture-01", enabled=True)
+        write_descriptor(self._tmp.name, "dev", "gg-no-replication-fixture-001", enabled=True)
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(invalid, [])
         self.assertEqual(inactive, [])
@@ -1120,61 +1180,151 @@ class ReplicationKeyTombstoneTests(ScratchEnvironmentTestCase):
         self.assertNotIn("replicationEnabled", active[0])
 
 
+class PipelineSuffixCorrelationContractTests(ScratchEnvironmentTestCase):
+    """Pipeline-Aware Descriptor Hierarchy (contracts B, E, F, G -- test requirements 7-10, 13, 14): the parent pipeline folder must exactly equal deployment.pipeline; both pipeline IDs and deployment IDs must end in a 3-digit correlation suffix (-NNN); the two suffixes must match exactly."""
+
+    def test_pipeline_id_lacking_three_digit_suffix_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001", pipeline="no-suffix-pipeline", role="source")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("3-digit", invalid[0][1])
+
+    def test_pipeline_id_with_only_two_digit_suffix_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-001", pipeline="two-digit-pipeline-01", role="source")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_deployment_id_lacking_three_digit_suffix_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-no-suffix", pipeline="test-pipeline-001", role="source")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("3-digit", invalid[0][1])
+
+    def test_deployment_id_with_only_two_digit_suffix_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-01", pipeline="test-pipeline-001", role="source")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+
+    def test_pipeline_suffix_not_equal_deployment_suffix_is_rejected(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-002", pipeline="test-pipeline-001", role="source")
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("correlation mismatch", invalid[0][1])
+
+    def test_pipeline_folder_not_equal_declared_pipeline_is_rejected(self):
+        # The folder is physically "test-pipeline-001" but the descriptor's OWN deployment.pipeline field claims a different (but still validly-suffixed) value -- contract B, independent of the suffix-correlation contract (both share suffix -001, so only the folder/field-equality check can catch this).
+        path = write_descriptor(self._tmp.name, "dev", "gg-fixture-001", pipeline="test-pipeline-001", role="source")
+        with open(path) as f:
+            content = f.read()
+        content = content.replace("pipeline: test-pipeline-001", "pipeline: some-other-pipeline-001")
+        with open(path, "w") as f:
+            f.write(content)
+        _active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("canonical path mismatch", invalid[0][1])
+
+    def test_correctly_suffixed_and_correlated_descriptor_passes(self):
+        write_descriptor(self._tmp.name, "dev", "gg-fixture-042", pipeline="some-pipeline-042", role="source")
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(active[0]["deploymentId"], "gg-fixture-042")
+        self.assertEqual(active[0]["pipeline"], "some-pipeline-042")
+
+    def test_different_pipelines_each_independently_contain_source_and_target(self):
+        # Test requirement 13.
+        write_descriptor(self._tmp.name, "dev", "gg-alpha-source-001", pipeline="alpha-pipeline-001", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-alpha-target-001", pipeline="alpha-pipeline-001", role="target")
+        write_descriptor(self._tmp.name, "dev", "gg-beta-source-002", pipeline="beta-pipeline-002", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-beta-target-002", pipeline="beta-pipeline-002", role="target")
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(gdm.validate("dev"), [])
+        by_pipeline_role = {(d["pipeline"], d["role"]): d["deploymentId"] for d in active}
+        self.assertEqual(by_pipeline_role[("alpha-pipeline-001", "source")], "gg-alpha-source-001")
+        self.assertEqual(by_pipeline_role[("alpha-pipeline-001", "target")], "gg-alpha-target-001")
+        self.assertEqual(by_pipeline_role[("beta-pipeline-002", "source")], "gg-beta-source-002")
+        self.assertEqual(by_pipeline_role[("beta-pipeline-002", "target")], "gg-beta-target-002")
+
+    def test_a_future_valid_pipeline_and_runtime_require_no_central_code_list_edit(self):
+        # Test requirement 14: onboarding is entirely folder-driven -- a brand-new pipeline/deployment ID pair (never referenced anywhere in source) is discovered and validated automatically.
+        write_descriptor(self._tmp.name, "dev", "gg-brandnew-runtime-003", pipeline="brandnew-future-pipeline-003", role="source", deployment_type="cassandra")
+        active, _inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["deploymentId"], "gg-brandnew-runtime-003")
+        self.assertEqual(active[0]["pipeline"], "brandnew-future-pipeline-003")
+        self.assertEqual(active[0]["runtimeServiceAccountName"], "gg-runtime-sa")
+
+
 class FailClosedTests(ScratchEnvironmentTestCase):
     """Malformed/invalid candidates never silently disappear."""
 
     def test_malformed_yaml_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-malformed-fixture-01", raw_override="deployment: [unterminated")
+        write_descriptor(self._tmp.name, "dev", "gg-malformed-fixture-001", raw_override="deployment: [unterminated")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_duplicate_yaml_keys_fail(self):
         raw = "deployment:\n  enabled: true\n  enabled: false\n"
-        write_descriptor(self._tmp.name, "dev", "gg-dup-key-fixture-01", raw_override=raw)
+        write_descriptor(self._tmp.name, "dev", "gg-dup-key-fixture-001", raw_override=raw)
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_invalid_runtime_candidate_is_not_silently_ignored(self):
-        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-01", tag="latest")
+        write_descriptor(self._tmp.name, "dev", "gg-bad-fixture-001", tag="latest")
         _active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(inactive, [])
         self.assertEqual(len(invalid), 1)
         path, reason = invalid[0]
-        self.assertIn("gg-bad-fixture-01", path)
+        self.assertIn("gg-bad-fixture-001", path)
         self.assertTrue(reason)
 
-    def test_non_runtime_folder_ignored_only_when_explicitly_recognized(self):
+    def test_argocd_and_monitor_values_files_are_never_treated_as_runtime_descriptors(self):
+        # Pipeline-Aware Descriptor Hierarchy (test requirement 15): both are siblings of pipelines/, never inside it -- find_values_files()'s own pipelines/*/*/values.yaml pattern structurally excludes them; they are never even reported as invalid, since they are never discovered at all.
         os.makedirs(os.path.join(self._tmp.name, "envs", "dev", "argocd"), exist_ok=True)
         with open(os.path.join(self._tmp.name, "envs", "dev", "argocd", "values.yaml"), "w") as f:
             f.write("unrelated: true\n")
+        os.makedirs(os.path.join(self._tmp.name, "envs", "dev", "goldengate-monitor"), exist_ok=True)
+        with open(os.path.join(self._tmp.name, "envs", "dev", "goldengate-monitor", "values.yaml"), "w") as f:
+            f.write("unrelated: true\n")
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(active, [])
+        self.assertEqual(inactive, [])
+        self.assertEqual(invalid, [])
+
+    def test_values_yaml_outside_the_canonical_pipelines_layout_is_never_adopted(self):
+        # Pipeline-Aware Descriptor Hierarchy (test requirement 16): a values.yaml at the wrong depth under pipelines/ (a pipeline folder with no deployment-id leaf) and an unrelated nested folder elsewhere under envs/dev are both outside the pipelines/*/*/values.yaml discovery pattern -- never silently adopted, never even reported as invalid.
+        os.makedirs(os.path.join(self._tmp.name, "envs", "dev", "pipelines", "some-pipeline-001"), exist_ok=True)
+        with open(os.path.join(self._tmp.name, "envs", "dev", "pipelines", "some-pipeline-001", "values.yaml"), "w") as f:
+            f.write("deploymentModel: singleRuntime\n")
         os.makedirs(os.path.join(self._tmp.name, "envs", "dev", "some-other-config"), exist_ok=True)
         with open(os.path.join(self._tmp.name, "envs", "dev", "some-other-config", "values.yaml"), "w") as f:
             f.write("unrelated: true\n")
-        _active, _inactive, invalid = gdm.scan("dev")
-        invalid_paths = [p for p, _r in invalid]
-        self.assertFalse(any("argocd" in p for p in invalid_paths))
-        self.assertTrue(any("some-other-config" in p for p in invalid_paths))
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(active, [])
+        self.assertEqual(inactive, [])
+        self.assertEqual(invalid, [])
 
     def test_duplicate_source_role_in_one_pipeline_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-source-a", pipeline="p1", role="source")
-        write_descriptor(self._tmp.name, "dev", "gg-source-b", pipeline="p1", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-source-a-001", pipeline="p1-001", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-source-b-001", pipeline="p1-001", role="source")
         problems = gdm.validate("dev")
         self.assertTrue(any("more than one source" in p for p in problems))
 
     def test_duplicate_target_role_in_one_pipeline_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-target-a", pipeline="p1", role="target")
-        write_descriptor(self._tmp.name, "dev", "gg-target-b", pipeline="p1", role="target")
+        write_descriptor(self._tmp.name, "dev", "gg-target-a-001", pipeline="p1-001", role="target")
+        write_descriptor(self._tmp.name, "dev", "gg-target-b-001", pipeline="p1-001", role="target")
         problems = gdm.validate("dev")
         self.assertTrue(any("more than one target" in p for p in problems))
 
     def test_duplicate_alb_group_order_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-alb-a", pipeline="p1", role="source", alb_group_order="110")
-        write_descriptor(self._tmp.name, "dev", "gg-alb-b", pipeline="p2", role="source", alb_group_order="110")
+        write_descriptor(self._tmp.name, "dev", "gg-alb-a-001", pipeline="p1-001", role="source", alb_group_order="110")
+        write_descriptor(self._tmp.name, "dev", "gg-alb-b-001", pipeline="p2-001", role="source", alb_group_order="110")
         problems = gdm.validate("dev")
         self.assertTrue(any("duplicate ALB group order" in p for p in problems))
 
     def test_latest_image_tag_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-latest-fixture-01", tag="latest")
+        write_descriptor(self._tmp.name, "dev", "gg-latest-fixture-001", tag="latest")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertIn("latest", invalid[0][1])
@@ -1182,16 +1332,16 @@ class FailClosedTests(ScratchEnvironmentTestCase):
     # test_public_image_repository_fails/test_wrong_ecr_account_fails no longer apply: a descriptor can't declare a full repository string at all; see test_image_repository_override_is_rejected above.
 
     def test_embedded_credentials_fail(self):
-        write_descriptor(self._tmp.name, "dev", "gg-cred-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-cred-fixture-001",
                          extra="\nadminPassword: hunter2\n")
         _active, _inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
         self.assertNotIn("hunter2", invalid[0][1])
 
     def test_boolean_like_string_enabled_fails(self):
-        write_descriptor(self._tmp.name, "dev", "gg-boolstr-fixture-01",
+        write_descriptor(self._tmp.name, "dev", "gg-boolstr-fixture-001",
                          raw_override=BASE_DESCRIPTOR.format(
-                             enabled='"true"', pipeline="p1", role="source",
+                             enabled='"true"', pipeline="p1-001", role="source",
                              deployment_admin_secret_block="", deployment_type="oracle",
                              repository_name="ogg-oracle", tag="1.0.0",
                              service_account_block="", csi_role_arn_block="", csi_admin_object_name_block="",
@@ -1217,23 +1367,23 @@ class RegistryDeterminismTests(ScratchEnvironmentTestCase):
 
     def test_registry_output_is_deterministic(self):
         self._write_platform_and_monitor_fixtures()
-        write_descriptor(self._tmp.name, "dev", "gg-b-fixture", pipeline="p1", role="source")
-        write_descriptor(self._tmp.name, "dev", "gg-a-fixture", pipeline="p2", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-b-fixture-001", pipeline="p1-001", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-a-fixture-001", pipeline="p2-001", role="source")
         first = gdm.build_registry("dev")
         second = gdm.build_registry("dev")
         self.assertEqual(first, second)
 
     def test_deployment_ordering_is_deterministic(self):
         self._write_platform_and_monitor_fixtures()
-        write_descriptor(self._tmp.name, "dev", "gg-zzz-fixture", pipeline="p1", role="source")
-        write_descriptor(self._tmp.name, "dev", "gg-aaa-fixture", pipeline="p2", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-zzz-fixture-001", pipeline="p1-001", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-aaa-fixture-001", pipeline="p2-001", role="source")
         registry = gdm.build_registry("dev")
         names = [d["name"] for d in registry["deployments"]]
         self.assertEqual(names, sorted(names))
 
     def test_registry_contains_no_credential_values(self):
         self._write_platform_and_monitor_fixtures()
-        write_descriptor(self._tmp.name, "dev", "gg-secret-fixture-01", pipeline="p1", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-secret-fixture-001", pipeline="p1-001", role="source")
         import yaml
         text = yaml.safe_dump(gdm.build_registry("dev"))
         for forbidden in ("hunter2", "OGG_ADMIN_PWD", "-----BEGIN"):
@@ -1241,30 +1391,30 @@ class RegistryDeterminismTests(ScratchEnvironmentTestCase):
 
     def test_two_sources_sharing_one_secret_get_distinct_registry_entries(self):
         self._write_platform_and_monitor_fixtures()
-        write_descriptor(self._tmp.name, "dev", "gg-source-a", pipeline="p1", role="source")
-        write_descriptor(self._tmp.name, "dev", "gg-source-b", pipeline="p2", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-source-a-001", pipeline="p1-001", role="source")
+        write_descriptor(self._tmp.name, "dev", "gg-source-b-001", pipeline="p2-001", role="source")
         registry = gdm.build_registry("dev")
         entries = {d["name"]: d["adminSecret"] for d in registry["deployments"]}
         self.assertEqual(entries, {
-            "gg-source-a": "dev/goldengate/source/admin",
-            "gg-source-b": "dev/goldengate/source/admin",
+            "gg-source-a-001": "dev/goldengate/source/admin",
+            "gg-source-b-001": "dev/goldengate/source/admin",
         })
 
     def test_two_targets_sharing_one_secret_get_distinct_registry_entries(self):
         self._write_platform_and_monitor_fixtures()
-        write_descriptor(self._tmp.name, "dev", "gg-target-a", pipeline="p1", role="target")
-        write_descriptor(self._tmp.name, "dev", "gg-target-b", pipeline="p2", role="target")
+        write_descriptor(self._tmp.name, "dev", "gg-target-a-001", pipeline="p1-001", role="target")
+        write_descriptor(self._tmp.name, "dev", "gg-target-b-001", pipeline="p2-001", role="target")
         registry = gdm.build_registry("dev")
         entries = {d["name"]: d["adminSecret"] for d in registry["deployments"]}
         self.assertEqual(entries, {
-            "gg-target-a": "dev/goldengate/target/admin",
-            "gg-target-b": "dev/goldengate/target/admin",
+            "gg-target-a-001": "dev/goldengate/target/admin",
+            "gg-target-b-001": "dev/goldengate/target/admin",
         })
 
 
 def _minimal_shape_doc(runtime_overrides=None, ingress_overrides=None):
     doc = {
-        "deployment": {"enabled": True, "pipeline": "test-pipeline", "role": "source"},
+        "deployment": {"enabled": True, "pipeline": "test-pipeline-001", "role": "source"},
         "deploymentModel": "singleRuntime",
         "runtime": {
             "deploymentType": "oracle",
@@ -1292,7 +1442,7 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
         return by_id[deployment_id]
 
     def test_defaults_when_fields_absent(self):
-        d = self._describe("gg-shape-01", _minimal_shape_doc())
+        d = self._describe("gg-shape-001", _minimal_shape_doc())
         self.assertEqual(d["replicas"], 1)
         self.assertEqual(d["serviceType"], "ClusterIP")
         self.assertEqual(d["servicePorts"], {"https": None, "dist": None, "receiver": None, "metrics": None})
@@ -1301,29 +1451,29 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
         self.assertEqual(d["ingressClassName"], "alb")
         # A: default hostname resolution -- no explicit ingress.host, so "<deploymentId>.<dnsDomain>" (the SAME precedence helm/goldengate.runtimeIngressHost implements), derived from the scratch environment's own dnsDomain rather than hardcoded.
         dns_domain = gdm._environment_derived_values("dev")["DNS_DOMAIN"]
-        self.assertEqual(d["runtimeIngressHost"], f"gg-shape-01.{dns_domain}")
+        self.assertEqual(d["runtimeIngressHost"], f"gg-shape-001.{dns_domain}")
 
     def test_explicit_ingress_host_override_is_used_verbatim(self):
         # B: an explicit ingress.host wins outright -- the default "<deploymentId>.<dnsDomain>" hostname must NOT be used.
         doc = _minimal_shape_doc(ingress_overrides={"host": "custom-runtime.example.internal"})
-        d = self._describe("gg-shape-07", doc)
+        d = self._describe("gg-shape-001", doc)
         self.assertEqual(d["runtimeIngressHost"], "custom-runtime.example.internal")
         dns_domain = gdm._environment_derived_values("dev")["DNS_DOMAIN"]
-        self.assertNotEqual(d["runtimeIngressHost"], f"gg-shape-07.{dns_domain}")
+        self.assertNotEqual(d["runtimeIngressHost"], f"gg-shape-001.{dns_domain}")
 
     def test_empty_string_ingress_host_falls_back_to_the_default(self):
         # Matches Helm's own {{ if .Values.ingress.host }} truthiness -- an empty string is treated exactly like an absent key, never as "explicitly set to empty".
         doc = _minimal_shape_doc(ingress_overrides={"host": ""})
-        d = self._describe("gg-shape-08", doc)
+        d = self._describe("gg-shape-001", doc)
         dns_domain = gdm._environment_derived_values("dev")["DNS_DOMAIN"]
-        self.assertEqual(d["runtimeIngressHost"], f"gg-shape-08.{dns_domain}")
+        self.assertEqual(d["runtimeIngressHost"], f"gg-shape-001.{dns_domain}")
 
     def test_invalid_ingress_host_shape_is_rejected(self):
         # J: a malformed ingress.host (whitespace, no dot, uppercase) must fail closed -- never silently coerced or defaulted.
         for bad_host in ("not a valid host", "nohostdotatall", "Custom-Runtime.Example.Internal"):
             with self.subTest(bad_host=bad_host):
                 doc = _minimal_shape_doc(ingress_overrides={"host": bad_host})
-                write_doc(self._tmp.name, "dev", "gg-shape-09", doc)
+                write_doc(self._tmp.name, "dev", "gg-shape-001", doc)
                 active, inactive, invalid = gdm.scan("dev")
                 self.assertEqual(len(invalid), 1)
 
@@ -1331,7 +1481,7 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
         for bad_host in (123, True, ["custom-runtime.example.internal"], {"host": "x"}):
             with self.subTest(bad_host=bad_host):
                 doc = _minimal_shape_doc(ingress_overrides={"host": bad_host})
-                write_doc(self._tmp.name, "dev", "gg-shape-10", doc)
+                write_doc(self._tmp.name, "dev", "gg-shape-001", doc)
                 active, inactive, invalid = gdm.scan("dev")
                 self.assertEqual(len(invalid), 1)
 
@@ -1344,7 +1494,7 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
             },
             ingress_overrides={"className": "alb"},
         )
-        d = self._describe("gg-shape-02", doc)
+        d = self._describe("gg-shape-001", doc)
         self.assertEqual(d["servicePorts"]["https"], 8443)
         self.assertEqual(d["servicePorts"]["dist"], 9013)
         self.assertIsNone(d["servicePorts"]["receiver"])
@@ -1353,25 +1503,25 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
 
     def test_invalid_replicas_is_rejected(self):
         doc = _minimal_shape_doc(runtime_overrides={"replicas": 0})
-        write_doc(self._tmp.name, "dev", "gg-shape-03", doc)
+        write_doc(self._tmp.name, "dev", "gg-shape-001", doc)
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_invalid_port_is_rejected(self):
         doc = _minimal_shape_doc(runtime_overrides={"service": {"ports": {"https": 99999}}})
-        write_doc(self._tmp.name, "dev", "gg-shape-04", doc)
+        write_doc(self._tmp.name, "dev", "gg-shape-001", doc)
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_invalid_ingress_enabled_type_is_rejected(self):
         doc = _minimal_shape_doc(ingress_overrides={"enabled": "yes"})
-        write_doc(self._tmp.name, "dev", "gg-shape-05", doc)
+        write_doc(self._tmp.name, "dev", "gg-shape-001", doc)
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_invalid_init_permissions_enabled_type_is_rejected(self):
         doc = _minimal_shape_doc(runtime_overrides={"initPermissions": {"enabled": "yes"}})
-        write_doc(self._tmp.name, "dev", "gg-shape-06", doc)
+        write_doc(self._tmp.name, "dev", "gg-shape-001", doc)
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
@@ -1412,7 +1562,7 @@ class CsiAndStorageFieldsTests(ScratchEnvironmentTestCase):
 
     def test_defaults_when_csi_disabled(self):
         doc = _minimal_shape_doc(runtime_overrides={"csi": {"enabled": False, "admin": {"enabled": False}, "certificate": {"enabled": False}}})
-        d = self._describe("gg-csi-01", doc)
+        d = self._describe("gg-csi-001", doc)
         self.assertFalse(d["csiEnabled"])
         self.assertFalse(d["csiAdminEnabled"])
         self.assertIsNone(d["csiAdminMountPath"])
@@ -1420,7 +1570,7 @@ class CsiAndStorageFieldsTests(ScratchEnvironmentTestCase):
         self.assertIsNone(d["csiCertificateMountPath"])
 
     def test_csi_enabled_reflects_exact_mount_paths(self):
-        d = self._describe("gg-csi-02", _minimal_shape_doc())
+        d = self._describe("gg-csi-001", _minimal_shape_doc())
         self.assertTrue(d["csiEnabled"])
         self.assertTrue(d["csiAdminEnabled"])
         self.assertEqual(d["csiAdminMountPath"], "/mnt/secrets-store/admin")
@@ -1429,34 +1579,34 @@ class CsiAndStorageFieldsTests(ScratchEnvironmentTestCase):
 
     def test_admin_enabled_without_mount_path_is_rejected(self):
         doc = _minimal_shape_doc(runtime_overrides={"csi": {"enabled": True, "admin": {"enabled": True}, "certificate": {"enabled": True, "mountPath": "/etc/nginx/cert"}}})
-        write_doc(self._tmp.name, "dev", "gg-csi-03", doc)
+        write_doc(self._tmp.name, "dev", "gg-csi-001", doc)
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_certificate_enabled_without_mount_path_is_rejected(self):
         doc = _minimal_shape_doc(runtime_overrides={"csi": {"enabled": True, "admin": {"enabled": True, "mountPath": "/mnt/secrets-store/admin"}, "certificate": {"enabled": True}}})
-        write_doc(self._tmp.name, "dev", "gg-csi-04", doc)
+        write_doc(self._tmp.name, "dev", "gg-csi-001", doc)
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
     def test_u02_type_efs_is_reflected(self):
         doc = _minimal_shape_doc(runtime_overrides={"storage": {"u02": {"type": "efs"}}})
-        d = self._describe("gg-csi-05", doc)
+        d = self._describe("gg-csi-001", doc)
         self.assertEqual(d["u02Type"], "efs")
 
     def test_u02_type_existing_claim_is_reflected(self):
         doc = _minimal_shape_doc(runtime_overrides={"storage": {"u02": {"type": "existingClaim", "existingClaim": "external-claim-01"}}})
-        d = self._describe("gg-csi-06", doc)
+        d = self._describe("gg-csi-001", doc)
         self.assertEqual(d["u02Type"], "existingClaim")
         self.assertEqual(d["pvcClaimName"], "external-claim-01")
 
     def test_u02_type_empty_dir_is_reflected(self):
         doc = _minimal_shape_doc(runtime_overrides={"storage": {"u02": {"type": "emptyDir"}}})
-        d = self._describe("gg-csi-07", doc)
+        d = self._describe("gg-csi-001", doc)
         self.assertEqual(d["u02Type"], "emptyDir")
 
     def test_extra_volume_names_default_empty(self):
-        d = self._describe("gg-csi-08", _minimal_shape_doc())
+        d = self._describe("gg-csi-001", _minimal_shape_doc())
         self.assertEqual(d["extraVolumeNames"], [])
         self.assertEqual(d["extraVolumeMountNames"], [])
 
@@ -1465,7 +1615,7 @@ class CsiAndStorageFieldsTests(ScratchEnvironmentTestCase):
             "extraVolumes": [{"name": "custom-vol", "emptyDir": {}}],
             "extraVolumeMounts": [{"name": "custom-vol", "mountPath": "/custom"}],
         })
-        d = self._describe("gg-csi-09", doc)
+        d = self._describe("gg-csi-001", doc)
         self.assertEqual(d["extraVolumeNames"], ["custom-vol"])
         self.assertEqual(d["extraVolumeMountNames"], ["custom-vol"])
         gdm.REPO_ROOT = self._tmp.name
