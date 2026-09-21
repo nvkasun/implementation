@@ -6530,6 +6530,176 @@ else
   skip "EFS-DECOMMISSION: managed EFS decommission allowlist checks -- python3 unavailable"
 fi
 
+echo ""
+echo "--- Managed EFS Identity Migration Correction: Terraform moved-block state-address proof ---"
+
+# Structural proof: exactly the four required moved blocks exist in envs/dev/efs.tf, each mapping the OLD for_each key to its EXACT NEW key, and no unexpected fifth block exists (never a general onboarding mechanism).
+if [ "$PYTHON_AVAILABLE" = "true" ]; then
+  MOVED_BLOCK_CHECK="$(python3 -c '
+import re
+
+with open("envs/dev/efs.tf") as f:
+    efs_tf = f.read()
+
+results = []
+
+
+def check(label, ok):
+    results.append((label, ok))
+
+
+REQUIRED_PAIRS = [
+    ("gg-postgresql-repltest-01", "gg-postgresql-repltest-001"),
+    ("gg-mssql-repltest-01", "gg-mssql-repltest-001"),
+    ("gg-oracle-repltest-01", "gg-oracle-repltest-002"),
+    ("gg-postgresql-repltest-02", "gg-postgresql-repltest-002"),
+]
+
+moved_blocks = re.findall(r"moved \{\s*from\s*=\s*module\.goldengate_runtime_efs\[\"([^\"]+)\"\]\s*to\s*=\s*module\.goldengate_runtime_efs\[\"([^\"]+)\"\]\s*\}", efs_tf)
+
+check("1: exactly four moved blocks exist for module.goldengate_runtime_efs", len(moved_blocks) == 4)
+check("1: all four required (OLD -> NEW) module-instance renames are present", sorted(moved_blocks) == sorted(REQUIRED_PAIRS))
+
+for old_id, new_id in REQUIRED_PAIRS:
+    check(f"1: moved block exists: module.goldengate_runtime_efs[{old_id!r}] -> module.goldengate_runtime_efs[{new_id!r}]", (old_id, new_id) in moved_blocks)
+
+check("2: no moved block exists for any ID outside the four bounded pairs (never a general onboarding mechanism)", all(pair in REQUIRED_PAIRS for pair in moved_blocks))
+check("2: no moved block exists mapping a NEW id back to itself or to any other NEW id (no future-runtime placeholder)", not any(old_id.endswith(("-001", "-002")) for old_id, _new_id in moved_blocks))
+
+# The moved blocks must appear BEFORE the module block they retarget -- Terraform accepts moved blocks anywhere in the configuration, but placing them immediately before the resource they describe is this repository'"'"'s own documented convention (see envs/dev/dynamodb.tf).
+module_index = efs_tf.find("module \"goldengate_runtime_efs\" {")
+first_moved_index = efs_tf.find("moved {")
+check("moved blocks appear before the module \"goldengate_runtime_efs\" block they retarget", first_moved_index != -1 and module_index != -1 and first_moved_index < module_index)
+
+# The misleading claim this correction fixes ("same creation_token means Terraform treats a changed for_each key as the same resource") must never appear anywhere in this repository'"'"'s own comments -- the moved blocks plus this comment (documenting WHY creation_token alone is insufficient) are the correction.
+with open("automation/goldengate-deployment-model.py") as f:
+    deployment_model_source = f.read()
+check("automation/goldengate-deployment-model.py no longer implies creation_token equality alone preserves a Terraform for_each-keyed resource across a key rename", "the SAME value as before -- no ForceNew diff" not in deployment_model_source and "no destroy/recreate" not in deployment_model_source)
+check("envs/dev/efs.tf documents the correction: creation_token equality is necessary but not sufficient without moved blocks", "NOT correlate" in efs_tf or "not sufficient" in efs_tf or "necessary-but-not-sufficient" in efs_tf)
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+' 2>&1)"
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL\ *) fail "MOVED-BLOCK: ${line#FAIL }" ;;
+      OK\ *) pass "MOVED-BLOCK: ${line#OK }" ;;
+    esac
+  done <<< "$MOVED_BLOCK_CHECK"
+else
+  skip "MOVED-BLOCK: structural moved-block checks -- python3 unavailable"
+fi
+
+# Behavioral proof (offline, no real backend, no AWS): Terraform's own moved-block semantics, exercised against a local stub module (terraform_data -- a Terraform-core builtin resource type requiring no provider download/network/credentials) that mirrors the ONE contract this correction actually depends on: an unchanged `name`/creation-token-equivalent input argument across a for_each key rename. Proves BOTH halves: (a) WITHOUT a moved block, renaming all four for_each keys while keeping their input arguments identical still plans a destroy+create pair for each -- refuting the specific false claim this correction exists to correct; (b) WITH the real moved blocks extracted verbatim from envs/dev/efs.tf, the identical rename plans zero adds/changes/destroys, only an address move.
+if command -v terraform >/dev/null 2>&1; then
+  MOVED_PROOF_ROOT="$(mktemp -d)"
+  mkdir -p "${MOVED_PROOF_ROOT}/base/stub-module"
+  cat > "${MOVED_PROOF_ROOT}/base/stub-module/main.tf" <<'EOF'
+variable "name" {
+  type = string
+}
+resource "terraform_data" "this" {
+  input = var.name
+}
+EOF
+  cat > "${MOVED_PROOF_ROOT}/base/main.tf" <<'EOF'
+locals {
+  goldengate_managed_efs_desired_deployments = {
+    "gg-postgresql-repltest-01" = { creation_token = "dev-gg-postgresql-repltest-01-efs" }
+    "gg-mssql-repltest-01"      = { creation_token = "dev-gg-mssql-repltest-01-efs" }
+    "gg-oracle-repltest-01"     = { creation_token = "dev-gg-oracle-repltest-01-efs" }
+    "gg-postgresql-repltest-02" = { creation_token = "dev-gg-postgresql-repltest-02-efs" }
+  }
+}
+
+module "goldengate_runtime_efs" {
+  for_each = local.goldengate_managed_efs_desired_deployments
+  source   = "./stub-module"
+  name     = each.value.creation_token
+}
+EOF
+
+  set +e
+  (cd "${MOVED_PROOF_ROOT}/base" && terraform init -backend=false) >"${MOVED_PROOF_ROOT}/base-init.log" 2>&1
+  BASE_INIT_STATUS=$?
+  (cd "${MOVED_PROOF_ROOT}/base" && terraform apply -auto-approve) >"${MOVED_PROOF_ROOT}/base-apply.log" 2>&1
+  BASE_APPLY_STATUS=$?
+  set -e
+
+  if [ "$BASE_INIT_STATUS" -ne 0 ] || [ "$BASE_APPLY_STATUS" -ne 0 ]; then
+    skip "MOVED-BLOCK-PROOF: could not establish the offline OLD-address baseline state (terraform_data is a core builtin -- likely an environment issue, not a network dependency)"
+    cat "${MOVED_PROOF_ROOT}/base-init.log" "${MOVED_PROOF_ROOT}/base-apply.log" 2>/dev/null
+  else
+    # (a) Negative control: rename the for_each keys with NO moved block -- proves the false claim wrong.
+    cp -r "${MOVED_PROOF_ROOT}/base" "${MOVED_PROOF_ROOT}/nomoved"
+    cat > "${MOVED_PROOF_ROOT}/nomoved/main.tf" <<'EOF'
+locals {
+  goldengate_managed_efs_desired_deployments = {
+    "gg-postgresql-repltest-001" = { creation_token = "dev-gg-postgresql-repltest-01-efs" }
+    "gg-mssql-repltest-001"      = { creation_token = "dev-gg-mssql-repltest-01-efs" }
+    "gg-oracle-repltest-002"     = { creation_token = "dev-gg-oracle-repltest-01-efs" }
+    "gg-postgresql-repltest-002" = { creation_token = "dev-gg-postgresql-repltest-02-efs" }
+  }
+}
+
+module "goldengate_runtime_efs" {
+  for_each = local.goldengate_managed_efs_desired_deployments
+  source   = "./stub-module"
+  name     = each.value.creation_token
+}
+EOF
+    set +e
+    (cd "${MOVED_PROOF_ROOT}/nomoved" && terraform init -backend=false) >"${MOVED_PROOF_ROOT}/nomoved-init.log" 2>&1
+    (cd "${MOVED_PROOF_ROOT}/nomoved" && terraform plan -input=false -no-color) >"${MOVED_PROOF_ROOT}/nomoved-plan.log" 2>&1
+    set -e
+    if grep -qE '^Plan: 4 to add, 0 to change, 4 to destroy\.$' "${MOVED_PROOF_ROOT}/nomoved-plan.log"; then
+      pass "MOVED-BLOCK-PROOF (a): confirmed reproduction -- renaming all four for_each keys with an UNCHANGED input argument and NO moved block still plans 4 to add + 4 to destroy (refutes the claim that equal creation_token/name alone preserves a for_each-keyed resource across a key rename)"
+    else
+      fail "MOVED-BLOCK-PROOF (a): expected the no-moved-block rename to plan exactly '4 to add, 0 to change, 4 to destroy'"
+      cat "${MOVED_PROOF_ROOT}/nomoved-plan.log"
+    fi
+
+    # (b) The actual fix: the REAL moved blocks, extracted verbatim from envs/dev/efs.tf (never a hand-copied/independently-maintained duplicate), applied to the identical rename.
+    cp -r "${MOVED_PROOF_ROOT}/base" "${MOVED_PROOF_ROOT}/withmoved"
+    {
+      cat <<'EOF'
+locals {
+  goldengate_managed_efs_desired_deployments = {
+    "gg-postgresql-repltest-001" = { creation_token = "dev-gg-postgresql-repltest-01-efs" }
+    "gg-mssql-repltest-001"      = { creation_token = "dev-gg-mssql-repltest-01-efs" }
+    "gg-oracle-repltest-002"     = { creation_token = "dev-gg-oracle-repltest-01-efs" }
+    "gg-postgresql-repltest-002" = { creation_token = "dev-gg-postgresql-repltest-02-efs" }
+  }
+}
+
+EOF
+      awk '/^moved \{$/{flag=1} flag{print} flag && /^\}$/{flag=0}' envs/dev/efs.tf
+      cat <<'EOF'
+
+module "goldengate_runtime_efs" {
+  for_each = local.goldengate_managed_efs_desired_deployments
+  source   = "./stub-module"
+  name     = each.value.creation_token
+}
+EOF
+    } > "${MOVED_PROOF_ROOT}/withmoved/main.tf"
+    set +e
+    (cd "${MOVED_PROOF_ROOT}/withmoved" && terraform init -backend=false) >"${MOVED_PROOF_ROOT}/withmoved-init.log" 2>&1
+    (cd "${MOVED_PROOF_ROOT}/withmoved" && terraform plan -input=false -no-color) >"${MOVED_PROOF_ROOT}/withmoved-plan.log" 2>&1
+    set -e
+    if grep -qE '^Plan: 0 to add, 0 to change, 0 to destroy\.$' "${MOVED_PROOF_ROOT}/withmoved-plan.log" \
+        && [ "$(grep -c 'has moved to' "${MOVED_PROOF_ROOT}/withmoved-plan.log")" -eq 4 ]; then
+      pass "MOVED-BLOCK-PROOF (b): the four moved blocks extracted verbatim from envs/dev/efs.tf, applied to the identical rename, plan exactly '0 to add, 0 to change, 0 to destroy' with all four instances reported as moved (never destroy+create) -- proves the actual committed fix, not a hand-copied stand-in"
+    else
+      fail "MOVED-BLOCK-PROOF (b): expected the real moved blocks to plan exactly '0 to add, 0 to change, 0 to destroy' with 4 'has moved to' lines"
+      cat "${MOVED_PROOF_ROOT}/withmoved-plan.log"
+    fi
+  fi
+  rm -rf "$MOVED_PROOF_ROOT"
+else
+  skip "MOVED-BLOCK-PROOF: terraform not available"
+fi
+
 if grep -qE 'resource\s+"aws_security_group"' envs/dev/*.tf 2>/dev/null; then
   fail "envs/dev/*.tf creates a new security group instead of reusing the single shared one via a fail-closed data lookup"
 else

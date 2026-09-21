@@ -38,6 +38,27 @@ resource "terraform_data" "goldengate_managed_efs_decommission_contract" {
   }
 }
 
+# Managed EFS Identity Migration Correction: a `moved` block migrates the Terraform STATE ADDRESS -- it is a SEPARATE, complementary mechanism from LEGACY_MANAGED_EFS_CREATION_TOKENS above (which only keeps the resource's own immutable creation_token argument unchanged once its state address already points at the right instance). Terraform does NOT correlate two different for_each keys as "the same resource" merely because their resource arguments (including creation_token) happen to be equal -- for_each is address-identity-based, not argument-based, so without an explicit moved block, changing module.goldengate_runtime_efs["gg-postgresql-repltest-01"] to module.goldengate_runtime_efs["gg-postgresql-repltest-001"] is, from Terraform's own state-address perspective, one module instance disappearing and an entirely unrelated one appearing -- Terraform would plan to destroy the OLD instance's aws_efs_file_system (and everything the approved module creates under it) and create a NEW one, even though creation_token is identical on both sides. This exact bounded set of four moved blocks is the ONLY thing that tells Terraform "these two addresses are the same underlying resource, carry its existing state across" -- LEGACY_MANAGED_EFS_CREATION_TOKENS above is a completely independent, necessary-but-not-sufficient safeguard for what state ends up being applied to that (now correctly addressed) resource once the address migration is in effect. Never remove one without the other; never add a future moved block here for a genuinely new runtime.
+moved {
+  from = module.goldengate_runtime_efs["gg-postgresql-repltest-01"]
+  to   = module.goldengate_runtime_efs["gg-postgresql-repltest-001"]
+}
+
+moved {
+  from = module.goldengate_runtime_efs["gg-mssql-repltest-01"]
+  to   = module.goldengate_runtime_efs["gg-mssql-repltest-001"]
+}
+
+moved {
+  from = module.goldengate_runtime_efs["gg-oracle-repltest-01"]
+  to   = module.goldengate_runtime_efs["gg-oracle-repltest-002"]
+}
+
+moved {
+  from = module.goldengate_runtime_efs["gg-postgresql-repltest-02"]
+  to   = module.goldengate_runtime_efs["gg-postgresql-repltest-002"]
+}
+
 # One approved-module instance per managed-mode runtime deployment EXCLUDING the explicit decommission set above, keyed by deployment ID -- module.goldengate_runtime_efs["gg-a"] and module.goldengate_runtime_efs["gg-b"] are two dedicated filesystems even though both live in this one Terraform state. `name` is the deterministic creation token; the approved module's v1.0.0 source has been manually verified to set `creation_token = var.name`, so this is an exact, verified contract, not an assumption. THROUGHPUT CONTRACT WARNING: v1.0.0 does NOT pass throughput_mode straight through to the AWS API -- its verified resource code is `throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")`, so the module INPUT "enhanced" is what produces the AWS EFS API value "elastic" (any other input, including the raw AWS value "elastic" itself, falls through to "bursting"); this exact input/output pair is a verified module-source contract, not a historical AWS filesystem observation. Do NOT replace "enhanced" below with the raw AWS value "elastic" without re-reading the module's actual resource code first -- v1.0.0 also has no provisioned-throughput branch, so "provisioned" is not a valid input either.
 module "goldengate_runtime_efs" {
   for_each = local.goldengate_managed_efs_desired_deployments

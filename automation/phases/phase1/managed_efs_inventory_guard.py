@@ -59,6 +59,15 @@ def derive_expected_creation_token(environment, deployment_id):
     return f"{environment}-{deployment_id}-efs"
 
 
+# Managed EFS Identity Migration Correction (First-Live-Run Tag Convergence): the Terraform `moved` blocks (envs/dev/efs.tf) migrate the STATE ADDRESS instantly on the next `terraform apply`, but this read-only guard runs in Phase 1, BEFORE that apply -- so on the very first post-migration push, an actual pre-existing AWS filesystem still carries its OLD GoldenGateDeploymentId tag (Terraform has not written the new tag value yet) while the current Git inventory already expects only the NEW deployment ID. This is a narrowly-scoped, explicit, auditable mapping of exactly the same four (environment, OLD deployment ID) pairs as automation/phases/phase1/detect-goldengate-deployments.sh's own KNOWN_DEPLOYMENT_ID_MIGRATIONS -> the exact NEW deployment ID Terraform will tag it with once applied. It is NEVER a general orphan-forgiveness or alias mechanism: an old tag is only ever treated as "known migration pending tag convergence" (never as an orphan, and never merged with any other identity) when check_managed_efs_inventory's own bounded nine-condition test below (ManagedBy/environment/storage/old-id-membership/mapped-target/expected-target-presence/exact legacy-token equality) holds in full; any other mismatch falls through unchanged to the pre-existing fail-closed rules. Never add a future entry here for a genuinely new runtime.
+PENDING_DEPLOYMENT_ID_MIGRATIONS = {
+    ("dev", "gg-postgresql-repltest-01"): "gg-postgresql-repltest-001",
+    ("dev", "gg-mssql-repltest-01"): "gg-mssql-repltest-001",
+    ("dev", "gg-oracle-repltest-01"): "gg-oracle-repltest-002",
+    ("dev", "gg-postgresql-repltest-02"): "gg-postgresql-repltest-002",
+}
+
+
 def check_managed_efs_inventory(expected, actual, environment):
     """expected: [{"deploymentId": ..., "efsCreationToken": ...}, ...] (from the deployment model, includes deployment.enabled=false descriptors). actual: AWS FileSystemDescription-shaped dicts (FileSystemId/CreationToken/Tags) sanitized down to the four GoldenGate tags. Returns the list of orphan deployment IDs (each with the fixed ORPHAN_MESSAGE) -- empty means PASS. Raises InventoryGuardError for a creation-token collision, malformed/missing ownership tags on an otherwise ManagedBy=goldengate-eks-app filesystem (checked in full BEFORE any environment-based ignore decision -- a validly-tagged other-environment resource is the only thing ever silently ignored), a deployment-tag/creation-token identity mismatch, or a duplicate GoldenGateDeploymentId -- all fail closed before any orphan comparison even runs."""
     expected_by_id = {e["deploymentId"]: e["efsCreationToken"] for e in expected}
@@ -74,10 +83,22 @@ def check_managed_efs_inventory(expected, actual, environment):
         deployment_id_tag = tags.get("GoldenGateDeploymentId")
         storage_tag = tags.get("GoldenGateStorage")
 
+        # Managed EFS Identity Migration Correction (First-Live-Run Tag Convergence): effective_deployment_id_tag is the identity every check BELOW this point (collision/duplicate/orphan) treats this filesystem as -- normally identical to the actual GoldenGateDeploymentId tag, remapped to the NEW id ONLY when this exact bounded nine-condition test holds (mirroring the task's own enumerated contract): (1) ManagedBy is exactly goldengate-eks-app, (2)+(4) the tag pair (environment_tag, deployment_id_tag) is one of the four known (environment, OLD deployment ID) migration sources, (3) GoldenGateStorage is exactly u02, (5) that OLD id's mapped target is used as the effective id below, (6) the expected inventory genuinely contains that NEW deployment ID, (7) the actual CreationToken exactly equals that NEW deployment's own expected efsCreationToken (the legacy token) -- never merely "some" expected token. (8) lifecycle-state safety and (9) duplicate/ambiguous-identity rejection are the existing, UNCHANGED checks further below, which now naturally apply to the (possibly remapped) effective identity. Any single condition failing leaves effective_deployment_id_tag as the raw actual tag, so the pre-existing fail-closed rules apply completely unchanged -- this is never a generic alias/orphan-forgiveness mechanism.
+        effective_deployment_id_tag = deployment_id_tag
+        migration_target = PENDING_DEPLOYMENT_ID_MIGRATIONS.get((environment_tag, deployment_id_tag))
+        if (
+            migration_target is not None
+            and managed_by == MANAGED_BY_VALUE
+            and storage_tag == REQUIRED_STORAGE_VALUE
+            and migration_target in expected_by_id
+            and creation_token == expected_by_id[migration_target]
+        ):
+            effective_deployment_id_tag = migration_target
+
         # Creation-token collision check: applies to EVERY actual filesystem regardless of its own tags -- an untagged, mistagged, or wrong-identity filesystem that happens to share one of our deterministic creation tokens is exactly the ambiguous case this guard exists to catch, before Terraform ever sees it.
         if creation_token in expected_by_token:
             expected_deployment_for_token = expected_by_token[creation_token]
-            if not (managed_by == MANAGED_BY_VALUE and deployment_id_tag == expected_deployment_for_token and environment_tag == environment):
+            if not (managed_by == MANAGED_BY_VALUE and effective_deployment_id_tag == expected_deployment_for_token and environment_tag == environment):
                 raise InventoryGuardError(
                     f"AWS EFS {filesystem_id!r} has CreationToken {creation_token!r}, matching expected managed "
                     f"runtime {expected_deployment_for_token!r}'s efsCreationToken, but its ownership tags "
@@ -135,7 +156,8 @@ def check_managed_efs_inventory(expected, actual, environment):
                 f"state {lifecycle_state!r}, which is unsafe to proceed with."
             )
 
-        in_scope.append((deployment_id_tag, filesystem_id, creation_token))
+        # Grouped/compared by effective_deployment_id_tag (the possibly-remapped NEW id), never the raw tag -- this is what lets a bounded migration-pending filesystem satisfy its NEW deployment's duplicate/orphan checks below exactly as if Terraform had already converged its tag, while a filesystem that failed the nine-condition test above keeps its raw (unremapped) identity and is still fully subject to every existing check.
+        in_scope.append((effective_deployment_id_tag, filesystem_id, creation_token))
 
     by_deployment_id = {}
     for deployment_id, filesystem_id, creation_token in in_scope:
