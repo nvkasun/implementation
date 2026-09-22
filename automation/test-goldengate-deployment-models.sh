@@ -4238,6 +4238,118 @@ else
   skip "EFS persistence validation regression tests -- helm and/or python3/PyYAML not available"
 fi
 
+# Distinguish Chart-Owned claimName From External existingClaim (14): the canonical goldengate-deployment-model.py's own u02EffectivePvcName resolution must match the REAL rendered chart's StatefulSet u02 volume claimName exactly, for all three PVC-backed shapes -- default chart-derived name, a custom chart-owned claimName, and a genuine existingClaim. Derived from scratch copies of a real descriptor (never a hand-duplicated retired production shape), each mutating ONLY runtime.storage.u02.
+echo ""
+echo "--- Chart-Owned vs External u02 Claim: canonical effective-PVC-name matches the real Helm render ---"
+
+if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
+  CLAIM_WORKDIR="${WORKDIR}/u02-claim-test"
+  mkdir -p "${CLAIM_WORKDIR}/rendered" "${CLAIM_WORKDIR}/values"
+
+  python3 -c "
+import yaml
+
+with open('envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml') as f:
+    base = yaml.safe_load(f)
+
+# Case A: default -- neither claimName nor existingClaim set.
+default_doc = yaml.safe_load(yaml.dump(base))
+default_doc['runtime']['storage']['u02']['claimName'] = ''
+default_doc['runtime']['storage']['u02']['existingClaim'] = ''
+with open('${CLAIM_WORKDIR}/values/default.yaml', 'w') as f:
+    yaml.dump(default_doc, f)
+
+# Case B: custom chart-owned claimName.
+custom_claim_doc = yaml.safe_load(yaml.dump(base))
+custom_claim_doc['runtime']['storage']['u02']['claimName'] = 'custom-owned-claim-for-render-test'
+custom_claim_doc['runtime']['storage']['u02']['existingClaim'] = ''
+with open('${CLAIM_WORKDIR}/values/custom-claim.yaml', 'w') as f:
+    yaml.dump(custom_claim_doc, f)
+
+# Case C: genuine existingClaim -- already the real descriptor's own current shape, copied verbatim.
+with open('${CLAIM_WORKDIR}/values/existing-claim.yaml', 'w') as f:
+    yaml.dump(base, f)
+"
+
+  for case in default custom-claim existing-claim; do
+    helm template gg-postgresql-repltest-001 "$RUNTIME_CHART" --namespace goldengate-dev \
+      --values "${CLAIM_WORKDIR}/values/${case}.yaml" \
+      --set global.environment=dev "${ORACLE_SHARED_OVERRIDES[@]}" \
+      --set persistence.efs.fileSystemId=fs-0dead0000000beef0 \
+      > "${CLAIM_WORKDIR}/rendered/${case}.yaml" 2>"${CLAIM_WORKDIR}/${case}.err" || true
+  done
+
+  set +e
+  CLAIM_NAME_CHECK="$(python3 - "$DEPLOYMENT_MODEL_TOOL" "$CLAIM_WORKDIR" <<'PYEOF'
+import importlib.util
+import sys
+
+import yaml
+
+tool_path, workdir = sys.argv[1:3]
+spec = importlib.util.spec_from_file_location("gdm", tool_path)
+gdm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gdm)
+
+results = []
+
+
+def rendered_u02_claim_name(rendered_path):
+    with open(rendered_path) as f:
+        docs = [d for d in yaml.safe_load_all(f) if d]
+    sts = [d for d in docs if d.get("kind") == "StatefulSet"]
+    assert len(sts) == 1, f"expected exactly one StatefulSet, found {len(sts)}"
+    volumes = sts[0]["spec"]["template"]["spec"].get("volumes", [])
+    u02 = [v for v in volumes if v.get("name") == "u02"]
+    assert u02, "no u02 volume in the rendered StatefulSet"
+    claim_name = (u02[0].get("persistentVolumeClaim") or {}).get("claimName")
+    assert claim_name, "u02 volume has no persistentVolumeClaim.claimName"
+    return claim_name
+
+
+def canonical_effective_name(values_path, deployment_id):
+    with open(values_path) as f:
+        doc = yaml.safe_load(f)
+    efs = gdm._parse_efs(deployment_id, "dev", doc)
+    u02_type = ((doc.get("runtime") or {}).get("storage") or {}).get("u02", {}).get("type")
+    return gdm._resolve_u02_effective_pvc_name(u02_type, deployment_id, efs["u02ExistingClaim"], efs["u02ClaimName"])
+
+
+for case, deployment_id in (("default", "gg-postgresql-repltest-001"), ("custom-claim", "gg-postgresql-repltest-001"), ("existing-claim", "gg-postgresql-repltest-001")):
+    rendered_path = f"{workdir}/rendered/{case}.yaml"
+    values_path = f"{workdir}/values/{case}.yaml"
+    try:
+        rendered_name = rendered_u02_claim_name(rendered_path)
+        canonical_name = canonical_effective_name(values_path, deployment_id)
+        ok = rendered_name == canonical_name
+        detail = f"rendered={rendered_name!r} canonical={canonical_name!r}"
+    except Exception as exc:
+        ok = False
+        detail = str(exc)
+    results.append((f"14: {case}: canonical u02EffectivePvcName resolution matches the REAL rendered StatefulSet u02 volume claimName ({detail})", ok))
+
+for label, ok in results:
+    print(("OK " if ok else "FAIL ") + label)
+PYEOF
+)"
+  CLAIM_NAME_STATUS=$?
+  set -e
+  echo "$CLAIM_NAME_CHECK"
+  if [ "$CLAIM_NAME_STATUS" -eq 0 ] && [ -z "$(echo "$CLAIM_NAME_CHECK" | grep '^FAIL ' || true)" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        OK\ *) pass "${line#OK }" ;;
+      esac
+    done <<< "$CLAIM_NAME_CHECK"
+  else
+    fail "canonical u02EffectivePvcName vs real Helm render check failed:"$'\n'"${CLAIM_NAME_CHECK}"
+  fi
+
+  rm -rf "$CLAIM_WORKDIR"
+else
+  skip "canonical u02EffectivePvcName vs real Helm render check -- helm and/or python3/PyYAML not available"
+fi
+
 # The "Detect changed deployments" step's inline run: scalar once reached ~23,971 UTF-8 characters, above GitHub Actions' ~21,000-character limit, which made GitHub reject the whole workflow file at compile time; the fix moved the real implementation into the tracked automation/phases/phase1/detect-goldengate-deployments.sh, leaving the step as a small env:-mapping wrapper -- these tests prove the fix and guard against regressing back over the limit.
 echo ""
 echo "--- Phase 5B2A: workflow-compilation-size correction ---"

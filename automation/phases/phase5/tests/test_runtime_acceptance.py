@@ -85,6 +85,10 @@ _FROZEN_CHART_OWNED_DESCRIPTOR = {
     "monitoringNamespace": "goldengate-monitoring",
     "pipeline": "repltest-pg-to-mssql-001",
     "pvcClaimName": "",
+    "u02ClaimName": "",
+    "u02ExistingClaim": "",
+    "u02ChartOwnsPvc": True,
+    "u02EffectivePvcName": f"{DEPLOYMENT_ID}-u02",
     "replicas": 1,
     "role": "source",
     "runtimeIngressHost": f"{DEPLOYMENT_ID}.{DNS_DOMAIN}",
@@ -1196,6 +1200,126 @@ class RuntimeAcceptanceExternalClaimTests(unittest.TestCase):
         result = self._classify_external(cluster)
         self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
         self.assertTrue(any("volume 'u02' claimName=" in r for r in result["reasons"]))
+
+
+def _custom_claim_name_descriptor(claim_name="custom-owned-claim", efs_mode="managed"):
+    """A synthetic descriptor for runtime.storage.u02.type=efs with a custom, non-empty claimName -- STILL chart-owned persistence (u02ChartOwnsPvc=True), distinct from a genuine existingClaim. efsMode is set (unlike RuntimeAcceptanceExternalClaimTests' own u02Type=existingClaim fixtures, whose efsMode is always None) so _check_storage()'s FULL StorageClass/PVC-Bound/PV/CSI-driver/volumeHandle identity chain actually runs."""
+    d = dict(_FROZEN_CHART_OWNED_DESCRIPTOR)
+    d.update({
+        "efsMode": efs_mode, "u02Type": "efs",
+        "u02ClaimName": claim_name, "u02ExistingClaim": "", "u02ChartOwnsPvc": True,
+        "u02EffectivePvcName": claim_name, "pvcClaimName": claim_name,
+    })
+    return d
+
+
+def _existing_claim_efs_descriptor(existing_claim="gg-postgresql-repltest-01-u02", efs_mode="managed"):
+    """A synthetic descriptor for runtime.storage.u02.type=efs with existingClaim set -- a genuine externally-provisioned/retained claim (u02ChartOwnsPvc=False), exactly the real 4 migrated descriptors' own shape. efsMode is set so the FULL storage identity chain runs, unlike RuntimeAcceptanceExternalClaimTests' own u02Type=existingClaim fixtures."""
+    d = dict(_FROZEN_CHART_OWNED_DESCRIPTOR)
+    d.update({
+        "efsMode": efs_mode, "u02Type": "efs",
+        "u02ClaimName": "", "u02ExistingClaim": existing_claim, "u02ChartOwnsPvc": False,
+        "u02EffectivePvcName": existing_claim, "pvcClaimName": existing_claim,
+    })
+    return d
+
+
+class StorageOwnershipDistinctionTests(unittest.TestCase):
+    """Distinguish Chart-Owned claimName From External existingClaim: focused unit-level coverage of _check_storage()/_expected_u02_claim_name()/_uses_externally_provisioned_u02_claim() for the claimName-only (still chart-owned, custom name) and existingClaim (external/retained) shapes -- both with efsMode set so the FULL StorageClass/PVC-Bound/PV/CSI-driver/volumeHandle identity chain is exercised, unlike RuntimeAcceptanceExternalClaimTests above (u02Type=existingClaim, efsMode=None, storage checks skipped entirely by _check_storage()'s own early return)."""
+
+    def _run_check_storage(self, descriptor, cluster):
+        reasons = []
+        runtime_acceptance._check_storage(cluster, reasons, ENVIRONMENT, DEPLOYMENT_ID, RUNTIME_NAMESPACE, descriptor, EXPECTED_FS_ID)
+        return reasons
+
+    def test_claim_name_only_is_not_externally_provisioned(self):
+        self.assertFalse(runtime_acceptance._uses_externally_provisioned_u02_claim(_custom_claim_name_descriptor()))
+
+    def test_claim_name_only_is_chart_owned_persistence(self):
+        # Mirrors runtime_state.py's own declares_chart_owned_persistence contract: efsMode set AND u02ChartOwnsPvc true.
+        descriptor = _custom_claim_name_descriptor()
+        self.assertTrue(bool(descriptor.get("efsMode") and descriptor.get("u02ChartOwnsPvc")))
+
+    def test_claim_name_only_effective_pvc_name_is_the_custom_name(self):
+        self.assertEqual(runtime_acceptance._expected_u02_claim_name(_custom_claim_name_descriptor("custom-owned-claim"), DEPLOYMENT_ID), "custom-owned-claim")
+
+    def test_default_empty_claim_fields_resolve_to_deployment_id_u02_and_are_chart_owned(self):
+        # 12: neither claimName nor existingClaim set -- default chart-derived name, still chart-owned.
+        self.assertFalse(runtime_acceptance._uses_externally_provisioned_u02_claim(_FROZEN_CHART_OWNED_DESCRIPTOR))
+        self.assertEqual(runtime_acceptance._expected_u02_claim_name(_FROZEN_CHART_OWNED_DESCRIPTOR, DEPLOYMENT_ID), f"{DEPLOYMENT_ID}-u02")
+
+    def test_existing_claim_is_externally_provisioned(self):
+        self.assertTrue(runtime_acceptance._uses_externally_provisioned_u02_claim(_existing_claim_efs_descriptor()))
+
+    def test_existing_claim_effective_pvc_name_is_the_retained_name(self):
+        self.assertEqual(runtime_acceptance._expected_u02_claim_name(_existing_claim_efs_descriptor("gg-postgresql-repltest-01-u02"), DEPLOYMENT_ID), "gg-postgresql-repltest-01-u02")
+
+    # 5: a custom chart-owned claimName's PVC must still match the expected runtime StorageClass.
+    def test_claim_name_only_requires_matching_storage_class_name(self):
+        descriptor = _custom_claim_name_descriptor("custom-owned-claim")
+        cluster = FakeCluster()
+        cluster.put("storageclass", SC_NAME, None, _storageclass_obj())
+        cluster.put("persistentvolumeclaim", "custom-owned-claim", RUNTIME_NAMESPACE, _pvc_obj(storage_class_name=SC_NAME))
+        cluster.put("persistentvolume", "pv-001", None, _pv_obj())
+        self.assertEqual(self._run_check_storage(descriptor, cluster), [])
+
+    # 6: an incorrect storageClassName on a claimName-only PVC fails acceptance.
+    def test_claim_name_only_wrong_storage_class_name_fails(self):
+        descriptor = _custom_claim_name_descriptor("custom-owned-claim")
+        cluster = FakeCluster()
+        cluster.put("storageclass", SC_NAME, None, _storageclass_obj())
+        cluster.put("persistentvolumeclaim", "custom-owned-claim", RUNTIME_NAMESPACE, _pvc_obj(storage_class_name="some-other-storage-class"))
+        cluster.put("persistentvolume", "pv-001", None, _pv_obj())
+        reasons = self._run_check_storage(descriptor, cluster)
+        self.assertTrue(any("storageClassName" in r for r in reasons))
+
+    # 7: existingClaim is allowed to retain its legacy StorageClass name -- never compared against the NEW runtime's own derived StorageClass.
+    def test_existing_claim_allows_legacy_storage_class_name(self):
+        descriptor = _existing_claim_efs_descriptor("gg-postgresql-repltest-01-u02")
+        cluster = FakeCluster()
+        cluster.put("storageclass", SC_NAME, None, _storageclass_obj())
+        cluster.put("persistentvolumeclaim", "gg-postgresql-repltest-01-u02", RUNTIME_NAMESPACE, _pvc_obj(storage_class_name="gg-efs-dev-gg-postgresql-repltest-01"))
+        cluster.put("persistentvolume", "pv-001", None, _pv_obj())
+        self.assertEqual(self._run_check_storage(descriptor, cluster), [])
+
+    # 8: existingClaim still requires Bound status.
+    def test_existing_claim_requires_bound_status(self):
+        descriptor = _existing_claim_efs_descriptor("gg-postgresql-repltest-01-u02")
+        cluster = FakeCluster()
+        cluster.put("storageclass", SC_NAME, None, _storageclass_obj())
+        cluster.put("persistentvolumeclaim", "gg-postgresql-repltest-01-u02", RUNTIME_NAMESPACE, _pvc_obj(phase="Pending", storage_class_name="legacy-sc"))
+        cluster.put("persistentvolume", "pv-001", None, _pv_obj())
+        reasons = self._run_check_storage(descriptor, cluster)
+        self.assertTrue(any("phase=" in r for r in reasons))
+
+    # 9: existingClaim still requires a bound PV to actually exist.
+    def test_existing_claim_requires_bound_pv_to_exist(self):
+        descriptor = _existing_claim_efs_descriptor("gg-postgresql-repltest-01-u02")
+        cluster = FakeCluster()
+        cluster.put("storageclass", SC_NAME, None, _storageclass_obj())
+        cluster.put("persistentvolumeclaim", "gg-postgresql-repltest-01-u02", RUNTIME_NAMESPACE, _pvc_obj(storage_class_name="legacy-sc", volume_name="pv-does-not-exist"))
+        reasons = self._run_check_storage(descriptor, cluster)
+        self.assertTrue(any("does not exist" in r for r in reasons))
+
+    # 10: existingClaim still requires the efs.csi.aws.com CSI driver.
+    def test_existing_claim_requires_efs_csi_driver(self):
+        descriptor = _existing_claim_efs_descriptor("gg-postgresql-repltest-01-u02")
+        cluster = FakeCluster()
+        cluster.put("storageclass", SC_NAME, None, _storageclass_obj())
+        cluster.put("persistentvolumeclaim", "gg-postgresql-repltest-01-u02", RUNTIME_NAMESPACE, _pvc_obj(storage_class_name="legacy-sc"))
+        cluster.put("persistentvolume", "pv-001", None, _pv_obj(driver="kubernetes.io/aws-ebs"))
+        reasons = self._run_check_storage(descriptor, cluster)
+        self.assertTrue(any("driver=" in r for r in reasons))
+
+    # 11: existingClaim still requires the PV volumeHandle to reference the expected EFS filesystem.
+    def test_existing_claim_requires_matching_volume_handle(self):
+        descriptor = _existing_claim_efs_descriptor("gg-postgresql-repltest-01-u02")
+        cluster = FakeCluster()
+        cluster.put("storageclass", SC_NAME, None, _storageclass_obj())
+        cluster.put("persistentvolumeclaim", "gg-postgresql-repltest-01-u02", RUNTIME_NAMESPACE, _pvc_obj(storage_class_name="legacy-sc"))
+        cluster.put("persistentvolume", "pv-001", None, _pv_obj(volume_handle="fs-000000000000000ff::fsap-0old00000000000001"))
+        reasons = self._run_check_storage(descriptor, cluster)
+        self.assertTrue(any("volumeHandle=" in r for r in reasons))
 
 
 class RuntimeAcceptanceNoMutationSourceSweepTests(unittest.TestCase):

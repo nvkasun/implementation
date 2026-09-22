@@ -1599,6 +1599,11 @@ class CsiAndStorageFieldsTests(ScratchEnvironmentTestCase):
         d = self._describe("gg-csi-001", doc)
         self.assertEqual(d["u02Type"], "existingClaim")
         self.assertEqual(d["pvcClaimName"], "external-claim-01")
+        # Distinguish Chart-Owned claimName From External existingClaim (1): the canonical existing-claim identity is exposed independently of the legacy combined pvcClaimName alias.
+        self.assertEqual(d["u02ExistingClaim"], "external-claim-01")
+        self.assertEqual(d["u02ClaimName"], "")
+        self.assertFalse(d["u02ChartOwnsPvc"])
+        self.assertEqual(d["u02EffectivePvcName"], "external-claim-01")
 
     def test_u02_type_empty_dir_is_reflected(self):
         doc = _minimal_shape_doc(runtime_overrides={"storage": {"u02": {"type": "emptyDir"}}})
@@ -1619,6 +1624,88 @@ class CsiAndStorageFieldsTests(ScratchEnvironmentTestCase):
         self.assertEqual(d["extraVolumeNames"], ["custom-vol"])
         self.assertEqual(d["extraVolumeMountNames"], ["custom-vol"])
         gdm.REPO_ROOT = self._tmp.name
+
+
+class ChartOwnedVsExternalU02ClaimTests(ScratchEnvironmentTestCase):
+    """Distinguish Chart-Owned claimName From External existingClaim: automation/goldengate-deployment-model.py must never collapse runtime.storage.u02.claimName and runtime.storage.u02.existingClaim into one ambiguous field for ownership decisions -- u02ClaimName/u02ExistingClaim expose each raw value independently, u02ChartOwnsPvc answers "does the chart own/create this PVC?" (false ONLY for a genuine existingClaim), and u02EffectivePvcName answers "what PVC name will the StatefulSet actually mount?", mirroring helm/goldengate/templates/runtime-statefulset.yaml's own precedence exactly (existingClaim wins unconditionally over claimName)."""
+
+    def _describe(self, deployment_id, doc):
+        write_doc(self._tmp.name, "dev", deployment_id, doc)
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(invalid, [])
+        by_id = {d["deploymentId"]: d for d in active + inactive}
+        return by_id[deployment_id]
+
+    def _managed_efs_doc(self, u02_overrides):
+        doc = _minimal_shape_doc(runtime_overrides={"storage": {"u02": {"type": "efs", **u02_overrides}}})
+        doc["persistence"] = {"enabled": True, "provider": "efs", "efs": {"mode": "managed"}}
+        return doc
+
+    # 2/3: a custom claimName alone is NOT external -- it is still chart-owned persistence.
+    def test_claim_name_only_is_chart_owned_not_external(self):
+        doc = self._managed_efs_doc({"claimName": "custom-owned-claim"})
+        d = self._describe("gg-storage-claimname-001", doc)
+        self.assertEqual(d["u02ClaimName"], "custom-owned-claim")
+        self.assertEqual(d["u02ExistingClaim"], "")
+        self.assertTrue(d["u02ChartOwnsPvc"])
+        self.assertEqual(d["u02EffectivePvcName"], "custom-owned-claim")
+        # Legacy alias still reflects the configured name (never both fields can be set simultaneously -- see the rejection test below) but must never itself be read to decide ownership; u02ChartOwnsPvc is the only correct authority for that.
+        self.assertEqual(d["pvcClaimName"], "custom-owned-claim")
+
+    def test_existing_claim_only_is_external_not_chart_owned(self):
+        doc = self._managed_efs_doc({"existingClaim": "retained-old-claim"})
+        d = self._describe("gg-storage-existingclaim-001", doc)
+        self.assertEqual(d["u02ClaimName"], "")
+        self.assertEqual(d["u02ExistingClaim"], "retained-old-claim")
+        self.assertFalse(d["u02ChartOwnsPvc"])
+        self.assertEqual(d["u02EffectivePvcName"], "retained-old-claim")
+
+    # 12: neither claimName nor existingClaim -- default chart-derived name, still chart-owned.
+    def test_neither_field_set_resolves_to_default_chart_owned_name(self):
+        doc = self._managed_efs_doc({})
+        d = self._describe("gg-storage-neither-001", doc)
+        self.assertEqual(d["u02ClaimName"], "")
+        self.assertEqual(d["u02ExistingClaim"], "")
+        self.assertTrue(d["u02ChartOwnsPvc"])
+        self.assertEqual(d["u02EffectivePvcName"], "gg-storage-neither-001-u02")
+        self.assertEqual(d["pvcClaimName"], "")
+
+    # 13: both claimName and existingClaim set for type=efs is a contradictory descriptor -- rejected fail-closed, never silently resolved either way.
+    def test_both_claim_name_and_existing_claim_set_is_rejected_fail_closed(self):
+        doc = self._managed_efs_doc({"claimName": "custom-owned-claim", "existingClaim": "retained-old-claim"})
+        write_doc(self._tmp.name, "dev", "gg-storage-both-001", doc)
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("claimName", invalid[0][1])
+        self.assertIn("existingClaim", invalid[0][1])
+
+    def test_u02_type_existing_claim_shape_is_unaffected_by_the_efs_contradiction_rule(self):
+        # runtime.storage.u02.type=existingClaim (a distinct u02Type from "efs") is its own supported shape and never subject to the type=efs contradiction check above -- existingClaim is the ONLY field that shape ever reads.
+        doc = _minimal_shape_doc(runtime_overrides={"storage": {"u02": {"type": "existingClaim", "existingClaim": "external-claim-01"}}})
+        d = self._describe("gg-storage-existtype-001", doc)
+        self.assertFalse(d["u02ChartOwnsPvc"])
+        self.assertEqual(d["u02EffectivePvcName"], "external-claim-01")
+
+
+class RealRepositoryChartOwnedVsExternalU02ClaimTests(unittest.TestCase):
+    """Exercised against the real, live envs/dev descriptors -- no scratch root (mirrors RealRepositoryDescriptorTests' own convention above)."""
+
+    def test_the_four_real_migration_descriptors_use_existing_claim_pointing_at_the_old_retained_pvc(self):
+        # 16: confirms the real, currently-active migrated descriptors still resolve through this corrected model to the exact same OLD retained PVC names -- this correction must never rename/recreate/re-point them.
+        real_active, real_inactive, real_invalid = gdm.scan("dev")
+        self.assertEqual(real_invalid, [])
+        by_id = {d["deploymentId"]: d for d in real_active + real_inactive}
+        expected = {
+            "gg-postgresql-repltest-001": "gg-postgresql-repltest-01-u02",
+            "gg-mssql-repltest-001": "gg-mssql-repltest-01-u02",
+            "gg-oracle-repltest-002": "gg-oracle-repltest-01-u02",
+            "gg-postgresql-repltest-002": "gg-postgresql-repltest-02-u02",
+        }
+        for deployment_id, expected_old_pvc in expected.items():
+            d = by_id[deployment_id]
+            self.assertEqual(d["u02ExistingClaim"], expected_old_pvc, deployment_id)
+            self.assertEqual(d["u02EffectivePvcName"], expected_old_pvc, deployment_id)
+            self.assertFalse(d["u02ChartOwnsPvc"], deployment_id)
 
 
 if __name__ == "__main__":

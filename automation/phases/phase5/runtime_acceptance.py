@@ -195,21 +195,13 @@ def _check_application(run, reasons, environment, deployment_id, argocd_namespac
 
 
 def _uses_externally_provisioned_u02_claim(descriptor):
-    """True when this deployment's u02 volume references a pre-existing/externally-provisioned PVC rather than one the chart itself creates -- exactly descriptor.get("pvcClaimName") being set (mirrors runtime_state.py's own declares_chart_owned_persistence: chart-owned means efsMode set AND no such override; this is its negation, restricted to the u02Type values that can even carry a claim). helm/goldengate/templates/runtime-pvc.yaml's own render condition (not existingClaim) skips PVC creation entirely for this shape -- the claim already existed before this Helm release ever ran, most commonly a retained PVC deliberately carried forward across a runtime identity migration (see RUNTIME_IDENTITY_MIGRATIONS in phase5_runtime.py) so the SAME durable /u02 EFS access-point directory keeps being used under a new deployment identity. Such a claim's own storageClassName is whatever it was ACTUALLY created with -- often a retired/legacy StorageClass name -- so it is never compared against this deployment's own freshly-derived StorageClass name; every other identity check (Bound phase, bound PV, CSI driver, volumeHandle-references-expected-EFS-filesystem) still applies fully and unconditionally, since those verify the ACTUAL durable backing identity regardless of which StorageClass object originally provisioned it. Never relaxes validation for a normal chart-owned PVC."""
-    return bool(descriptor.get("pvcClaimName"))
+    """True when this deployment's u02 volume references a pre-existing/externally-provisioned PVC rather than one the chart itself creates -- exactly descriptor.get("u02ChartOwnsPvc") being False (automation/goldengate-deployment-model.py's own canonical field, mirrored by runtime_state.py's declares_chart_owned_persistence). Distinguish Chart-Owned claimName From External existingClaim: this is FALSE for a non-empty custom runtime.storage.u02.claimName -- that PVC is still chart-owned, just under a custom name -- and TRUE only for a genuine runtime.storage.u02.existingClaim. helm/goldengate/templates/runtime-pvc.yaml's own render condition (checks existingClaim specifically, never claimName) skips PVC creation entirely for the existingClaim shape -- the claim already existed before this Helm release ever ran, most commonly a retained PVC deliberately carried forward across a runtime identity migration (see RUNTIME_IDENTITY_MIGRATIONS in phase5_runtime.py) so the SAME durable /u02 EFS access-point directory keeps being used under a new deployment identity. Such a claim's own storageClassName is whatever it was ACTUALLY created with -- often a retired/legacy StorageClass name -- so it is never compared against this deployment's own freshly-derived StorageClass name; every other identity check (Bound phase, bound PV, CSI driver, volumeHandle-references-expected-EFS-filesystem) still applies fully and unconditionally, since those verify the ACTUAL durable backing identity regardless of which StorageClass object originally provisioned it. Never relaxes validation for a normal chart-owned PVC, custom claimName included."""
+    return descriptor.get("u02ChartOwnsPvc") is False
 
 
 def _expected_u02_claim_name(descriptor, deployment_id):
-    """Mirrors helm/goldengate/templates/runtime-statefulset.yaml's u02 volume claimName resolution exactly for the two PVC-backed u02Type values. Returns None for emptyDir (no PVC) or an unrecognized/unset u02Type."""
-    u02_type = descriptor.get("u02Type")
-    override = descriptor.get("pvcClaimName") or ""
-    if u02_type == "existingClaim":
-        # The chart reads runtime.storage.u02.existingClaim directly in this branch -- never a fallback to claimName or a chart-derived name.
-        return override or None
-    if u02_type == "efs":
-        # existingClaim (if set) takes priority over claimName; otherwise the chart-derived <deployment-id>-u02 name (helm/goldengate/templates/_helpers.tpl's goldengate.runtimeU02PVCName).
-        return override if override else f"{deployment_id}-u02"
-    return None
+    """Reads the canonical descriptor's own already-resolved effective u02 PVC name (automation/goldengate-deployment-model.py's u02EffectivePvcName, computed via the single canonical _resolve_u02_effective_pvc_name() that mirrors helm/goldengate/templates/runtime-statefulset.yaml's u02 volume claimName resolution exactly) -- never re-derives the existingClaim/claimName precedence here. Returns None for emptyDir/unrecognized/unset u02Type (no PVC volume at all). deployment_id is accepted for call-site stability but unused -- the canonical field already has it baked in."""
+    return descriptor.get("u02EffectivePvcName")
 
 
 def _expected_pod_volumes(descriptor, deployment_id):

@@ -312,7 +312,7 @@ def derive_efs_creation_token(environment, deployment_id):
 
 
 def _parse_efs(deployment_id, environment, doc):
-    """Existing mode passes through an operator-supplied fileSystemId; managed mode derives a creation token and forbids a committed ID."""
+    """Existing mode passes through an operator-supplied fileSystemId; managed mode derives a creation token and forbids a committed ID. Chart-Owned vs External u02 Claim Correction: reads runtime.storage.u02.claimName and runtime.storage.u02.existingClaim as two SEPARATE raw fields (u02ClaimName/u02ExistingClaim below) -- they are never collapsed into one ambiguous value here. helm/goldengate/templates/runtime-statefulset.yaml's own u02 volume resolution for type=efs uses existingClaim (if set) directly and UNCONDITIONALLY, falling back to claimName (a still-chart-owned custom PVC name) only when existingClaim is empty; setting BOTH for type=efs is a contradictory descriptor (an operator-supplied custom chart-owned name that would be silently overridden by an externally-provisioned claim) and is rejected outright here, never silently resolved either way."""
     persistence = doc.get("persistence")
     if persistence is not None:
         _require_dict(persistence, "invalid persistence configuration: persistence must be a mapping")
@@ -321,14 +321,18 @@ def _parse_efs(deployment_id, environment, doc):
     runtime = doc.get("runtime") or {}
     storage = runtime.get("storage") or {}
     u02 = storage.get("u02") or {}
-    pvc_claim_name = u02.get("claimName") or u02.get("existingClaim") or ""
+    u02_claim_name = u02.get("claimName") or ""
+    u02_existing_claim = u02.get("existingClaim") or ""
+
+    if u02.get("type") == "efs" and u02_claim_name and u02_existing_claim:
+        raise DescriptorError("invalid persistence configuration: runtime.storage.u02.claimName and runtime.storage.u02.existingClaim must not both be set when runtime.storage.u02.type=efs -- existingClaim means the chart must never create a PVC at all, which contradicts a custom chart-owned claimName; set exactly one")
 
     if "enabled" in persistence and not _is_literal_bool(persistence.get("enabled")):
         raise DescriptorError("invalid persistence configuration: persistence.enabled must be a literal Boolean")
 
     efs_enabled = persistence.get("enabled") is True and persistence.get("provider") == "efs"
     if not efs_enabled:
-        return {"mode": None, "fileSystemId": None, "creationToken": None, "pvcClaimName": pvc_claim_name}
+        return {"mode": None, "fileSystemId": None, "creationToken": None, "u02ClaimName": u02_claim_name, "u02ExistingClaim": u02_existing_claim}
 
     if u02.get("type") != "efs":
         raise DescriptorError("invalid persistence configuration: runtime.storage.u02.type must be \"efs\" when persistence.enabled=true and provider=efs")
@@ -342,12 +346,25 @@ def _parse_efs(deployment_id, environment, doc):
     if mode == "existing":
         if not isinstance(filesystem_id, str) or not _EFS_FILESYSTEM_ID_RE.match(filesystem_id):
             raise DescriptorError("invalid persistence configuration: persistence.efs.fileSystemId is not a safe EFS filesystem ID")
-        return {"mode": mode, "fileSystemId": filesystem_id, "creationToken": None, "pvcClaimName": pvc_claim_name}
+        return {"mode": mode, "fileSystemId": filesystem_id, "creationToken": None, "u02ClaimName": u02_claim_name, "u02ExistingClaim": u02_existing_claim}
 
     if filesystem_id not in (None, ""):
         raise DescriptorError("invalid persistence configuration: persistence.efs.fileSystemId must not be set when persistence.efs.mode=managed -- Terraform provisions and resolves it")
     creation_token = derive_efs_creation_token(environment, deployment_id)
-    return {"mode": mode, "fileSystemId": None, "creationToken": creation_token, "pvcClaimName": pvc_claim_name}
+    return {"mode": mode, "fileSystemId": None, "creationToken": creation_token, "u02ClaimName": u02_claim_name, "u02ExistingClaim": u02_existing_claim}
+
+
+def _resolve_u02_effective_pvc_name(u02_type, deployment_id, u02_existing_claim, u02_claim_name):
+    """Mirrors helm/goldengate/templates/runtime-statefulset.yaml's u02 volume claimName resolution EXACTLY, for the two PVC-backed u02Type values -- the single canonical place this precedence is computed, so runtime_acceptance.py/phase5_runtime.py never re-derive it independently. Returns None for emptyDir/unrecognized/unset u02Type (no PVC volume at all)."""
+    if u02_type == "existingClaim":
+        # The chart reads runtime.storage.u02.existingClaim directly in this branch -- never a fallback to claimName or a chart-derived name (Helm's own `fail` guards an empty existingClaim here at render time).
+        return u02_existing_claim or None
+    if u02_type == "efs":
+        # existingClaim (if set) takes priority over claimName -- see _parse_efs's own contradictory-descriptor rejection above, which means both are never simultaneously truthy by the time this runs.
+        if u02_existing_claim:
+            return u02_existing_claim
+        return u02_claim_name or f"{deployment_id}-u02"
+    return None
 
 
 def parse_descriptor(deployment_id, environment, doc, shared=None, pipeline_folder=None, values_file=None):
@@ -454,6 +471,12 @@ def parse_descriptor(deployment_id, environment, doc, shared=None, pipeline_fold
     extra_volume_names = sorted({v.get("name") for v in (runtime.get("extraVolumes") or []) if isinstance(v, dict) and v.get("name")})
     extra_volume_mount_names = sorted({v.get("name") for v in (runtime.get("extraVolumeMounts") or []) if isinstance(v, dict) and v.get("name")})
 
+    # Chart-Owned vs External u02 Claim Correction: u02ClaimName/u02ExistingClaim are the raw, UNCOLLAPSED runtime.storage.u02.claimName/existingClaim values -- answer "what raw field was configured?" independently of each other and of u02Type. u02ChartOwnsPvc answers "does this Helm release own/create this PVC?" -- false ONLY when existingClaim is set (the one shape helm/goldengate/templates/runtime-pvc.yaml's own render condition skips PVC creation for); a non-empty custom claimName is still chart-owned persistence, exactly like the chart-derived default name. u02EffectivePvcName answers "what PVC name will the StatefulSet actually mount?", computed via the single canonical _resolve_u02_effective_pvc_name() -- consumers (runtime_state.py/runtime_acceptance.py/phase5_runtime.py) read these three fields directly and never re-derive this precedence themselves.
+    u02_claim_name = efs["u02ClaimName"]
+    u02_existing_claim = efs["u02ExistingClaim"]
+    u02_chart_owns_pvc = not u02_existing_claim
+    u02_effective_pvc_name = _resolve_u02_effective_pvc_name(u02_type, deployment_id, u02_existing_claim, u02_claim_name)
+
     return {
         "deploymentId": deployment_id,
         "environment": environment,
@@ -476,7 +499,12 @@ def parse_descriptor(deployment_id, environment, doc, shared=None, pipeline_fold
         "efsMode": efs["mode"],
         "efsFileSystemId": efs["fileSystemId"],
         "efsCreationToken": efs["creationToken"],
-        "pvcClaimName": efs["pvcClaimName"],
+        # Legacy/back-compat alias: existingClaim if set, else claimName, else empty -- the two can never both be truthy (see _parse_efs's own contradictory-descriptor rejection), so this is unambiguous in practice, but its mere non-emptiness must NEVER be used to decide chart ownership (a non-empty claimName here is still chart-owned) -- use u02ChartOwnsPvc for that instead.
+        "pvcClaimName": u02_existing_claim or u02_claim_name,
+        "u02ClaimName": u02_claim_name,
+        "u02ExistingClaim": u02_existing_claim,
+        "u02ChartOwnsPvc": u02_chart_owns_pvc,
+        "u02EffectivePvcName": u02_effective_pvc_name,
         "albGroupOrder": alb_group_order,
         "replicas": replicas,
         "serviceType": service_type,

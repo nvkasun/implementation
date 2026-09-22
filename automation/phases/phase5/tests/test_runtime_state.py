@@ -327,7 +327,7 @@ class RuntimeStateClassifierTests(unittest.TestCase):
         original_describe_deployment = runtime_state.describe_deployment
 
         def _chart_owned_persistence_descriptor(environment, deployment_id):
-            return {"deploymentId": deployment_id, "efsMode": "managed", "pvcClaimName": ""}
+            return {"deploymentId": deployment_id, "efsMode": "managed", "u02ChartOwnsPvc": True}
 
         runtime_state.describe_deployment = _chart_owned_persistence_descriptor
         try:
@@ -361,7 +361,7 @@ class RuntimeStateClassifierTests(unittest.TestCase):
         original_describe_deployment = runtime_state.describe_deployment
 
         def _no_persistence_descriptor(environment, deployment_id):
-            return {"deploymentId": deployment_id, "efsMode": None, "pvcClaimName": ""}
+            return {"deploymentId": deployment_id, "efsMode": None, "u02ChartOwnsPvc": True}
 
         runtime_state.describe_deployment = _no_persistence_descriptor
         try:
@@ -374,11 +374,11 @@ class RuntimeStateClassifierTests(unittest.TestCase):
             runtime_state.describe_deployment = original_describe_deployment
 
     def test_23_app_absent_retained_pvc_with_existing_claim_mode_is_broken(self):
-        # A descriptor that references a pre-existing PVC (runtime.storage.u02.existingClaim set) never owns/creates its own PVC via the chart at all -- pvcClaimName being non-empty must be treated the same as "not chart-owned" here, exactly like the "no persistence declared" case above.
+        # A descriptor that references a pre-existing PVC (runtime.storage.u02.existingClaim set, u02ChartOwnsPvc=False) never owns/creates its own PVC via the chart at all -- must be treated the same as "not chart-owned" here, exactly like the "no persistence declared" case above.
         original_describe_deployment = runtime_state.describe_deployment
 
         def _existing_claim_descriptor(environment, deployment_id):
-            return {"deploymentId": deployment_id, "efsMode": "existing", "pvcClaimName": "some-pre-existing-pvc"}
+            return {"deploymentId": deployment_id, "efsMode": "existing", "u02ChartOwnsPvc": False}
 
         runtime_state.describe_deployment = _existing_claim_descriptor
         try:
@@ -386,6 +386,23 @@ class RuntimeStateClassifierTests(unittest.TestCase):
             cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
             result = _classify(cluster)
             self.assertEqual(result["state"], runtime_state.STATE_BROKEN)
+        finally:
+            runtime_state.describe_deployment = original_describe_deployment
+
+    def test_23b_app_absent_retained_pvc_with_custom_chart_owned_claim_name_is_owned(self):
+        # Distinguish Chart-Owned claimName From External existingClaim: a descriptor with a non-empty custom runtime.storage.u02.claimName (u02ChartOwnsPvc=True) is STILL chart-owned persistence -- must be recognized as the safe retained-PVC shape exactly like the default chart-derived name, never misclassified as "external" the way a naive `not pvcClaimName` check would (a non-empty claimName previously made this look identical to a genuine existingClaim).
+        original_describe_deployment = runtime_state.describe_deployment
+
+        def _custom_claim_name_descriptor(environment, deployment_id):
+            return {"deploymentId": deployment_id, "efsMode": "managed", "u02ChartOwnsPvc": True}
+
+        runtime_state.describe_deployment = _custom_claim_name_descriptor
+        try:
+            cluster = FakeCluster()
+            cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
+            result = _classify(cluster)
+            self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+            self.assertEqual(result["reasons"], [])
         finally:
             runtime_state.describe_deployment = original_describe_deployment
 
