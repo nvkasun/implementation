@@ -320,15 +320,24 @@ class RuntimeStateClassifierTests(unittest.TestCase):
         with self.assertRaises(runtime_state.ClassifierInspectionError):
             _classify(cluster)
 
-    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: DEPLOYMENT_ID (gg-postgresql-repltest-001) is a real descriptor that declares chart-owned managed EFS persistence (persistence.enabled=true, provider=efs, efs.mode=managed, no existingClaim) -- exactly the shape the retained-PVC safe case requires.
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5: this needs a descriptor that declares chart-owned managed EFS persistence (efsMode set, no pvcClaimName) -- exactly the shape the retained-PVC safe case requires. DEPLOYMENT_ID's own real descriptor no longer has this shape (it now permanently sets runtime.storage.u02.existingClaim -- Runtime Identity Migration, see RUNTIME_IDENTITY_MIGRATIONS in phase5_runtime.py -- to retain its OLD PVC forever), so this one test monkeypatches describe_deployment to the pre-migration chart-owned shape, matching this file's own established describe_deployment monkeypatch convention (see test_22/test_23 below).
 
     def test_19_app_absent_only_owned_retained_pvc_is_owned(self):
         # 25: App absent + owned retained PVC only is considered safe for re-enable -- the recognized "disabled runtime, durable /u02 data retained" shape.
-        cluster = FakeCluster()
-        cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
-        result = _classify(cluster)
-        self.assertEqual(result["state"], runtime_state.STATE_OWNED)
-        self.assertEqual(result["reasons"], [])
+        original_describe_deployment = runtime_state.describe_deployment
+
+        def _chart_owned_persistence_descriptor(environment, deployment_id):
+            return {"deploymentId": deployment_id, "efsMode": "managed", "pvcClaimName": ""}
+
+        runtime_state.describe_deployment = _chart_owned_persistence_descriptor
+        try:
+            cluster = FakeCluster()
+            cluster.put("persistentvolumeclaim", f"{DEPLOYMENT_ID}-u02", RUNTIME_NAMESPACE, _named_obj(f"{DEPLOYMENT_ID}-u02", _runtime_labels()))
+            result = _classify(cluster)
+            self.assertEqual(result["state"], runtime_state.STATE_OWNED)
+            self.assertEqual(result["reasons"], [])
+        finally:
+            runtime_state.describe_deployment = original_describe_deployment
 
     def test_20_app_absent_foreign_retained_pvc_is_broken(self):
         # 26: App absent + a same-named PVC whose ownership labels belong to a DIFFERENT deployment is BROKEN -- retained-persistence recognition never bypasses the ordinary per-resource ownership-label check.

@@ -194,6 +194,11 @@ def _check_application(run, reasons, environment, deployment_id, argocd_namespac
         reasons.append(f"Application {app_name} source.helm.releaseName={helm_source.get('releaseName')!r}, expected {deployment_id!r}")
 
 
+def _uses_externally_provisioned_u02_claim(descriptor):
+    """True when this deployment's u02 volume references a pre-existing/externally-provisioned PVC rather than one the chart itself creates -- exactly descriptor.get("pvcClaimName") being set (mirrors runtime_state.py's own declares_chart_owned_persistence: chart-owned means efsMode set AND no such override; this is its negation, restricted to the u02Type values that can even carry a claim). helm/goldengate/templates/runtime-pvc.yaml's own render condition (not existingClaim) skips PVC creation entirely for this shape -- the claim already existed before this Helm release ever ran, most commonly a retained PVC deliberately carried forward across a runtime identity migration (see RUNTIME_IDENTITY_MIGRATIONS in phase5_runtime.py) so the SAME durable /u02 EFS access-point directory keeps being used under a new deployment identity. Such a claim's own storageClassName is whatever it was ACTUALLY created with -- often a retired/legacy StorageClass name -- so it is never compared against this deployment's own freshly-derived StorageClass name; every other identity check (Bound phase, bound PV, CSI driver, volumeHandle-references-expected-EFS-filesystem) still applies fully and unconditionally, since those verify the ACTUAL durable backing identity regardless of which StorageClass object originally provisioned it. Never relaxes validation for a normal chart-owned PVC."""
+    return bool(descriptor.get("pvcClaimName"))
+
+
 def _expected_u02_claim_name(descriptor, deployment_id):
     """Mirrors helm/goldengate/templates/runtime-statefulset.yaml's u02 volume claimName resolution exactly for the two PVC-backed u02Type values. Returns None for emptyDir (no PVC) or an unrecognized/unset u02Type."""
     u02_type = descriptor.get("u02Type")
@@ -421,7 +426,7 @@ def _check_storage(run, reasons, environment, deployment_id, runtime_namespace, 
     pvc_spec = pvc_obj.get("spec") or {}
     if pvc_status.get("phase") != "Bound":
         reasons.append(f"persistentvolumeclaim/{pvc_name} phase={pvc_status.get('phase')!r}, expected 'Bound'")
-    if pvc_spec.get("storageClassName") != sc_name:
+    if not _uses_externally_provisioned_u02_claim(descriptor) and pvc_spec.get("storageClassName") != sc_name:
         reasons.append(f"persistentvolumeclaim/{pvc_name} storageClassName={pvc_spec.get('storageClassName')!r}, expected {sc_name!r}")
 
     volume_name = pvc_spec.get("volumeName")

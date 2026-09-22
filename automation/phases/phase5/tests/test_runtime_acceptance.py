@@ -1,4 +1,4 @@
-"""Offline tests for automation/phases/phase5/runtime_acceptance.py; run directly via `python3 automation/phases/phase5/tests/test_runtime_acceptance.py`. No live Kubernetes/AWS -- every kubectl response is a fake, injected fixture, and the expected EFS filesystem ID is passed in exactly as the real workflow would after its own read-only AWS resolution. Exercises the classifier's actual logic (never merely greps its source). Fixtures are shaped after the real, currently-active envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001 descriptor (source role, managed EFS, ingress enabled) -- describe_deployment() reads the real repository, never a scratch root, EXCEPT the dedicated RuntimeAcceptanceExternalClaimTests class below, which uses an isolated scratch environment to exercise the supported explicit-existingClaim shape those real descriptors do not use."""
+"""Offline tests for automation/phases/phase5/runtime_acceptance.py; run directly via `python3 automation/phases/phase5/tests/test_runtime_acceptance.py`. No live Kubernetes/AWS -- every kubectl response is a fake, injected fixture, and the expected EFS filesystem ID is passed in exactly as the real workflow would after its own read-only AWS resolution. Exercises the classifier's actual logic (never merely greps its source). Fixtures are shaped after the pre-migration envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001 descriptor (source role, chart-owned managed-EFS PVC, ingress enabled) -- describe_deployment() is redirected to a frozen snapshot of exactly that shape for (ENVIRONMENT, DEPLOYMENT_ID) below (see _FROZEN_CHART_OWNED_DESCRIPTOR), since the real descriptor now permanently retains its OLD PVC via existingClaim (Runtime Identity Migration) and no longer exercises the ordinary chart-owned-PVC contract these classes validate; every other (environment, deployment_id) pair still reads the real repository. RuntimeAcceptanceExternalClaimTests below is the dedicated class for the supported explicit-existingClaim/retained-claim shape, using its own isolated scratch environment."""
 from __future__ import annotations
 
 import importlib.util
@@ -54,6 +54,60 @@ MAIN_CONTAINER_PORTS = [
     {"name": "dist", "containerPort": 9013, "protocol": "TCP"},
     {"name": "metrics", "containerPort": 9015, "protocol": "TCP"},
 ]
+
+
+# Frozen chart-owned-PVC descriptor: the real envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml descriptor now permanently sets runtime.storage.u02.existingClaim (Runtime Identity Migration -- see RUNTIME_IDENTITY_MIGRATIONS in automation/phases/phase5/phase5_runtime.py), retaining its pre-migration gg-postgresql-repltest-01 PVC forever rather than a chart-owned "<deployment-id>-u02" PVC. That is the correct, permanent real-world shape, but it means no real DEV descriptor exercises the ordinary, still fully-supported chart-owned-PVC contract this file's classes below (everything except RuntimeAcceptanceExternalClaimTests, which already has its own dedicated existingClaim scratch fixture) were written to validate. Rather than let a real repository migration silently repoint every general classifier test onto the existing-claim path by accident, describe_deployment() is redirected for exactly (ENVIRONMENT, DEPLOYMENT_ID) to this frozen, pre-migration-shaped snapshot (captured from `goldengate-deployment-model.py describe gg-postgresql-repltest-001` before this repo's migration commit set existingClaim) -- every other (environment, deployment_id) pair, including deliberately unknown IDs and RuntimeAcceptanceExternalClaimTests' own scratch REPO_ROOT, still resolves through the real, unmodified describe_deployment() unchanged.
+_FROZEN_CHART_OWNED_DESCRIPTOR = {
+    "adminSecretName": ADMIN_SECRET_OBJECT_NAME,
+    "albGroupOrder": "112",
+    "containerName": CONTAINER_NAME,
+    "csiAdminEnabled": True,
+    "csiAdminMountPath": ADMIN_MOUNT_PATH,
+    "csiCertificateEnabled": True,
+    "csiCertificateMountPath": CERTIFICATE_MOUNT_PATH,
+    "csiEnabled": True,
+    "deploymentId": DEPLOYMENT_ID,
+    "deploymentType": "postgresql",
+    "efsCreationToken": "dev-gg-postgresql-repltest-01-efs",
+    "efsFileSystemId": None,
+    "efsMode": "managed",
+    "enabled": True,
+    "environment": ENVIRONMENT,
+    "extraVolumeMountNames": [],
+    "extraVolumeNames": [],
+    "imageRepository": f"{ECR_REGISTRY}/ogg-postgresql",
+    "imageRepositoryName": "ogg-postgresql",
+    "imageTag": "23.26.2.0.1",
+    "ingressClassName": "alb",
+    "ingressEnabled": True,
+    "ingressHost": DNS_DOMAIN,
+    "initPermissionsEnabled": True,
+    "monitoringNamespace": "goldengate-monitoring",
+    "pipeline": "repltest-pg-to-mssql-001",
+    "pvcClaimName": "",
+    "replicas": 1,
+    "role": "source",
+    "runtimeIngressHost": f"{DEPLOYMENT_ID}.{DNS_DOMAIN}",
+    "runtimeNamespace": RUNTIME_NAMESPACE,
+    "runtimeServiceAccountName": SA_NAME,
+    # Real gg-postgresql-repltest-001 descriptor: source role -> https/dist/metrics, receiver is null (not DEFAULT_SERVICE_PORT_VALUES' generic receiver=9014, which _service_obj's tests use for a DIFFERENT, target-shaped fixture).
+    "servicePorts": {"https": 8443, "dist": 9013, "receiver": None, "metrics": 9015},
+    "serviceType": "ClusterIP",
+    "tlsSecretName": TLS_SECRET_OBJECT_NAME,
+    "u02Type": "efs",
+    "valuesFile": "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml",
+}
+
+_real_describe_deployment = runtime_acceptance.describe_deployment
+
+
+def _frozen_describe_deployment(environment, deployment_id):
+    if environment == ENVIRONMENT and deployment_id == DEPLOYMENT_ID:
+        return dict(_FROZEN_CHART_OWNED_DESCRIPTOR)
+    return _real_describe_deployment(environment, deployment_id)
+
+
+runtime_acceptance.describe_deployment = _frozen_describe_deployment
 
 
 class FakeCluster:

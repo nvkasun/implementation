@@ -201,6 +201,49 @@ jobs:
             --environment "${GG_SELECTED_ENVIRONMENT}" \
             --deployment-id "${{ matrix.deployment_id }}"
 
+      # Runtime Identity Migration (u02 storage-preserving bridge): bounded to exactly the four historical pipeline-aware-hierarchy renames (phase5_runtime.py's own RUNTIME_IDENTITY_MIGRATIONS) -- every other matrix entry's deployment_id is a no-op here (read-only, zero extra kubectl calls). Sequenced strictly BEFORE "Reconcile runtime through Argo CD": read-only preflight classifies the OLD identity's live ownership and (only when its compute is still genuinely present) validates the retained /u02 PersistentVolumeClaim/PersistentVolume/EFS access-point identity against this SAME deployment's own already-resolved resolved_efs_id above -- never a second AWS call. OLD compute is torn down (ApplicationSet before its generated child Application, exactly like the existing removal ordering) only when preflight found it still present, and its absence is positively re-proven before the NEW identity is ever reconciled -- OLD and NEW compute never write GoldenGate /u02 concurrently. The retained PVC/PV are never mutated by any of these three steps.
+      - name: Runtime identity migration preflight
+        if: ${{ matrix.deploy }}
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
+        run: |
+          set -euo pipefail
+
+          python3 automation/phases/phase5/phase5_runtime.py migration-preflight \
+            --environment "${GG_SELECTED_ENVIRONMENT}" \
+            --deployment-id "${{ matrix.deployment_id }}"
+
+      - name: Runtime identity migration - remove OLD runtime compute
+        if: ${{ matrix.deploy }}
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
+        run: |
+          set -euo pipefail
+
+          python3 automation/phases/phase5/phase5_runtime.py migration-remove-old \
+            --environment "${GG_SELECTED_ENVIRONMENT}" \
+            --deployment-id "${{ matrix.deployment_id }}"
+
+      - name: Runtime identity migration - verify OLD runtime compute absent
+        if: ${{ matrix.deploy }}
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
+        run: |
+          set -euo pipefail
+
+          python3 automation/phases/phase5/phase5_runtime.py migration-verify-old-absent \
+            --environment "${GG_SELECTED_ENVIRONMENT}" \
+            --deployment-id "${{ matrix.deployment_id }}"
+
       - name: Render, validate and package runtime locally
         shell: bash
         run: |

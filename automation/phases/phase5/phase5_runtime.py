@@ -60,6 +60,20 @@ REMOVAL_ALLOWED_STATE_KEYS = frozenset({
     "applicationset_found", "footprint_found",
 })
 
+# Runtime Identity Migration (u02 storage-preserving bridge): exactly four intentional deployment-ID renames from the pipeline-aware hierarchy migration also require GoldenGate runtime COMPUTE identity (ApplicationSet/Application/StatefulSet/Services/Ingress/SecretProviderClasses) to move to a NEW canonical name while the durable /u02 PersistentVolumeClaim/PersistentVolume/EFS access-point identity is physically retained under its OLD name -- a PersistentVolumeClaim cannot be renamed in place, and deleting+recreating a same-named PVC would legitimately provision a DIFFERENT EFS access-point directory (helm/goldengate/templates/runtime-pvc.yaml's own documented contract: subPathPattern="${.PVC.name}" plus ensureUniqueDirectory=true ties the access-point directory to the SPECIFIC PVC/PV instance). The four NEW descriptors therefore permanently set runtime.storage.u02.existingClaim to the OLD PVC's own name -- a normal, pre-existing chart feature, never a new descriptor schema -- so the retained claim is simply an externally-provisioned volume from this Helm release's own point of view. This bounded map is what lets Phase 5 recognize exactly these four (environment, NEW deployment ID) pairs still need their OLD runtime COMPUTE torn down (never the retained PVC, which carries its own argocd.argoproj.io/sync-options: Prune=false,Delete=false protection, completely independent of this map) before the NEW identity is ever reconciled against that SAME storage, so OLD and NEW compute never write GoldenGate /u02 state concurrently. Discoverable purely from which deployment_id Phase 5 is currently processing -- independent of Git diff/rename detection, so a manual environment-wide workflow_dispatch Deploy with no rename diff still finds it on every single run. Self-terminating: once the OLD ApplicationSet/Application are genuinely gone (a prior run already completed the bridge), every later run's live classification of the OLD identity naturally reports "nothing to remove" and this becomes a read-only no-op forever -- no separate "confirmed complete" flag is needed. Never a general rename mechanism: a deployment_id absent from this map always takes the ordinary, unmodified reconciliation path, with zero extra kubectl calls.
+RUNTIME_IDENTITY_MIGRATIONS = {
+    ("dev", "gg-postgresql-repltest-001"): "gg-postgresql-repltest-01",
+    ("dev", "gg-mssql-repltest-001"): "gg-mssql-repltest-01",
+    ("dev", "gg-oracle-repltest-002"): "gg-oracle-repltest-01",
+    ("dev", "gg-postgresql-repltest-002"): "gg-postgresql-repltest-02",
+}
+
+MIGRATION_ALLOWED_STATE_KEYS = frozenset({
+    "environment", "new_deployment_id", "old_deployment_id", "bridge_required",
+    "old_ownership_state", "old_application_found", "old_applicationset_found", "old_footprint_found",
+    "old_pvc_name", "old_pv_name", "old_volume_handle", "expected_efs_file_system_id",
+})
+
 
 class Phase5Error(Exception):
     """A fail-closed Phase 5 Runtime error; main() reports it and exits non-zero."""
@@ -257,12 +271,17 @@ def _validate_removal_state_identity(state, environment, deployment_id):
 
 REMOVAL_COMMANDS = frozenset({"prepare-removal", "removal-preflight", "remove-runtime", "post-delete-acceptance"})
 
+# Own dedicated state file, distinct from BOTH reconcile-state and removal-state -- a migration-state document describes a relationship between TWO deployment IDs (old and new), never a single runtime's own reconcile/removal identity, so it must never be conflated with (or overwrite) either of those.
+MIGRATION_COMMANDS = frozenset({"migration-preflight", "migration-remove-old", "migration-verify-old-absent"})
+
 
 def state_path_for(command, mode, override):
     if override is not None:
         return override
     if command in REMOVAL_COMMANDS:
         return default_state_path("removal-state")
+    if command in MIGRATION_COMMANDS:
+        return default_state_path("migration-state")
     if command == "summary":
         return default_state_path("removal-state" if mode == "remove" else "runtime-state")
     return default_state_path("runtime-state")
@@ -1187,7 +1206,16 @@ def _validate_efs_values_shape(values, deployment_id, deployment_model):
     return True, {"mode": mode, "declared_file_system_id": declared_file_system_id, "base_path": base_path}
 
 
-def _validate_rendered_storageclass_and_pvc(docs, environment, deployment_id, resolved_efs_id, base_path):
+def _expected_rendered_u02_pvc_name(values, deployment_id):
+    """Mirrors helm/goldengate/templates/_helpers.tpl's goldengate.runtimeU02PVCName plus the runtime StatefulSet template's own u02 volume claimName resolution for runtime.storage.u02.type=efs, exactly: existingClaim (if set) is used directly and the runtime PVC template's own render condition skips PVC creation entirely for it (Runtime Identity Migration -- u02 storage-preserving bridge, see RUNTIME_IDENTITY_MIGRATIONS above -- this is the shape a retained OLD PVC carried forward under a NEW deployment identity always takes); otherwise claimName (if set) is still a chart-owned PVC under a custom name; otherwise the chart-derived "<deployment-id>-u02" name. Returns (expected_pvc_name, chart_owns_pvc) -- chart_owns_pvc is False only for the existingClaim case, where NO PersistentVolumeClaim document is ever rendered."""
+    u02 = ((values.get("runtime") or {}).get("storage") or {}).get("u02") or {}
+    existing_claim = u02.get("existingClaim") or ""
+    if existing_claim:
+        return existing_claim, False
+    return (u02.get("claimName") or f"{deployment_id}-u02"), True
+
+
+def _validate_rendered_storageclass_and_pvc(values, docs, environment, deployment_id, resolved_efs_id, base_path):
     expected_sc_name = f"gg-efs-{environment}-{deployment_id}"
     storage_classes = [d for d in docs if d.get("kind") == "StorageClass" and (d.get("metadata") or {}).get("name") == expected_sc_name]
     if len(storage_classes) != 1:
@@ -1210,10 +1238,15 @@ def _validate_rendered_storageclass_and_pvc(docs, environment, deployment_id, re
         raise Phase5Error(f"rendered StorageClass {expected_sc_name!r} does not match the expected configuration: {failed}")
     print(f"OK: StorageClass {expected_sc_name!r} matches the expected configuration (provisioner, provisioningMode, fileSystemId, basePath={base_path!r}, subPathPattern, ensureUniqueDirectory, reclaimPolicy).")
 
-    expected_pvc_name = f"{deployment_id}-u02"
-    pvcs = [d for d in docs if d.get("kind") == "PersistentVolumeClaim" and (d.get("metadata") or {}).get("name") == expected_pvc_name]
-    if len(pvcs) != 1:
-        raise Phase5Error(f"expected exactly one PersistentVolumeClaim named {expected_pvc_name!r}, found {len(pvcs)}.")
+    expected_pvc_name, chart_owns_pvc = _expected_rendered_u02_pvc_name(values, deployment_id)
+    rendered_pvcs = [d for d in docs if d.get("kind") == "PersistentVolumeClaim"]
+    if chart_owns_pvc:
+        pvcs = [d for d in rendered_pvcs if (d.get("metadata") or {}).get("name") == expected_pvc_name]
+        if len(pvcs) != 1:
+            raise Phase5Error(f"expected exactly one PersistentVolumeClaim named {expected_pvc_name!r}, found {len(pvcs)}.")
+    elif rendered_pvcs:
+        # Runtime Identity Migration (u02 storage-preserving bridge): runtime.storage.u02.existingClaim is set to a retained OLD PVC's own name -- helm/goldengate/templates/runtime-pvc.yaml's own render condition never creates a PVC for this shape, so ANY rendered PersistentVolumeClaim document here would mean the chart unexpectedly created a SECOND, dynamically-provisioned PVC alongside the retained one, which would legitimately provision a DIFFERENT EFS access-point directory.
+        raise Phase5Error(f"runtime.storage.u02.existingClaim={expected_pvc_name!r} is set (an externally-provisioned/retained claim, never chart-owned) -- expected ZERO chart-owned PersistentVolumeClaim documents, found {len(rendered_pvcs)}.")
 
     statefulsets = [d for d in docs if d.get("kind") == "StatefulSet"]
     if len(statefulsets) != 1:
@@ -1247,7 +1280,7 @@ def _validate_efs_render_contract(values, docs, environment, deployment_id, depl
         raise Phase5Error(f"resolved EFS ID ({resolved_efs_id}) does not match the declared persistence.efs.fileSystemId ({efs_file_system_id_declared_state}) for mode=existing.")
 
     print(f"persistence.enabled=true and provider=efs. Expected EFS fileSystemId: {resolved_efs_id}. Expected EFS basePath: {facts['base_path']}")
-    _validate_rendered_storageclass_and_pvc(docs, environment, deployment_id, resolved_efs_id, facts["base_path"])
+    _validate_rendered_storageclass_and_pvc(values, docs, environment, deployment_id, resolved_efs_id, facts["base_path"])
 
 
 def _package_runtime_chart(deployment_id, values_file, chart_version):
@@ -1595,6 +1628,230 @@ def cmd_validate_cluster_prerequisites(args):
     argocd_namespace = require_env("ARGOCD_NAMESPACE")
     _require_applicationset_controller_ready(argocd_namespace)
     print("OK: live EKS runtime prerequisites validated.")
+
+
+# Phase 5B, step 5.5: runtime identity migration bridge (AWS credentials required, Deploy only; bounded, one-time, self-terminating -- see RUNTIME_IDENTITY_MIGRATIONS above)
+
+_k8s_common_module = None
+
+
+def _load_k8s_common():
+    """Lazy import of automation/orchestration/k8s_common.py -- the single canonical read-only kubectl JSON-fetch helper (get_json/ClassifierInspectionError), genuinely cross-phase (shared by runtime_state.py/runtime_acceptance.py/the Phase 4 classifiers too) and never duplicated here."""
+    global _k8s_common_module
+    if _k8s_common_module is None:
+        spec = importlib.util.spec_from_file_location("k8s_common", REPO_ROOT / "automation" / "orchestration" / "k8s_common.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _k8s_common_module = module
+    return _k8s_common_module
+
+
+def _kubectl_runner(args):
+    """Adapts this module's own run() (an argument array including "kubectl" itself, REPO_ROOT cwd, Phase5Error on an unexpected non-kubectl failure) to k8s_common.get_json()'s expected calling convention -- a callable taking ONLY kubectl's own args and returning (returncode, stdout, stderr)."""
+    proc = run(["kubectl", *args], check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _validate_migration_state_identity(state, environment, new_deployment_id):
+    """Binds a persisted migration-state JSON document back to the CURRENT CLI environment/new_deployment_id AND the one bounded (environment, new_deployment_id) -> old_deployment_id pair RUNTIME_IDENTITY_MIGRATIONS itself names -- applied before any cluster connection or mutating call from a migration-state consumer (migration-remove-old, migration-verify-old-absent), so a stale/cross-runtime migration state file can never control a different runtime's mutation. Returns (old_deployment_id, bridge_required)."""
+    if not isinstance(state, dict):
+        raise Phase5Error(f"Phase 5 migration state is a {type(state).__name__}, expected a JSON object.")
+
+    def _require_exact(key, expected):
+        actual = state.get(key)
+        if actual != expected:
+            raise Phase5Error(f"Phase 5 migration state {key}={actual!r} does not match the current matrix runtime (expected {expected!r} for environment={environment!r}, new_deployment_id={new_deployment_id!r}) -- refusing to let a mismatched/stale migration state file control this mutation.")
+        return actual
+
+    _require_exact("environment", environment)
+    _require_exact("new_deployment_id", new_deployment_id)
+
+    expected_old_id = RUNTIME_IDENTITY_MIGRATIONS.get((environment, new_deployment_id)) or ""
+    _require_exact("old_deployment_id", expected_old_id)
+
+    bridge_required = state.get("bridge_required")
+    if not isinstance(bridge_required, bool):
+        raise Phase5Error(f"Phase 5 migration state bridge_required is {bridge_required!r} ({type(bridge_required).__name__}), expected a literal boolean -- refusing to mutate anything.")
+
+    return expected_old_id, bridge_required
+
+
+def cmd_migration_preflight(args):
+    """Determines whether (environment, deployment_id) is one of the four bounded runtime-identity-migration pairs; if not, records bridge_required=false and returns immediately -- zero extra kubectl calls, the ordinary reconciliation path is entirely unaffected. If it is, classifies the OLD identity's live ownership via runtime_state.py's own classifier (reused unmodified, retained_pvc_expected=True since the OLD descriptor itself no longer exists in Git) and fails closed (BROKEN) on any foreign/ambiguous OLD ApplicationSet/Application -- never proceeds with anything for either identity in that case. When OLD compute (ApplicationSet or Application) is still genuinely present, additionally validates -- read-only -- that the OLD /u02 PersistentVolumeClaim exists, is Bound, has a bound PersistentVolume using the efs.csi.aws.com CSI driver, and that PersistentVolume's volumeHandle references the SAME managed EFS filesystem this NEW deployment's own already-resolved resolved_efs_id names (the reconcile-state value resolve-live-inputs already computed earlier in this same job -- never re-resolved via a second AWS call here). Persists the exact retained PVC/PV/volumeHandle identity (never a secret) for migration-remove-old/migration-verify-old-absent to reuse and re-verify unchanged."""
+    environment = require_environment_arg(args.environment)
+    new_deployment_id = require_deployment_id_arg(args.deployment_id)
+
+    old_deployment_id = RUNTIME_IDENTITY_MIGRATIONS.get((environment, new_deployment_id))
+    if old_deployment_id is None:
+        update_state(args.state_path, {
+            "environment": environment, "new_deployment_id": new_deployment_id, "old_deployment_id": "",
+            "bridge_required": False,
+        }, MIGRATION_ALLOWED_STATE_KEYS)
+        print(f"{new_deployment_id} is not one of the bounded runtime-identity-migration pairs -- ordinary reconciliation proceeds normally.")
+        return
+
+    _connect_to_eks()
+
+    classify_proc = run([sys.executable, str(RUNTIME_STATE_TOOL), "--environment", environment, "--deployment-id", old_deployment_id, "--retained-pvc-expected"], check=False)
+    if classify_proc.stderr:
+        print(classify_proc.stderr, file=sys.stderr)
+    if classify_proc.returncode != 0:
+        raise Phase5Error(f"the GoldenGate runtime ownership classifier could not classify OLD migration identity {old_deployment_id!r} (configuration or inspection error) -- refusing to proceed with the {new_deployment_id!r} runtime-identity migration.")
+
+    try:
+        old_result = json.loads(classify_proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise Phase5Error(f"the GoldenGate runtime ownership classifier produced unparseable output for OLD migration identity {old_deployment_id!r}: {exc}") from exc
+
+    old_state, old_application_found, old_applicationset_found, old_footprint_found = _validate_runtime_state_classifier_output(old_result)
+    if old_state == "BROKEN":
+        raise Phase5Error(f"GoldenGate runtime ownership-safety state for OLD migration identity {old_deployment_id!r} is BROKEN -- an existing Argo CD ApplicationSet/Application/footprint does not clearly belong to it (foreign or ambiguous ownership). Refusing to touch anything for the {new_deployment_id!r} runtime-identity migration.")
+
+    bridge_required = bool(old_application_found or old_applicationset_found)
+
+    descriptor = _describe_deployment_json(environment, new_deployment_id)
+    efs_mode = descriptor.get("efsMode")
+
+    old_pvc_name = ""
+    old_pv_name = ""
+    old_volume_handle = ""
+    expected_efs_file_system_id = ""
+    if efs_mode:
+        reconcile_state = load_state(default_state_path("runtime-state"))
+        expected_efs_file_system_id = require_state_value(reconcile_state, "resolved_efs_id")
+        k8s_common = _load_k8s_common()
+        old_pvc_name = f"{old_deployment_id}-u02"
+        pvc_found, pvc_obj = k8s_common.get_json(_kubectl_runner, "persistentvolumeclaim", old_pvc_name, require_env("RUNTIME_NAMESPACE"))
+        if not pvc_found:
+            raise Phase5Error(f"OLD runtime-identity migration source persistentvolumeclaim/{old_pvc_name} does not exist -- refusing to proceed with the {new_deployment_id!r} runtime-identity migration without proven retained storage.")
+        pvc_status = (pvc_obj.get("status") or {})
+        pvc_spec = (pvc_obj.get("spec") or {})
+        if pvc_status.get("phase") != "Bound":
+            raise Phase5Error(f"OLD runtime-identity migration source persistentvolumeclaim/{old_pvc_name} phase={pvc_status.get('phase')!r}, expected 'Bound' -- refusing to proceed.")
+        old_pv_name = pvc_spec.get("volumeName") or ""
+        if not old_pv_name:
+            raise Phase5Error(f"OLD runtime-identity migration source persistentvolumeclaim/{old_pvc_name} has no bound volumeName -- refusing to proceed.")
+        pv_found, pv_obj = k8s_common.get_json(_kubectl_runner, "persistentvolume", old_pv_name)
+        if not pv_found:
+            raise Phase5Error(f"OLD runtime-identity migration source persistentvolume/{old_pv_name} (bound to {old_pvc_name}) does not exist -- refusing to proceed.")
+        pv_csi = ((pv_obj.get("spec") or {}).get("csi")) or {}
+        if pv_csi.get("driver") != "efs.csi.aws.com":
+            raise Phase5Error(f"OLD runtime-identity migration source persistentvolume/{old_pv_name} spec.csi.driver={pv_csi.get('driver')!r}, expected 'efs.csi.aws.com' -- refusing to proceed.")
+        old_volume_handle = pv_csi.get("volumeHandle") or ""
+        if not old_volume_handle.startswith(f"{expected_efs_file_system_id}::"):
+            raise Phase5Error(f"OLD runtime-identity migration source persistentvolume/{old_pv_name} volumeHandle={old_volume_handle!r} does not reference this deployment's own expected managed EFS filesystem {expected_efs_file_system_id!r} -- refusing to proceed.")
+        print(f"OK: OLD runtime-identity migration source persistentvolumeclaim/{old_pvc_name} is Bound to persistentvolume/{old_pv_name}, whose volumeHandle references the expected EFS filesystem {expected_efs_file_system_id!r}.")
+
+    update_state(args.state_path, {
+        "environment": environment, "new_deployment_id": new_deployment_id, "old_deployment_id": old_deployment_id,
+        "bridge_required": bridge_required,
+        "old_ownership_state": old_state, "old_application_found": old_application_found,
+        "old_applicationset_found": old_applicationset_found, "old_footprint_found": old_footprint_found,
+        "old_pvc_name": old_pvc_name, "old_pv_name": old_pv_name, "old_volume_handle": old_volume_handle,
+        "expected_efs_file_system_id": expected_efs_file_system_id,
+    }, MIGRATION_ALLOWED_STATE_KEYS)
+
+    if bridge_required:
+        print(f"Runtime-identity migration bridge required: OLD identity {old_deployment_id!r} still has live compute (applicationset_found={old_applicationset_found}, application_found={old_application_found}) -- it will be removed before {new_deployment_id!r} is reconciled, never concurrently.")
+    else:
+        print(f"OLD identity {old_deployment_id!r} has no live compute remaining (already migrated in a prior run, or never existed) -- proceeding directly to ordinary reconciliation for {new_deployment_id!r}.")
+
+
+def cmd_migration_remove_old(args):
+    """Reuses the EXACT SAME approved removal mutation sequence as cmd_remove_runtime (ApplicationSet deleted before its generated child Application is touched, matching the existing self-healing removal-ordering safety proof) -- but targets the OLD migration identity's own canonical names, never the current CLI deployment_id's own. No-ops (zero kubectl mutation calls) when migration-preflight already determined bridge_required=false. The retained /u02 PersistentVolumeClaim is never touched here, exactly like normal runtime removal -- its own argocd.argoproj.io/sync-options: Prune=false,Delete=false annotation is what actually protects it, completely independent of this code path."""
+    environment = require_environment_arg(args.environment)
+    new_deployment_id = require_deployment_id_arg(args.deployment_id)
+    state = load_state(args.state_path)
+
+    old_deployment_id, bridge_required = _validate_migration_state_identity(state, environment, new_deployment_id)
+    if not bridge_required:
+        print(f"No runtime-identity migration bridge is required for {new_deployment_id!r} -- nothing to remove.")
+        return
+
+    old_application_found = state.get("old_application_found")
+    old_applicationset_found = state.get("old_applicationset_found")
+    if not isinstance(old_application_found, bool) or not isinstance(old_applicationset_found, bool):
+        raise Phase5Error("Phase 5 migration state old_application_found/old_applicationset_found must be literal booleans -- refusing to mutate anything.")
+
+    argocd_app_name = _canonical_argocd_app_name(environment, old_deployment_id)
+    argocd_appset_name = _canonical_appset_name(environment, old_deployment_id)
+    argocd_namespace = require_env("ARGOCD_NAMESPACE")
+
+    _connect_to_eks()
+
+    # Same self-healing removal ordering as cmd_remove_runtime: the ApplicationSet's OWN ownership is removed BEFORE its generated child Application is touched, so the controller can never recreate the child in the window between deleting the child and deleting its owner.
+    if old_applicationset_found:
+        delete_appset_proc = run(["kubectl", "delete", "applicationset", argocd_appset_name, "-n", argocd_namespace, "--wait=true", "--timeout=5m"], check=False)
+        if delete_appset_proc.returncode != 0:
+            raise Phase5Error(f"failed to delete OLD migration-identity Argo CD ApplicationSet {argocd_appset_name}: {((delete_appset_proc.stderr or '') + (delete_appset_proc.stdout or '')).strip()}")
+        print(f"Argo CD ApplicationSet {argocd_appset_name} (OLD migration identity {old_deployment_id!r}) deleted -- self-healing ownership removed before its generated Application is touched.")
+
+    if old_application_found:
+        patch_proc = run(["kubectl", "patch", "application", argocd_app_name, "-n", argocd_namespace, "--type", "merge",
+                           "-p", json.dumps({"metadata": {"finalizers": ["resources-finalizer.argocd.argoproj.io"]}})], check=False)
+        if patch_proc.returncode != 0 and "(NotFound)" not in (patch_proc.stderr or ""):
+            raise Phase5Error(f"failed to patch finalizers on OLD migration-identity Argo CD Application {argocd_app_name}: {((patch_proc.stderr or '') + (patch_proc.stdout or '')).strip()}")
+
+        delete_proc = run(["kubectl", "delete", "application", argocd_app_name, "-n", argocd_namespace, "--wait=true", "--timeout=10m"], check=False)
+        if delete_proc.returncode != 0 and "(NotFound)" not in (delete_proc.stderr or ""):
+            raise Phase5Error(f"failed to delete OLD migration-identity Argo CD Application {argocd_app_name}: {((delete_proc.stderr or '') + (delete_proc.stdout or '')).strip()}")
+        print(f"Argo CD Application {argocd_app_name} (OLD migration identity {old_deployment_id!r}) deleted. Argo CD will cascade-delete its managed resources.")
+
+    print(f"The retained /u02 PersistentVolumeClaim {state.get('old_pvc_name')!r} is never deleted here -- its own argocd.argoproj.io/sync-options: Prune=false,Delete=false annotation protects it. The shared runtime namespace is never deleted either.")
+
+
+def cmd_migration_verify_old_absent(args):
+    """No-ops when migration-preflight already determined bridge_required=false. Otherwise re-classifies the OLD identity via runtime_state.py's classifier (reused unmodified) and requires it now shows genuine compute absence -- reuses the exact same positive-absence proof cmd_post_delete_acceptance itself relies on (_post_delete_positively_absent, retained_pvc_expected=True), never a second independent definition of "absent". Also re-reads the retained PVC/PV/volumeHandle and requires them BYTE-FOR-BYTE IDENTICAL to what migration-preflight captured -- proving the OLD-compute removal above genuinely never touched durable storage."""
+    environment = require_environment_arg(args.environment)
+    new_deployment_id = require_deployment_id_arg(args.deployment_id)
+    state = load_state(args.state_path)
+
+    old_deployment_id, bridge_required = _validate_migration_state_identity(state, environment, new_deployment_id)
+    if not bridge_required:
+        print(f"No runtime-identity migration bridge was required for {new_deployment_id!r} -- nothing to verify.")
+        return
+
+    _connect_to_eks()
+
+    classify_proc = run([sys.executable, str(RUNTIME_STATE_TOOL), "--environment", environment, "--deployment-id", old_deployment_id, "--retained-pvc-expected"], check=False)
+    if classify_proc.stderr:
+        print(classify_proc.stderr, file=sys.stderr)
+    if classify_proc.returncode != 0:
+        raise Phase5Error(f"the GoldenGate runtime ownership classifier could not re-classify OLD migration identity {old_deployment_id!r} after removal -- refusing to accept the {new_deployment_id!r} runtime-identity migration as complete.")
+
+    try:
+        old_result = json.loads(classify_proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise Phase5Error(f"the GoldenGate runtime ownership classifier produced unparseable output while re-classifying OLD migration identity {old_deployment_id!r}: {exc}") from exc
+
+    positively_absent, reason = _post_delete_positively_absent(old_result, retained_pvc_expected=True)
+    if not positively_absent:
+        raise Phase5Error(f"OLD migration identity {old_deployment_id!r} compute is not positively confirmed absent after removal ({reason}) -- refusing to accept the {new_deployment_id!r} runtime-identity migration as complete.")
+    print(f"OK: OLD migration identity {old_deployment_id!r} compute is positively confirmed absent (retained PVC only).")
+
+    expected_efs_file_system_id = state.get("expected_efs_file_system_id") or ""
+    if expected_efs_file_system_id:
+        k8s_common = _load_k8s_common()
+        old_pvc_name = require_state_value(state, "old_pvc_name")
+        old_pv_name = require_state_value(state, "old_pv_name")
+        old_volume_handle = require_state_value(state, "old_volume_handle")
+
+        pvc_found, pvc_obj = k8s_common.get_json(_kubectl_runner, "persistentvolumeclaim", old_pvc_name, require_env("RUNTIME_NAMESPACE"))
+        if not pvc_found:
+            raise Phase5Error(f"retained persistentvolumeclaim/{old_pvc_name} no longer exists after removing OLD migration identity {old_deployment_id!r} compute -- the removal step must never have deleted it.")
+        pvc_spec = (pvc_obj.get("spec") or {})
+        if (pvc_obj.get("status") or {}).get("phase") != "Bound":
+            raise Phase5Error(f"retained persistentvolumeclaim/{old_pvc_name} is no longer Bound after removing OLD migration identity {old_deployment_id!r} compute.")
+        if pvc_spec.get("volumeName") != old_pv_name:
+            raise Phase5Error(f"retained persistentvolumeclaim/{old_pvc_name} is now bound to persistentvolume/{pvc_spec.get('volumeName')!r}, expected the SAME persistentvolume/{old_pv_name!r} captured during migration preflight -- refusing to accept the {new_deployment_id!r} runtime-identity migration as complete.")
+
+        pv_found, pv_obj = k8s_common.get_json(_kubectl_runner, "persistentvolume", old_pv_name)
+        if not pv_found:
+            raise Phase5Error(f"retained persistentvolume/{old_pv_name} no longer exists after removing OLD migration identity {old_deployment_id!r} compute.")
+        actual_volume_handle = ((pv_obj.get("spec") or {}).get("csi") or {}).get("volumeHandle") or ""
+        if actual_volume_handle != old_volume_handle:
+            raise Phase5Error(f"retained persistentvolume/{old_pv_name} volumeHandle changed from {old_volume_handle!r} (captured during migration preflight) to {actual_volume_handle!r} -- refusing to accept the {new_deployment_id!r} runtime-identity migration as complete.")
+        print(f"OK: retained persistentvolumeclaim/{old_pvc_name} remains Bound to the SAME persistentvolume/{old_pv_name} with the SAME volumeHandle -- durable /u02 storage identity is unchanged.")
 
 
 # Phase 5B, step 6: reconcile-runtime (AWS credentials required, Deploy only)
@@ -2207,6 +2464,9 @@ _SUBCOMMANDS = {
     "validate-local": cmd_validate_local,
     "publish-chart": cmd_publish_chart,
     "validate-cluster-prerequisites": cmd_validate_cluster_prerequisites,
+    "migration-preflight": cmd_migration_preflight,
+    "migration-remove-old": cmd_migration_remove_old,
+    "migration-verify-old-absent": cmd_migration_verify_old_absent,
     "reconcile-runtime": cmd_reconcile_runtime,
     "post-deploy-diagnostics": cmd_post_deploy_diagnostics,
     "prepare-removal": cmd_prepare_removal,
@@ -2219,7 +2479,8 @@ _SUBCOMMANDS = {
 
 _DEPLOYMENT_ID_SUBCOMMANDS = (
     "ownership-preflight", "resolve-live-inputs", "validate-local", "publish-chart",
-    "validate-cluster-prerequisites", "reconcile-runtime", "post-deploy-diagnostics",
+    "validate-cluster-prerequisites", "migration-preflight", "migration-remove-old", "migration-verify-old-absent",
+    "reconcile-runtime", "post-deploy-diagnostics",
     "removal-preflight", "remove-runtime", "post-delete-acceptance", "strict-acceptance",
 )
 

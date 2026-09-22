@@ -59,7 +59,8 @@ runtime:
   storage:
     u02:
       type: efs
-      existingClaim: ""
+      # Runtime Identity Migration (u02 storage-preserving bridge): this deployment's OLD identity (gg-postgresql-repltest-02) still physically owns the durable /u02 PersistentVolumeClaim/EFS access-point directory -- a PVC cannot be renamed in place, and recreating a same-named PVC would legitimately provision a DIFFERENT EFS access-point directory (helm/goldengate/templates/runtime-pvc.yaml's own documented contract), so this retained claim intentionally keeps its OLD physical name permanently rather than being silently renamed/recreated. helm/goldengate/templates/runtime-pvc.yaml never creates a NEW PVC while existingClaim is set (this is the chart's own normal, pre-existing existingClaim contract, never a new descriptor field); automation/phases/phase5/phase5_runtime.py's RUNTIME_IDENTITY_MIGRATIONS is what tears down the OLD gg-postgresql-repltest-02 runtime COMPUTE (never this retained PVC) before this NEW identity is ever reconciled against it.
+      existingClaim: gg-postgresql-repltest-02-u02
       claimName: ""
       size: 20Gi
       accessModes:

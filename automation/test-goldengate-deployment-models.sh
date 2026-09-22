@@ -1781,8 +1781,9 @@ print('OK')
       cat "${WORKDIR}/${name}-sidecar.log"
     fi
 
-    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5 (tests 22/24): the rendered runtime PVC carries the approved Argo CD Prune=false,Delete=false retention contract -- the SAME convention already established and validated elsewhere in this repository (helm/goldengate-platform's runtime-namespace.yaml/runtime-serviceaccounts.yaml, cross-checked by 30-sub-platform.yaml) for other deletion-protected shared objects (test 22 -- both real descriptors declare chart-owned managed EFS persistence), while every OTHER compute/workload kind (StatefulSet/Service/Ingress) carries NO such annotation at all (test 24 -- proving Application deletion still prunes/cascade-deletes them normally; only durable storage state is protected).
-    if python3 -c "
+    # GoldenGate Runtime Presence Contract -- Final Safety Correction, Gap 5 (tests 22/24): the rendered runtime PVC carries the approved Argo CD Prune=false,Delete=false retention contract -- the SAME convention already established and validated elsewhere in this repository (helm/goldengate-platform's runtime-namespace.yaml/runtime-serviceaccounts.yaml, cross-checked by 30-sub-platform.yaml) for other deletion-protected shared objects (test 22 -- both real descriptors declare chart-owned managed EFS persistence), while every OTHER compute/workload kind (StatefulSet/Service/Ingress) carries NO such annotation at all (test 24 -- proving Application deletion still prunes/cascade-deletes them normally; only durable storage state is protected). Runtime Identity Migration (u02 storage-preserving bridge): a deployment whose runtime.storage.u02.existingClaim is set (see RUNTIME_IDENTITY_MIGRATIONS in automation/phases/phase5/phase5_runtime.py) never renders a PersistentVolumeClaim document at all -- helm/goldengate/templates/runtime-pvc.yaml's own documented existingClaim condition skips PVC creation entirely, so this chart never owns/annotates that retained claim in the first place; for exactly that shape, the check below instead proves the StatefulSet's own u02 volume references the externally-provisioned claim, never a chart-generated PVC.
+    if grep -q '^kind: PersistentVolumeClaim$' "$RENDERED"; then
+      if python3 -c "
 import sys, yaml
 docs = [d for d in yaml.safe_load_all(open('$RENDERED')) if d]
 pvcs = [d for d in docs if d.get('kind') == 'PersistentVolumeClaim']
@@ -1797,18 +1798,54 @@ for kind in ('StatefulSet', 'Service', 'Ingress'):
         assert 'argocd.argoproj.io/sync-options' not in annotations, f'{kind} unexpectedly carries argocd.argoproj.io/sync-options -- only the durable PVC may be retention-protected, compute must still be pruned normally'
 print('OK')
 " >"${WORKDIR}/${name}-pvc-retention.log" 2>&1; then
-      pass "${name}: runtime PVC carries argocd.argoproj.io/sync-options: Prune=false,Delete=false, while StatefulSet/Service/Ingress carry no such annotation (compute still prunes normally, only durable storage is protected)"
+        pass "${name}: runtime PVC carries argocd.argoproj.io/sync-options: Prune=false,Delete=false, while StatefulSet/Service/Ingress carry no such annotation (compute still prunes normally, only durable storage is protected)"
+      else
+        fail "${name}: PVC retention-annotation check failed"
+        cat "${WORKDIR}/${name}-pvc-retention.log"
+      fi
+    elif python3 -c "
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open('$RENDERED')) if d]
+sts = [d for d in docs if d.get('kind') == 'StatefulSet']
+assert sts, 'no StatefulSet document rendered'
+volumes = sts[0]['spec']['template']['spec'].get('volumes', [])
+u02 = [v for v in volumes if v.get('name') == 'u02']
+assert u02, 'no u02 volume in the rendered StatefulSet'
+claim_name = (u02[0].get('persistentVolumeClaim') or {}).get('claimName')
+assert claim_name, 'u02 volume has no persistentVolumeClaim.claimName'
+print('OK')
+" >"${WORKDIR}/${name}-pvc-retention.log" 2>&1; then
+      pass "${name}: no chart-owned PersistentVolumeClaim rendered (runtime.storage.u02.existingClaim is set -- Runtime Identity Migration retained-claim bridge); the StatefulSet's u02 volume references the externally-provisioned claim directly"
     else
       fail "${name}: PVC retention-annotation check failed"
       cat "${WORKDIR}/${name}-pvc-retention.log"
     fi
 
-    # 30: false -> true re-enable must reuse the SAME PVC name -- proven by rendering the same descriptor/release name twice independently and comparing the PVC name byte-for-byte (a purely deterministic template function of Release.Name, never a random/time-based suffix).
+    # 30: false -> true re-enable must reuse the SAME PVC name -- proven by rendering the same descriptor/release name twice independently and comparing the PVC (or, for a retained existingClaim, the StatefulSet's u02 volume claimName) name byte-for-byte (a purely deterministic template function of Release.Name/values.yaml, never a random/time-based suffix).
     RENDERED_SECOND_RENDER="${WORKDIR}/${name}-second-render.yaml"
     if helm template "$name" "$RUNTIME_CHART" --namespace goldengate-dev \
         -f "$VALUES_FILE" "${SHARED_OVERRIDES[@]}" > "$RENDERED_SECOND_RENDER" 2>"${WORKDIR}/${name}-second-render.err"; then
-      PVC_NAME_FIRST="$(grep -A2 '^kind: PersistentVolumeClaim$' "$RENDERED" | grep '  name:' | head -1)"
-      PVC_NAME_SECOND="$(grep -A2 '^kind: PersistentVolumeClaim$' "$RENDERED_SECOND_RENDER" | grep '  name:' | head -1)"
+      if grep -q '^kind: PersistentVolumeClaim$' "$RENDERED"; then
+        PVC_NAME_FIRST="$(grep -A2 '^kind: PersistentVolumeClaim$' "$RENDERED" | grep '  name:' | head -1)"
+        PVC_NAME_SECOND="$(grep -A2 '^kind: PersistentVolumeClaim$' "$RENDERED_SECOND_RENDER" | grep '  name:' | head -1)"
+      else
+        PVC_NAME_FIRST="$(python3 -c "
+import yaml
+docs = [d for d in yaml.safe_load_all(open('$RENDERED')) if d]
+sts = [d for d in docs if d.get('kind') == 'StatefulSet'][0]
+volumes = sts['spec']['template']['spec'].get('volumes', [])
+u02 = [v for v in volumes if v.get('name') == 'u02'][0]
+print(u02['persistentVolumeClaim']['claimName'])
+")"
+        PVC_NAME_SECOND="$(python3 -c "
+import yaml
+docs = [d for d in yaml.safe_load_all(open('$RENDERED_SECOND_RENDER')) if d]
+sts = [d for d in docs if d.get('kind') == 'StatefulSet'][0]
+volumes = sts['spec']['template']['spec'].get('volumes', [])
+u02 = [v for v in volumes if v.get('name') == 'u02'][0]
+print(u02['persistentVolumeClaim']['claimName'])
+")"
+      fi
       if [ -n "$PVC_NAME_FIRST" ] && [ "$PVC_NAME_FIRST" = "$PVC_NAME_SECOND" ]; then
         pass "30: ${name}: two independent renders of the same release name produce the identical PVC name (${PVC_NAME_FIRST# name: }) -- a future deployment.enabled=false then true re-enable reuses the SAME PVC/storage identity, never a random/time-based suffix"
       else
@@ -4100,7 +4137,7 @@ if [ "$HELM_AVAILABLE" = "true" ] && [ "$PYTHON_AVAILABLE" = "true" ]; then
   EFS_WORKDIR="${WORKDIR}/efs-test"
   mkdir -p "${EFS_WORKDIR}/rendered" "${EFS_WORKDIR}/values"
 
-  # mode=existing scratch fixtures: derived by mutating ONLY persistence.efs on scratch copies of the two current real descriptors (never a hand-duplicated retired production descriptor) -- proves the generic mode=existing code path from a source that always exists.
+  # mode=existing scratch fixtures: derived by mutating ONLY persistence.efs on scratch copies of the two current real descriptors (never a hand-duplicated retired production descriptor) -- proves the generic mode=existing code path from a source that always exists. Both source descriptors now permanently carry runtime.storage.u02.existingClaim (Runtime Identity Migration -- see RUNTIME_IDENTITY_MIGRATIONS in automation/phases/phase5/phase5_runtime.py), which is orthogonal to what THIS test validates (chart-owned-PVC StorageClass/basePath derivation) -- also cleared here on the scratch copy so this stays a chart-owned-PVC fixture, exactly as before that migration.
   ORACLE_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-a.yaml"
   POSTGRESQL_EXISTING_FIXTURE="${EFS_WORKDIR}/values/existing-mode-b.yaml"
   python3 -c "
@@ -4111,6 +4148,7 @@ def make_existing_fixture(src_path, dst_path, fs_id):
         data = yaml.safe_load(f)
     data['persistence']['efs']['mode'] = 'existing'
     data['persistence']['efs']['fileSystemId'] = fs_id
+    data['runtime']['storage']['u02']['existingClaim'] = ''
     with open(dst_path, 'w') as f:
         yaml.dump(data, f)
 
@@ -16990,7 +17028,7 @@ def step_names_with_credentials(job):
 
 
 results.append(("O: runtime_ownership_preflight -- only 'Classify runtime ownership safety' receives credential outputs", step_names_with_credentials(phase5_jobs["runtime_ownership_preflight"]) == {"Classify runtime ownership safety"}))
-results.append(("O: build_publish_and_deploy -- exactly the five live-AWS steps receive credential outputs", step_names_with_credentials(phase5_jobs["build_publish_and_deploy"]) == {"Resolve and verify live AWS inputs", "Publish runtime Helm chart to private ECR", "Validate live EKS runtime prerequisites", "Reconcile runtime through Argo CD", "Post-deployment diagnostics"}))
+results.append(("O: build_publish_and_deploy -- exactly the eight live-AWS steps receive credential outputs (five original plus the three bounded Runtime Identity Migration bridge steps)", step_names_with_credentials(phase5_jobs["build_publish_and_deploy"]) == {"Resolve and verify live AWS inputs", "Runtime identity migration preflight", "Runtime identity migration - remove OLD runtime compute", "Runtime identity migration - verify OLD runtime compute absent", "Publish runtime Helm chart to private ECR", "Validate live EKS runtime prerequisites", "Reconcile runtime through Argo CD", "Post-deployment diagnostics"}))
 results.append(("O: delete_removed_argocd_applications -- exactly the three live-AWS steps receive credential outputs", step_names_with_credentials(phase5_jobs["delete_removed_argocd_applications"]) == {"Classify removal safety", "Remove owned runtime Application", "Verify runtime compute absence"}))
 results.append(("O: validate_active_runtimes -- only 'Require runtime to be exactly HEALTHY' receives credential outputs", step_names_with_credentials(phase5_jobs["validate_active_runtimes"]) == {"Require runtime to be exactly HEALTHY"}))
 
