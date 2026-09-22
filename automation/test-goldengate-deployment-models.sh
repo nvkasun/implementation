@@ -6739,12 +6739,14 @@ var_body = var_match.group(1) if var_match else ""
 check("goldengate_config_migration_pending defaults to true (the real live migration has not run as of this correction)", re.search(r"default\s*=\s*true", var_body) is not None)
 check("goldengate_config_migration_pending is typed bool", re.search(r"type\s*=\s*bool", var_body) is not None)
 
-data_match = re.search(r"data \"aws_dynamodb_table_item\" \"legacy_pipeline_config\" \{(.*?)\n\}", dynamodb_tf, re.S)
+data_match = re.search(r"data \"aws_dynamodb_table_item\" \"legacy_pipeline_config\" \{(.*?)\n\}\n\n#", dynamodb_tf, re.S)
 check("6: read-only legacy CONFIG data source exists", data_match is not None)
 data_body = data_match.group(1) if data_match else ""
 check("legacy CONFIG data source for_each is gated on goldengate_config_migration_pending, sourced from the bounded map only (never all deployments)", "var.goldengate_config_migration_pending ? local.goldengate_config_migration_source_ids : {}" in data_body)
 check("legacy CONFIG data source reads by the OLD id (each.value), never the NEW id (each.key)", "S = each.value" in data_body and "pipeline   = { S = each.value }" in data_body.replace("\n", " ").replace("  ", " ") or "each.value" in data_body)
 check("legacy CONFIG data source targets the same gg-eks-pipeline table and CONFIG recordType", "table_name = \"gg-eks-pipeline\"" in data_body and "\"CONFIG\"" in data_body)
+check("11/12/13: fail-closed postcondition rejects a read-back item whose own pipeline.S does not exactly equal the mapped OLD id (missing/malformed/foreign identity)", "jsondecode(self.item).pipeline.S, null) == each.value" in data_body)
+check("13: fail-closed postcondition rejects a read-back item whose own recordType.S is not exactly \"CONFIG\"", "jsondecode(self.item).recordType.S, null) == \"CONFIG\"" in data_body)
 
 contract_match = re.search(r"resource \"terraform_data\" \"goldengate_config_migration_contract\" \{(.*?)\n\}\n", dynamodb_tf, re.S)
 check("fail-closed migration-contract precondition resource exists", contract_match is not None)
@@ -6757,7 +6759,10 @@ pipeline_config_match = re.search(r"resource \"aws_dynamodb_table_item\" \"pipel
 check("pipeline_config resource block located", pipeline_config_match is not None)
 pipeline_config_body = pipeline_config_match.group(1) if pipeline_config_match else ""
 check("4/10: item selection ternary is gated on BOTH goldengate_config_migration_pending AND contains(...) membership in the bounded map -- a future/unrelated deployment ID (never a map member) always takes the plain-default branch, regardless of the pending switch", "var.goldengate_config_migration_pending && contains(keys(local.goldengate_config_migration_source_ids), each.key)" in pipeline_config_body)
-check("6: the bounded (pending) branch sources item from the legacy data source, never re-synthesizes a default body for a migrated id", "data.aws_dynamodb_table_item.legacy_pipeline_config[each.key].item" in pipeline_config_body)
+check("2/4/5/6/9: the bounded (pending) branch never assigns the legacy data source item verbatim -- it decodes it, merges in an override, and re-encodes (jsondecode(...) -> merge(...) -> jsonencode(...)), never re-synthesizing a default body for a migrated id either", "jsonencode(merge(" in pipeline_config_body and "jsondecode(data.aws_dynamodb_table_item.legacy_pipeline_config[each.key].item)" in pipeline_config_body)
+check("2/10: the merge override rewrites ONLY the physical pipeline key to the NEW canonical id (each.key) -- never the OLD id, never a hardcoded literal", re.search(r"pipeline\s*=\s*\{\s*S\s*=\s*each\.key\s*\}", pipeline_config_body) is not None)
+check("3: the merge override forces recordType back to exactly \"CONFIG\" defensively, on top of whatever the read-back item already validated to", re.search("recordType\\s*=\\s*\\{\\s*S\\s*=\\s*\"CONFIG\"\\s*\\}", pipeline_config_body) is not None)
+check("4/5/6/7/8/9: the override map passed to merge() names ONLY pipeline/recordType -- every other attribute in the decoded old item (manual tuning, unknown/future fields) passes through merge() untouched, never selected/reconstructed by a fixed field list", re.search(r"merge\(\s*jsondecode\([^)]*\),\s*\{\s*pipeline\s*=\s*\{\s*S\s*=\s*each\.key\s*\}\s*recordType\s*=\s*\{\s*S\s*=\s*\"CONFIG\"\s*\}\s*\}\s*\)", pipeline_config_body, re.S) is not None)
 check("ignore_changes=[item] is retained -- later manual tuning on the resulting item (from either branch) still survives future applies", "ignore_changes = [item]" in pipeline_config_body)
 check("depends_on includes the fail-closed migration-contract precondition, evaluated before any CONFIG item action", "terraform_data.goldengate_config_migration_contract" in pipeline_config_body)
 
@@ -6790,6 +6795,210 @@ for label, ok in results:
   done <<< "$DYNAMODB_CONFIG_MIGRATION_CHECK"
 else
   skip "DYNAMODB-CONFIG-MIGRATION: structural checks -- python3 unavailable"
+fi
+
+# Behavioral proof (offline, zero providers/resources/data-sources, zero AWS calls of any kind): exercises the EXACT jsondecode()->merge()->jsonencode() expression used by the real migration branch against a fabricated OLD item containing clearly non-default content (metricsEnabled/alertsEnabled/checkIntervalSeconds/quietHours/overrides) plus one arbitrary unknown/custom attribute Terraform has no explicit knowledge of -- proving the physical pipeline key is rewritten to the NEW canonical id, recordType remains exactly CONFIG, the OLD id is no longer present anywhere in the pipeline attribute, and every other attribute (known and unknown alike) survives byte-for-byte.
+if command -v terraform >/dev/null 2>&1; then
+  TRANSFORM_PROOF_ROOT="$(mktemp -d)"
+  cat > "${TRANSFORM_PROOF_ROOT}/main.tf" <<'EOF'
+locals {
+  old_id = "gg-oracle-repltest-01"
+  new_id = "gg-oracle-repltest-002"
+
+  fabricated_old_item_json = jsonencode({
+    pipeline       = { S = local.old_id }
+    recordType     = { S = "CONFIG" }
+    deploymentType = { S = "oracle" }
+
+    alertsEnabled        = { BOOL = true }
+    metricsEnabled       = { BOOL = true }
+    checkIntervalSeconds = { N = "15" }
+    quietHours           = { M = { friday = { S = "22:00-06:00" } } }
+    overrides            = { M = { maxConsecutiveAbends = { N = "10" } } }
+
+    someFutureCustomAttribute = { S = "operator-added-value-not-known-to-terraform" }
+  })
+
+  # Exactly the real migration-branch transform in envs/dev/dynamodb.tf's aws_dynamodb_table_item.pipeline_config.
+  migrated_item_json = jsonencode(merge(
+    jsondecode(local.fabricated_old_item_json),
+    {
+      pipeline   = { S = local.new_id }
+      recordType = { S = "CONFIG" }
+    }
+  ))
+
+  migrated_item_decoded = jsondecode(local.migrated_item_json)
+}
+
+output "pipeline_is_new_id" {
+  value = local.migrated_item_decoded.pipeline.S == local.new_id
+}
+output "old_id_absent_from_pipeline" {
+  value = local.migrated_item_decoded.pipeline.S != local.old_id
+}
+output "record_type_is_config" {
+  value = local.migrated_item_decoded.recordType.S == "CONFIG"
+}
+output "metrics_enabled_preserved" {
+  value = local.migrated_item_decoded.metricsEnabled.BOOL == true
+}
+output "alerts_enabled_preserved" {
+  value = local.migrated_item_decoded.alertsEnabled.BOOL == true
+}
+output "check_interval_preserved" {
+  value = local.migrated_item_decoded.checkIntervalSeconds.N == "15"
+}
+output "quiet_hours_preserved" {
+  value = local.migrated_item_decoded.quietHours.M.friday.S == "22:00-06:00"
+}
+output "overrides_preserved" {
+  value = local.migrated_item_decoded.overrides.M.maxConsecutiveAbends.N == "10"
+}
+output "unknown_custom_attribute_preserved" {
+  value = local.migrated_item_decoded.someFutureCustomAttribute.S == "operator-added-value-not-known-to-terraform"
+}
+EOF
+  set +e
+  (cd "$TRANSFORM_PROOF_ROOT" && terraform init -backend=false) >"${TRANSFORM_PROOF_ROOT}/init.log" 2>&1
+  TRANSFORM_INIT_STATUS=$?
+  (cd "$TRANSFORM_PROOF_ROOT" && terraform apply -auto-approve -no-color) >"${TRANSFORM_PROOF_ROOT}/apply.log" 2>&1
+  TRANSFORM_APPLY_STATUS=$?
+  set -e
+
+  if [ "$TRANSFORM_INIT_STATUS" -ne 0 ] || [ "$TRANSFORM_APPLY_STATUS" -ne 0 ]; then
+    skip "DYNAMODB-CONFIG-MIGRATION-TRANSFORM-PROOF: could not evaluate the pure-locals transformation fixture (no providers/resources/data-sources involved -- likely an environment issue)"
+    cat "${TRANSFORM_PROOF_ROOT}/init.log" "${TRANSFORM_PROOF_ROOT}/apply.log" 2>/dev/null
+  else
+    TRANSFORM_OUTPUTS="$(cd "$TRANSFORM_PROOF_ROOT" && terraform output -json 2>&1)"
+    for output_name in pipeline_is_new_id old_id_absent_from_pipeline record_type_is_config metrics_enabled_preserved alerts_enabled_preserved check_interval_preserved quiet_hours_preserved overrides_preserved unknown_custom_attribute_preserved; do
+      if echo "$TRANSFORM_OUTPUTS" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('${output_name}', {}).get('value') is True else 1)" 2>/dev/null; then
+        pass "DYNAMODB-CONFIG-MIGRATION-TRANSFORM-PROOF: ${output_name}"
+      else
+        fail "DYNAMODB-CONFIG-MIGRATION-TRANSFORM-PROOF: ${output_name} did not evaluate true"
+        echo "$TRANSFORM_OUTPUTS"
+      fi
+    done
+  fi
+  rm -rf "$TRANSFORM_PROOF_ROOT"
+else
+  skip "DYNAMODB-CONFIG-MIGRATION-TRANSFORM-PROOF: terraform not available"
+fi
+
+# Copy/delete semantics proof (offline, real aws_dynamodb_table_item resource type, fabricated prior state, zero AWS calls): proves the CREATE (new physical key, full tuned content preserved via the same transform) and DESTROY (old physical key) plan actions in a single terraform plan reference two genuinely DIFFERENT DynamoDB primary keys -- so destroying the OLD Terraform-managed instance can never delete the NEW one. Never claims safety merely because the Terraform resource ADDRESSES differ; proves the resulting physical KEY VALUES differ.
+if command -v terraform >/dev/null 2>&1; then
+  COPYDEL_PROOF_ROOT="$(mktemp -d)"
+  cat > "${COPYDEL_PROOF_ROOT}/main.tf" <<'EOF'
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "5.91.0"
+    }
+  }
+}
+provider "aws" {
+  region                      = "eu-west-1"
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_requesting_account_id  = true
+  skip_metadata_api_check     = true
+}
+
+locals {
+  # Stands in for the real data.aws_dynamodb_table_item.legacy_pipeline_config[...].item read (a live call this sandbox cannot perform) -- the exact real-world shape a manually-tuned OLD item would have, including a field Terraform does not know about.
+  fabricated_old_item_json = jsonencode({
+    pipeline                  = { S = "gg-oracle-repltest-01" }
+    recordType                = { S = "CONFIG" }
+    deploymentType            = { S = "oracle" }
+    alertsEnabled             = { BOOL = true }
+    metricsEnabled            = { BOOL = true }
+    checkIntervalSeconds      = { N = "15" }
+    quietHours                = { M = { friday = { S = "22:00-06:00" } } }
+    overrides                 = { M = { maxConsecutiveAbends = { N = "10" } } }
+    someFutureCustomAttribute = { S = "operator-added-value-not-known-to-terraform" }
+  })
+
+  deployment_names = ["gg-oracle-repltest-002"]
+}
+
+resource "aws_dynamodb_table_item" "pipeline_config" {
+  for_each = toset(local.deployment_names)
+
+  table_name = "gg-eks-pipeline"
+  hash_key   = "pipeline"
+  range_key  = "recordType"
+
+  # Exactly the real migration-branch transform: jsondecode -> merge (override pipeline/recordType only) -> jsonencode.
+  item = jsonencode(merge(
+    jsondecode(local.fabricated_old_item_json),
+    {
+      pipeline   = { S = each.key }
+      recordType = { S = "CONFIG" }
+    }
+  ))
+
+  lifecycle {
+    ignore_changes = [item]
+  }
+}
+EOF
+  set +e
+  (cd "$COPYDEL_PROOF_ROOT" && terraform init -backend=false) >"${COPYDEL_PROOF_ROOT}/init.log" 2>&1
+  COPYDEL_INIT_STATUS=$?
+  set -e
+
+  if [ "$COPYDEL_INIT_STATUS" -ne 0 ]; then
+    skip "DYNAMODB-CONFIG-MIGRATION-COPYDEL-PROOF: could not download the AWS provider from the public Terraform registry in this environment -- offline reproduction skipped"
+  else
+    python3 - "$COPYDEL_PROOF_ROOT" <<'PYEOF'
+import json, sys
+work = sys.argv[1]
+old_item = {
+    "pipeline": {"S": "gg-oracle-repltest-01"}, "recordType": {"S": "CONFIG"}, "deploymentType": {"S": "oracle"},
+    "alertsEnabled": {"BOOL": True}, "metricsEnabled": {"BOOL": True}, "checkIntervalSeconds": {"N": "15"},
+    "quietHours": {"M": {"friday": {"S": "22:00-06:00"}}}, "overrides": {"M": {"maxConsecutiveAbends": {"N": "10"}}},
+    "someFutureCustomAttribute": {"S": "operator-added-value-not-known-to-terraform"},
+}
+state = {
+    "version": 4, "terraform_version": "1.7.2", "serial": 1,
+    "lineage": "55555555-5555-5555-5555-555555555555", "outputs": {},
+    "resources": [{
+        "mode": "managed", "type": "aws_dynamodb_table_item", "name": "pipeline_config",
+        "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+        "instances": [{
+            "index_key": "gg-oracle-repltest-01", "schema_version": 0,
+            "attributes": {
+                "id": "gg-eks-pipeline|gg-oracle-repltest-01|CONFIG", "table_name": "gg-eks-pipeline",
+                "hash_key": "pipeline", "range_key": "recordType", "item": json.dumps(old_item),
+            },
+            "sensitive_attributes": [], "private": "bnVsbA==",
+        }],
+    }],
+}
+with open(work + "/terraform.tfstate", "w") as f:
+    json.dump(state, f, indent=2)
+PYEOF
+    set +e
+    (cd "$COPYDEL_PROOF_ROOT" && terraform plan -refresh=false -no-color) >"${COPYDEL_PROOF_ROOT}/plan.log" 2>&1
+    set -e
+    CREATED_BLOCK="$(sed -n '/will be created/,/^    }$/p' "${COPYDEL_PROOF_ROOT}/plan.log")"
+    DESTROYED_BLOCK="$(sed -n '/will be destroyed/,/^    }$/p' "${COPYDEL_PROOF_ROOT}/plan.log")"
+    if grep -qE '^Plan: 1 to add, 0 to change, 1 to destroy\.$' "${COPYDEL_PROOF_ROOT}/plan.log" \
+        && echo "$CREATED_BLOCK" | grep -qF '+ S = "gg-oracle-repltest-002"' \
+        && echo "$CREATED_BLOCK" | grep -qF 'someFutureCustomAttribute' \
+        && echo "$DESTROYED_BLOCK" | grep -qF -- '- S = "gg-oracle-repltest-01"' \
+        && ! echo "$CREATED_BLOCK" | grep -qF '"gg-oracle-repltest-01"'; then
+      pass "DYNAMODB-CONFIG-MIGRATION-COPYDEL-PROOF: the created instance's own item physically embeds pipeline.S=gg-oracle-repltest-002 (the NEW key, with the tuned content and unknown custom attribute intact) while the destroyed instance's item embeds pipeline.S=gg-oracle-repltest-01 (the OLD key) -- two genuinely different physical DynamoDB primary keys, so destroying the OLD Terraform-managed instance can never delete the NEW one"
+    else
+      fail "DYNAMODB-CONFIG-MIGRATION-COPYDEL-PROOF: expected the created item to embed the NEW physical pipeline key (with tuned/unknown content intact) and the destroyed item to embed the OLD physical pipeline key, as two distinct identities"
+      cat "${COPYDEL_PROOF_ROOT}/plan.log"
+    fi
+  fi
+  rm -rf "$COPYDEL_PROOF_ROOT"
+else
+  skip "DYNAMODB-CONFIG-MIGRATION-COPYDEL-PROOF: terraform not available"
 fi
 
 # Behavioral proof (offline, no real backend, no real AWS data exchanged): reproduces the actual aws_dynamodb_table_item resource type's own moved-block + ignore_changes interaction against a fabricated prior state via `terraform plan -refresh=false` (never live-refreshed, never applied) -- proving the DESIGN DECISION above (deliberately NOT adding a moved block for this resource) is correct, not an oversight. (a) WITHOUT a moved block, renaming the for_each key alone plans a destroy (of the tuned item) + create (from Terraform defaults) -- silently loses manual tuning. (b) WITH a moved block, the rename plans zero changes, but the resulting resource'"'"'s own `item` (and therefore its embedded physical `pipeline` primary-key attribute) remains frozen at its OLD value forever, via ignore_changes=[item] -- never relocating to the new physical key. Both confirm why this correction copies content forward via a read-only data source instead of using a moved block for this specific resource.

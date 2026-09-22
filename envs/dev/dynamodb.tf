@@ -67,7 +67,7 @@ variable "goldengate_config_migration_pending" {
   default     = true
 }
 
-# Read-only lookup of each bounded pair's OLD physical CONFIG item -- never a mutation, never a second write path. Exists ONLY while goldengate_config_migration_pending=true, and ONLY for the four bounded NEW ids that have a mapped OLD predecessor; a genuinely new deployment ID is never a member of this for_each, so its own plan/apply never attempts this read at all.
+# Read-only lookup of each bounded pair's OLD physical CONFIG item -- never a mutation, never a second write path. Exists ONLY while goldengate_config_migration_pending=true, and ONLY for the four bounded NEW ids that have a mapped OLD predecessor; a genuinely new deployment ID is never a member of this for_each, so its own plan/apply never attempts this read at all. The postconditions below fail closed (before this value is ever used to construct the NEW item) unless the item actually read back carries EXACTLY the expected OLD identity -- self is available here because postcondition (unlike precondition) runs after a data resource's own read, per Terraform's own precondition/postcondition contract, verified against the real provider via `terraform validate`.
 data "aws_dynamodb_table_item" "legacy_pipeline_config" {
   for_each = var.goldengate_config_migration_pending ? local.goldengate_config_migration_source_ids : {}
 
@@ -79,6 +79,17 @@ data "aws_dynamodb_table_item" "legacy_pipeline_config" {
   })
 
   depends_on = [module.goldengate_pipeline_state]
+
+  lifecycle {
+    postcondition {
+      condition     = try(jsondecode(self.item).pipeline.S, null) == each.value
+      error_message = "envs/dev/dynamodb.tf: the legacy CONFIG item read for migration target ${each.key} does not have pipeline.S == ${each.value} (the exact mapped OLD id) -- refusing to migrate a missing, malformed, or foreign-identity item."
+    }
+    postcondition {
+      condition     = try(jsondecode(self.item).recordType.S, null) == "CONFIG"
+      error_message = "envs/dev/dynamodb.tf: the legacy CONFIG item read for migration target ${each.key} does not have recordType.S == \"CONFIG\" -- refusing to migrate a missing or malformed record."
+    }
+  }
 }
 
 # Fail-closed guard: the migration map must never alias a NEW id to itself, never chain (an OLD id must never also be a NEW id / map key elsewhere), and must contain exactly these four known pairs -- never a general/future onboarding mechanism.
@@ -116,10 +127,16 @@ resource "aws_dynamodb_table_item" "pipeline_config" {
   hash_key   = "pipeline"
   range_key  = "recordType"
 
-  # Bounded content source: the four migrated NEW ids carry forward their OLD item's real (possibly manually tuned) content while the migration is pending; every other id (including these same four once goldengate_config_migration_pending=false) uses the plain Terraform-default CONFIG body -- unaffected either way once written, since ignore_changes=[item] below freezes it against future drift regardless of which branch produced it.
+  # Bounded content source: the four migrated NEW ids carry forward their OLD item's real (possibly manually tuned) content while the migration is pending; every other id (including these same four once goldengate_config_migration_pending=false) uses the plain Terraform-default CONFIG body -- unaffected either way once written, since ignore_changes=[item] below freezes it against future drift regardless of which branch produced it. The migration branch is NEVER a verbatim copy of the legacy item -- the OLD item's own embedded pipeline attribute value is the OLD deployment ID (that is the whole physical key DynamoDB itself would keep if copied as-is, since aws_dynamodb_table_item resolves hash_key/range_key VALUES from inside `item`, never from the for_each key/resource address alone). jsondecode()+merge()+jsonencode() copies the COMPLETE old body -- every attribute Terraform does not explicitly know about included -- and overrides ONLY the two top-level key attributes (pipeline -> this NEW canonical id; recordType forced back to "CONFIG" defensively) so the resulting item physically keys under the NEW pipeline value while every other attribute (manual tuning, unknown/future fields) survives untouched.
   item = (
     var.goldengate_config_migration_pending && contains(keys(local.goldengate_config_migration_source_ids), each.key)
-    ? data.aws_dynamodb_table_item.legacy_pipeline_config[each.key].item
+    ? jsonencode(merge(
+      jsondecode(data.aws_dynamodb_table_item.legacy_pipeline_config[each.key].item),
+      {
+        pipeline   = { S = each.key }
+        recordType = { S = "CONFIG" }
+      }
+    ))
     : jsonencode({
       pipeline       = { S = each.key }
       recordType     = { S = "CONFIG" }
