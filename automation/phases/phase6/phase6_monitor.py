@@ -188,20 +188,35 @@ def cmd_validate_local(args):
         os.makedirs(files_dir, exist_ok=True)
         shutil.copy(registry_path, os.path.join(files_dir, "goldengate-deployments.yaml"))
 
-        monitor_role_arn = require_env("MONITOR_ROLE_ARN")
+        # Phase 6C Validate render-identity parity: the committed envs/<environment>/goldengate-monitor/values.yaml deliberately omits these shared identities (its own comment says so) -- the real deploy path (.github/workflows/50-sub-monitor.yaml) always injects them via --set-string from the SAME canonical environment resolver this Validate-only local render must also use, or chart guards genuinely required at render time (namespace.yaml's required "namespace.name", plus serviceAccount.yaml/deployment.yaml/ingress.yaml's own required/fail guards) fail exactly like a real Deploy would if the workflow ever forgot to inject them. Never hardcoded literals -- every value is read from the SAME GG_ENVIRONMENT/MONITOR_NAMESPACE/AWS_REGION/MONITOR_ROLE_ARN/MONITOR_HOST/ALB_GROUP_NAME/ACM_CERTIFICATE_ARN environment variables 60-phase-monitor-final-acceptance.yaml already loads via `goldengate-environment.py ... github-env` before this command ever runs, so a canonical-config drift fails this command closed exactly like it would fail the real deploy workflow, rather than only being caught by a live Deploy run.
+        gg_environment = require_env("GG_ENVIRONMENT")
         monitor_namespace = require_env("MONITOR_NAMESPACE")
+        aws_region = require_env("AWS_REGION")
+        monitor_role_arn = require_env("MONITOR_ROLE_ARN")
+        monitor_host = require_env("MONITOR_HOST")
+        alb_group_name = require_env("ALB_GROUP_NAME")
+        acm_certificate_arn = require_env("ACM_CERTIFICATE_ARN")
+
+        # ONE canonical override list, used identically by both helm lint and helm template -- exactly matching 50-sub-monitor.yaml's own --set-string render-identity contract, never two independently-drifting lists.
         common_set_args = [
-            "--set", "image.repository=example.invalid/goldengate-monitor",
-            "--set", "image.tag=dry-run",
-            "--set", f"serviceAccount.roleArn={monitor_role_arn}",
+            "--set-string", "image.repository=example.invalid/goldengate-monitor",
+            "--set-string", "image.tag=dry-run",
+            "--set-string", f"global.environment={gg_environment}",
+            "--set-string", f"namespace.name={monitor_namespace}",
+            "--set-string", f"aws.region={aws_region}",
+            "--set-string", f"serviceAccount.roleArn={monitor_role_arn}",
+            "--set-string", f"ingress.host={monitor_host}",
+            "--set-string", f"ingress.alb.groupName={alb_group_name}",
+            "--set-string", f"ingress.alb.certificateArn={acm_certificate_arn}",
         ]
 
-        run(["helm", "lint", staged_chart, *common_set_args])
-
         values_file = REPO_ROOT / "envs" / environment / "goldengate-monitor" / "values.yaml"
+
+        run(["helm", "lint", staged_chart, "--values", str(values_file), *common_set_args])
+
         template_proc = run(["helm", "template", "gg-monitor", staged_chart,
                               "--namespace", monitor_namespace,
-                              "-f", str(values_file),
+                              "--values", str(values_file),
                               *common_set_args])
         with open(os.path.join(tmp, "gg-monitor-dry-run.yaml"), "w") as f:
             f.write(template_proc.stdout)

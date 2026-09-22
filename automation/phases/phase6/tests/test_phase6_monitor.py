@@ -210,24 +210,58 @@ class OwnershipPreflightTests(unittest.TestCase):
 
 
 class ValidateLocalTests(unittest.TestCase):
-    """5: unit tests invoked, canonical registry generated, helm lint invoked, helm template invoked, no AWS/kubectl/ECR/mutation."""
+    """5: unit tests invoked, canonical registry generated, helm lint invoked, helm template invoked, no AWS/kubectl/ECR/mutation. Phase 6C Validate render-identity parity: proves cmd_validate_local() actually supplies the SAME canonical shared-identity overrides (global.environment/namespace.name/aws.region/serviceAccount.roleArn/ingress.host/ingress.alb.groupName/ingress.alb.certificateArn) to BOTH helm lint and helm template that 50-sub-monitor.yaml's own real deploy path supplies -- deliberately using MARKER env var values distinct from any real envs/dev/* literal or any value hardcoded elsewhere in this file's own BASE_ENV, so a regression that hardcodes a real DEV literal instead of reading the env var would fail these assertions, not merely happen to still pass."""
 
-    def test_full_local_dry_run_sequence_and_no_cloud_calls(self):
+    VALIDATE_ENV = {
+        "GG_ENVIRONMENT": "validate-env-marker",
+        "MONITOR_NAMESPACE": "validate-namespace-marker",
+        "MONITOR_ROLE_ARN": "arn:aws:iam::668311715351:role/ValidateMonitorRoleMarker",
+        "MONITOR_HOST": "validate-monitor-host-marker.example.internal",
+        "ALB_GROUP_NAME": "validate-alb-group-marker",
+        "ACM_CERTIFICATE_ARN": "arn:aws:acm:eu-west-1:668311715351:certificate/validate-marker",
+    }
+
+    EXPECTED_IDENTITY_SET_ARGS = {
+        "global.environment=validate-env-marker",
+        "namespace.name=validate-namespace-marker",
+        "aws.region=eu-west-1",
+        "serviceAccount.roleArn=arn:aws:iam::668311715351:role/ValidateMonitorRoleMarker",
+        "ingress.host=validate-monitor-host-marker.example.internal",
+        "ingress.alb.groupName=validate-alb-group-marker",
+        "ingress.alb.certificateArn=arn:aws:acm:eu-west-1:668311715351:certificate/validate-marker",
+    }
+
+    def _scripted(self):
         scripted = ScriptedRun()
         scripted.when(_starts_with("bash", "-c", "command -v helm"), FakeProc(0, "/usr/local/bin/helm"))
         scripted.when(_starts_with(sys.executable, "-m", "unittest"), FakeProc(0, "OK"))
         scripted.when(_is_registry_call, lambda argv: _write_registry_fixture(argv))
         scripted.when(_starts_with("helm", "lint"), FakeProc(0, ""))
         scripted.when(_starts_with("helm", "template"), FakeProc(0, "kind: Deployment\n"))
+        return scripted
 
+    def _run(self, scripted, extra_env=None):
+        env = dict(self.VALIDATE_ENV)
+        if extra_env:
+            env.update(extra_env)
         args = argparse_namespace(environment=ENVIRONMENT)
-        with _env_patch(), mock.patch.object(phase6_monitor, "run", scripted):
+        with _env_patch(env), mock.patch.object(phase6_monitor, "run", scripted):
             phase6_monitor.cmd_validate_local(args)
 
+    @staticmethod
+    def _set_string_values(argv):
+        """Every value passed via --set-string <key>=<value> in argv, in order."""
+        return [argv[i + 1] for i, a in enumerate(argv) if a == "--set-string" and i + 1 < len(argv)]
+
+    def test_full_local_dry_run_sequence_and_no_cloud_calls(self):
+        scripted = self._scripted()
+        self._run(scripted)
+
         self.assertTrue(any(_starts_with(sys.executable, "-m", "unittest")(c["argv"]) for c in scripted.calls))
-        self.assertTrue(any(_is_registry_call(c["argv"]) for c in scripted.calls))
+        self.assertTrue(any(_is_registry_call(c["argv"]) for c in scripted.calls))  # 13: canonical-registry staging unchanged
         self.assertTrue(any(_starts_with("helm", "lint")(c["argv"]) for c in scripted.calls))
         self.assertTrue(any(_starts_with("helm", "template")(c["argv"]) for c in scripted.calls))
+        # 12: no AWS CLI/kubectl/ECR/Argo mutation is introduced into Validate mode.
         self.assertFalse(any(_starts_with("aws")(c["argv"]) for c in scripted.calls))
         self.assertFalse(any(_starts_with("kubectl")(c["argv"]) for c in scripted.calls))
 
@@ -235,9 +269,107 @@ class ValidateLocalTests(unittest.TestCase):
         scripted = ScriptedRun()
         scripted.when(_starts_with("bash", "-c", "command -v helm"), FakeProc(1, "", ""))
         args = argparse_namespace(environment=ENVIRONMENT)
-        with _env_patch(), mock.patch.object(phase6_monitor, "run", scripted):
+        with _env_patch(self.VALIDATE_ENV), mock.patch.object(phase6_monitor, "run", scripted):
             with self.assertRaises(phase6_monitor.Phase6MonitorError):
                 phase6_monitor.cmd_validate_local(args)
+
+    def test_helm_lint_receives_the_environment_monitor_values_file(self):
+        # 2: helm lint receives --values envs/dev/goldengate-monitor/values.yaml.
+        scripted = self._scripted()
+        self._run(scripted)
+        lint_call = next(c for c in scripted.calls if _starts_with("helm", "lint")(c["argv"]))
+        expected_values_file = str(phase6_monitor.REPO_ROOT / "envs" / ENVIRONMENT / "goldengate-monitor" / "values.yaml")
+        self.assertIn("--values", lint_call["argv"])
+        self.assertEqual(lint_call["argv"][lint_call["argv"].index("--values") + 1], expected_values_file)
+
+    def test_helm_template_receives_the_same_environment_monitor_values_file(self):
+        # 3: helm template receives the same environment values file as lint.
+        scripted = self._scripted()
+        self._run(scripted)
+        lint_call = next(c for c in scripted.calls if _starts_with("helm", "lint")(c["argv"]))
+        template_call = next(c for c in scripted.calls if _starts_with("helm", "template")(c["argv"]))
+        lint_values_file = lint_call["argv"][lint_call["argv"].index("--values") + 1]
+        template_values_file = template_call["argv"][template_call["argv"].index("--values") + 1]
+        self.assertEqual(lint_values_file, template_values_file)
+
+    def test_both_lint_and_template_receive_the_full_canonical_identity_set(self):
+        # 4/7: lint and template both receive global.environment/namespace.name/aws.region/serviceAccount.roleArn/ingress.host/ingress.alb.groupName/ingress.alb.certificateArn -- the SAME canonical identity override set, never two independently-drifting lists.
+        scripted = self._scripted()
+        self._run(scripted)
+        lint_call = next(c for c in scripted.calls if _starts_with("helm", "lint")(c["argv"]))
+        template_call = next(c for c in scripted.calls if _starts_with("helm", "template")(c["argv"]))
+        lint_values = set(self._set_string_values(lint_call["argv"]))
+        template_values = set(self._set_string_values(template_call["argv"]))
+        self.assertTrue(self.EXPECTED_IDENTITY_SET_ARGS.issubset(lint_values), lint_values)
+        self.assertTrue(self.EXPECTED_IDENTITY_SET_ARGS.issubset(template_values), template_values)
+        self.assertEqual(lint_values, template_values)
+
+    def test_identity_values_come_from_environment_variables_never_hardcoded(self):
+        # 5: values come from environment variables, never hardcoded DEV literals -- MARKER values (distinct from any real envs/dev/* literal) must appear verbatim in the actual rendered argv.
+        scripted = self._scripted()
+        self._run(scripted)
+        template_call = next(c for c in scripted.calls if _starts_with("helm", "template")(c["argv"]))
+        template_values = set(self._set_string_values(template_call["argv"]))
+        self.assertTrue(self.EXPECTED_IDENTITY_SET_ARGS.issubset(template_values))
+        # None of the real dev-environment literals leaked in as accidental hardcoding.
+        flat = " ".join(str(a) for a in template_call["argv"])
+        self.assertNotIn("goldengate-dev.adcbmis.local", flat)
+        self.assertNotIn("gg-poc-dev-alb", flat)
+
+    def test_template_namespace_flag_equals_canonical_monitor_namespace(self):
+        # 6: helm template --namespace equals canonical MONITOR_NAMESPACE.
+        scripted = self._scripted()
+        self._run(scripted)
+        template_call = next(c for c in scripted.calls if _starts_with("helm", "template")(c["argv"]))
+        self.assertIn("--namespace", template_call["argv"])
+        self.assertEqual(template_call["argv"][template_call["argv"].index("--namespace") + 1], self.VALIDATE_ENV["MONITOR_NAMESPACE"])
+
+    def test_missing_gg_environment_fails_closed(self):
+        scripted = self._scripted()
+        with self.assertRaises(phase6_monitor.Phase6MonitorError):
+            self._run(scripted, {"GG_ENVIRONMENT": ""})
+
+    def test_missing_monitor_namespace_fails_closed(self):
+        # 8
+        scripted = self._scripted()
+        with self.assertRaises(phase6_monitor.Phase6MonitorError):
+            self._run(scripted, {"MONITOR_NAMESPACE": ""})
+
+    def test_missing_aws_region_fails_closed(self):
+        # 9
+        scripted = self._scripted()
+        with self.assertRaises(phase6_monitor.Phase6MonitorError):
+            self._run(scripted, {"AWS_REGION": ""})
+
+    def test_missing_monitor_role_arn_fails_closed(self):
+        scripted = self._scripted()
+        with self.assertRaises(phase6_monitor.Phase6MonitorError):
+            self._run(scripted, {"MONITOR_ROLE_ARN": ""})
+
+    def test_missing_monitor_host_fails_closed(self):
+        # 10
+        scripted = self._scripted()
+        with self.assertRaises(phase6_monitor.Phase6MonitorError):
+            self._run(scripted, {"MONITOR_HOST": ""})
+
+    def test_missing_alb_group_name_fails_closed(self):
+        scripted = self._scripted()
+        with self.assertRaises(phase6_monitor.Phase6MonitorError):
+            self._run(scripted, {"ALB_GROUP_NAME": ""})
+
+    def test_missing_acm_certificate_arn_fails_closed(self):
+        # 11
+        scripted = self._scripted()
+        with self.assertRaises(phase6_monitor.Phase6MonitorError):
+            self._run(scripted, {"ACM_CERTIFICATE_ARN": ""})
+
+    def test_no_required_env_lookup_ever_reaches_helm_before_failing(self):
+        """A missing required identity variable must fail BEFORE either helm lint or helm template ever runs -- never a partial/inconsistent local render."""
+        scripted = self._scripted()
+        with self.assertRaises(phase6_monitor.Phase6MonitorError):
+            self._run(scripted, {"MONITOR_HOST": ""})
+        self.assertFalse(any(_starts_with("helm", "lint")(c["argv"]) for c in scripted.calls))
+        self.assertFalse(any(_starts_with("helm", "template")(c["argv"]) for c in scripted.calls))
 
 
 def _write_registry_fixture(argv):
