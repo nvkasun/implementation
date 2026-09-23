@@ -3,159 +3,68 @@
 #dont delete or do any modifiction in to this file.
 
 
+
 #!/bin/bash
 
 set -u
 
-NS="goldengate-dev"
-ARGO_NS="argocd"
+echo "===== 1. SECRETS STORE CSI ====="
 
-OLD_IDS=(
-  "gg-postgresql-repltest-01"
-  "gg-mssql-repltest-01"
-  "gg-oracle-repltest-01"
-  "gg-postgresql-repltest-02"
-)
+echo "-- CSI Driver --"
+kubectl get csidriver secrets-store.csi.k8s.io \
+  -o jsonpath='NAME={.metadata.name}{" TOKEN_REQUESTS="}{.spec.tokenRequests}{"\n"}' 2>&1 || true
 
-NEW_IDS=(
-  "gg-postgresql-repltest-001"
-  "gg-mssql-repltest-001"
-  "gg-oracle-repltest-002"
-  "gg-postgresql-repltest-002"
-)
+echo "-- CSI / AWS Provider DaemonSets --"
+kubectl get daemonsets -A \
+  -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady' \
+  | grep -Ei 'secret|csi|provider' || true
 
-echo
-echo "============================================================"
-echo "1. CURRENT KUBERNETES CONTEXT"
-echo "============================================================"
-kubectl config current-context
-kubectl cluster-info 2>&1 | head -20
+echo "-- CSI / AWS Provider Pods --"
+kubectl get pods -A \
+  -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,READY:.status.containerStatuses[*].ready,STATUS:.status.phase,NODE:.spec.nodeName' \
+  | grep -Ei 'secret|csi|provider' || true
+
 
 echo
-echo "============================================================"
-echo "2. CONFIRM NEW RUNTIME IDENTITIES DO NOT EXIST"
-echo "============================================================"
+echo "===== 2. ARGO ECR TOKEN SYNC ====="
 
-for id in "${NEW_IDS[@]}"; do
-  suffix="${id#gg-}"
-  app="goldengate-dev-${suffix}"
-  appset="${app}-appset"
+echo "-- ServiceAccount --"
+kubectl get sa argocd-ecr-token-sync -n argocd \
+  -o jsonpath='NAME={.metadata.name}{" ROLE_ARN="}{.metadata.annotations.eks\.amazonaws\.com/role-arn}{"\n"}' 2>&1 || true
 
-  echo
-  echo "----- NEW ID: ${id} -----"
+echo "-- CronJob --"
+kubectl get cronjob argocd-ecr-token-sync -n argocd \
+  -o jsonpath='NAME={.metadata.name}{" SCHEDULE="}{.spec.schedule}{" LAST_SCHEDULE="}{.status.lastScheduleTime}{" LAST_SUCCESS="}{.status.lastSuccessfulTime}{"\n"}' 2>&1 || true
 
-  kubectl get applicationset "$appset" -n "$ARGO_NS" \
-    --ignore-not-found \
-    -o custom-columns='APPSET:.metadata.name'
+echo "-- Recent Jobs --"
+kubectl get jobs -n argocd \
+  --sort-by=.metadata.creationTimestamp \
+  -o custom-columns='NAME:.metadata.name,SUCCEEDED:.status.succeeded,FAILED:.status.failed,START:.status.startTime,END:.status.completionTime' \
+  | grep 'argocd-ecr-token-sync' | tail -5 || true
 
-  kubectl get application "$app" -n "$ARGO_NS" \
-    --ignore-not-found \
-    -o custom-columns='APP:.metadata.name'
-
-  kubectl get statefulset "$id" -n "$NS" \
-    --ignore-not-found \
-    -o custom-columns='STS:.metadata.name'
-done
+LATEST_JOB="$(kubectl get jobs -n argocd \
+  --sort-by=.metadata.creationTimestamp \
+  -o name 2>/dev/null \
+  | grep 'argocd-ecr-token-sync' \
+  | tail -1)"
 
 echo
-echo "============================================================"
-echo "3. OLD ARGO APPLICATIONSET / APPLICATION OWNERSHIP"
-echo "============================================================"
+echo "-- Latest Token Sync Job Logs --"
 
-for id in "${OLD_IDS[@]}"; do
-  suffix="${id#gg-}"
-  app="goldengate-dev-${suffix}"
-  appset="${app}-appset"
+if [ -n "$LATEST_JOB" ]; then
+  echo "JOB=$LATEST_JOB"
+  kubectl logs -n argocd "$LATEST_JOB" --tail=50 2>&1
+else
+  echo "NO_TOKEN_SYNC_JOB_FOUND"
+fi
 
-  echo
-  echo "===== ${id} ====="
-
-  echo "--- ApplicationSet ---"
-  kubectl get applicationset "$appset" -n "$ARGO_NS" \
-    -o jsonpath='NAME={.metadata.name}{"\n"}UID={.metadata.uid}{"\n"}ENV={.metadata.labels.goldengate\.adcb/environment}{"\n"}DEPLOYMENT_ID={.metadata.labels.goldengate\.adcb/deployment-id}{"\n"}'
-
-  echo
-  echo "--- Application ---"
-  kubectl get application "$app" -n "$ARGO_NS" \
-    -o jsonpath='NAME={.metadata.name}{"\n"}SYNC={.status.sync.status}{"\n"}HEALTH={.status.health.status}{"\n"}OWNER_KIND={.metadata.ownerReferences[0].kind}{"\n"}OWNER_NAME={.metadata.ownerReferences[0].name}{"\n"}OWNER_UID={.metadata.ownerReferences[0].uid}{"\n"}'
-
-  echo
-  echo "--- Application conditions ---"
-  kubectl get application "$app" -n "$ARGO_NS" \
-    -o jsonpath='{range .status.conditions[*]}TYPE={.type} MESSAGE={.message}{"\n"}{end}'
-done
 
 echo
-echo "============================================================"
-echo "4. RETAINED PVC -> PV -> EFS ACCESS POINT IDENTITY"
-echo "============================================================"
+echo "===== 3. ARGO GOLDENGATE OCI SECRET ====="
 
-for id in "${OLD_IDS[@]}"; do
-  pvc="${id}-u02"
+kubectl get secret argocd-ecr-goldengate-oci -n argocd \
+  -o jsonpath='NAME={.metadata.name}{" TYPE="}{.type}{" CREATED="}{.metadata.creationTimestamp}{"\n"}' 2>&1 || true
 
-  echo
-  echo "===== ${pvc} ====="
-
-  pv=$(kubectl get pvc "$pvc" -n "$NS" -o jsonpath='{.spec.volumeName}')
-
-  echo "PVC=$pvc"
-  echo "PV=$pv"
-
-  kubectl get pvc "$pvc" -n "$NS" \
-    -o jsonpath='PVC_STATUS={.status.phase}{"\n"}STORAGECLASS={.spec.storageClassName}{"\n"}PVC_UID={.metadata.uid}{"\n"}'
-
-  kubectl get pv "$pv" \
-    -o jsonpath='PV_STATUS={.status.phase}{"\n"}RECLAIM_POLICY={.spec.persistentVolumeReclaimPolicy}{"\n"}CSI_DRIVER={.spec.csi.driver}{"\n"}VOLUME_HANDLE={.spec.csi.volumeHandle}{"\n"}CLAIM_NAMESPACE={.spec.claimRef.namespace}{"\n"}CLAIM_NAME={.spec.claimRef.name}{"\n"}'
-done
-
-echo
-echo "============================================================"
-echo "5. STATEFULSET -> U02 PVC REFERENCES"
-echo "============================================================"
-
-for id in "${OLD_IDS[@]}"; do
-  echo
-  echo "===== ${id} ====="
-
-  kubectl get statefulset "$id" -n "$NS" \
-    -o jsonpath='STS={.metadata.name}{"\n"}READY={.status.readyReplicas}{"\n"}REPLICAS={.status.replicas}{"\n"}{range .spec.template.spec.volumes[*]}VOLUME={.name} CLAIM={.persistentVolumeClaim.claimName}{"\n"}{end}'
-done
-
-echo
-echo "============================================================"
-echo "6. GOLDENGATE INIT-CONTAINER FAILURE DETAILS"
-echo "============================================================"
-
-for id in "${OLD_IDS[@]}"; do
-  pod="${id}-0"
-
-  echo
-  echo "===== ${pod} ====="
-
-  kubectl get pod "$pod" -n "$NS" \
-    -o jsonpath='POD={.metadata.name}{"\n"}PHASE={.status.phase}{"\n"}NODE={.spec.nodeName}{"\n"}{range .status.initContainerStatuses[*]}INIT={.name} READY={.ready} RESTARTS={.restartCount} WAITING_REASON={.state.waiting.reason} WAITING_MESSAGE={.state.waiting.message} TERMINATED_REASON={.state.terminated.reason} EXIT_CODE={.state.terminated.exitCode}{"\n"}{end}'
-
-  echo
-  echo "--- prepare-u02-permissions logs ---"
-  kubectl logs "$pod" -n "$NS" \
-    -c prepare-u02-permissions \
-    --tail=100 2>&1 || true
-
-  echo
-  echo "--- recent pod events ---"
-  kubectl get events -n "$NS" \
-    --field-selector involvedObject.name="$pod" \
-    --sort-by='.lastTimestamp' 2>&1 | tail -20
-done
-
-echo
-echo "============================================================"
-echo "7. SUMMARY"
-echo "============================================================"
-
-kubectl get applications -n "$ARGO_NS" \
-  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
-
-echo
-
-kubectl get statefulsets,pods,pvc -n "$NS" -o wide
+echo -n "DATA_KEYS="
+kubectl get secret argocd-ecr-goldengate-oci -n argocd \
+  -o go-template='{{range $k,$v := .data}}{{$k}} {{end}}{{"\n"}}' 2>&1 || true
