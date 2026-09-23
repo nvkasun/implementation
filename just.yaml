@@ -1,80 +1,108 @@
-cat > mssql-migration-state.sh <<'EOF'
+cat > migration-checkpoint.sh <<'EOF'
 #!/bin/bash
 set -u
 
 ARGO_NS="argocd"
 GG_NS="goldengate-dev"
+REGION="eu-west-1"
+TABLE="gg-eks-pipeline"
 
-OLD_APP="goldengate-dev-mssql-repltest-01"
-OLD_APPSET="goldengate-dev-mssql-repltest-01-appset"
-OLD_ID="gg-mssql-repltest-01"
+PAIRS=(
+  "gg-mssql-repltest-01|gg-mssql-repltest-001"
+  "gg-oracle-repltest-01|gg-oracle-repltest-002"
+  "gg-postgresql-repltest-01|gg-postgresql-repltest-001"
+  "gg-postgresql-repltest-02|gg-postgresql-repltest-002"
+)
 
-NEW_APP="goldengate-dev-mssql-repltest-001"
-NEW_APPSET="goldengate-dev-mssql-repltest-001-appset"
-NEW_ID="gg-mssql-repltest-001"
-
-PVC="gg-mssql-repltest-01-u02"
-
-echo "===== OLD IDENTITY ====="
-
-for r in \
-  "applicationset/$OLD_APPSET" \
-  "application/$OLD_APP"
-do
-  if kubectl get "$r" -n "$ARGO_NS" >/dev/null 2>&1; then
-    echo "$r=EXISTS"
+exists() {
+  local kind="$1" name="$2" ns="$3"
+  if kubectl get "$kind" "$name" -n "$ns" >/dev/null 2>&1; then
+    echo "EXISTS"
   else
-    echo "$r=ABSENT"
+    echo "ABSENT"
   fi
-done
+}
 
-for r in \
-  "statefulset/$OLD_ID" \
-  "service/$OLD_ID" \
-  "service/${OLD_ID}-headless"
-do
-  if kubectl get "$r" -n "$GG_NS" >/dev/null 2>&1; then
-    echo "$r=EXISTS"
+ddb_exists() {
+  local id="$1"
+
+  result="$(
+    aws dynamodb get-item \
+      --region "$REGION" \
+      --table-name "$TABLE" \
+      --consistent-read \
+      --key "{\"pipeline\":{\"S\":\"$id\"},\"recordType\":{\"S\":\"CONFIG\"}}" \
+      --query 'Item.pipeline.S' \
+      --output text 2>/dev/null
+  )"
+
+  if [ "$result" = "$id" ]; then
+    echo "EXISTS"
   else
-    echo "$r=ABSENT"
+    echo "ABSENT"
   fi
+}
+
+echo "===== RUNTIME MIGRATION CHECKPOINT ====="
+
+for pair in "${PAIRS[@]}"; do
+  OLD="${pair%%|*}"
+  NEW="${pair##*|}"
+
+  OLD_SUFFIX="${OLD#gg-}"
+  NEW_SUFFIX="${NEW#gg-}"
+
+  OLD_APP="goldengate-dev-${OLD_SUFFIX}"
+  NEW_APP="goldengate-dev-${NEW_SUFFIX}"
+
+  OLD_APPSET="${OLD_APP}-appset"
+  NEW_APPSET="${NEW_APP}-appset"
+
+  PVC="${OLD}-u02"
+
+  echo
+  echo "PAIR=$OLD -> $NEW"
+
+  echo "OLD_APPSET=$(exists applicationset "$OLD_APPSET" "$ARGO_NS")"
+  echo "OLD_APP=$(exists application "$OLD_APP" "$ARGO_NS")"
+  echo "OLD_STS=$(exists statefulset "$OLD" "$GG_NS")"
+
+  echo "NEW_APPSET=$(exists applicationset "$NEW_APPSET" "$ARGO_NS")"
+  echo "NEW_APP=$(exists application "$NEW_APP" "$ARGO_NS")"
+  echo "NEW_STS=$(exists statefulset "$NEW" "$GG_NS")"
+
+  if kubectl get application "$NEW_APP" -n "$ARGO_NS" >/dev/null 2>&1; then
+    kubectl get application "$NEW_APP" -n "$ARGO_NS" \
+      -o jsonpath='NEW_ARGO_SYNC={.status.sync.status}{" NEW_ARGO_HEALTH="}{.status.health.status}{"\n"}'
+  fi
+
+  if kubectl get statefulset "$NEW" -n "$GG_NS" >/dev/null 2>&1; then
+    kubectl get statefulset "$NEW" -n "$GG_NS" \
+      -o jsonpath='NEW_STS_READY={.status.readyReplicas}{"/"}{.status.replicas}{"\n"}'
+  fi
+
+  if kubectl get pvc "$PVC" -n "$GG_NS" >/dev/null 2>&1; then
+    PV="$(kubectl get pvc "$PVC" -n "$GG_NS" -o jsonpath='{.spec.volumeName}')"
+
+    kubectl get pvc "$PVC" -n "$GG_NS" \
+      -o jsonpath='PVC={.metadata.name}{" PVC_STATUS="}{.status.phase}{" PV="}{.spec.volumeName}{"\n"}'
+
+    kubectl get pv "$PV" \
+      -o jsonpath='PV_STATUS={.status.phase}{" HANDLE="}{.spec.csi.volumeHandle}{"\n"}'
+  else
+    echo "PVC=$PVC ABSENT"
+  fi
+
+  echo "DDB_OLD_CONFIG=$(ddb_exists "$OLD")"
+  echo "DDB_NEW_CONFIG=$(ddb_exists "$NEW")"
 done
 
 echo
-echo "===== RETAINED STORAGE ====="
-
-if kubectl get pvc "$PVC" -n "$GG_NS" >/dev/null 2>&1; then
-  PV="$(kubectl get pvc "$PVC" -n "$GG_NS" -o jsonpath='{.spec.volumeName}')"
-
-  kubectl get pvc "$PVC" -n "$GG_NS" \
-    -o jsonpath='PVC={.metadata.name}{" STATUS="}{.status.phase}{" PV="}{.spec.volumeName}{"\n"}'
-
-  kubectl get pv "$PV" \
-    -o jsonpath='PV={.metadata.name}{" STATUS="}{.status.phase}{" DRIVER="}{.spec.csi.driver}{" HANDLE="}{.spec.csi.volumeHandle}{"\n"}'
-else
-  echo "PVC=$PVC ABSENT"
-fi
-
-echo
-echo "===== NEW IDENTITY ====="
-
-for r in \
-  "applicationset/$NEW_APPSET" \
-  "application/$NEW_APP"
-do
-  if kubectl get "$r" -n "$ARGO_NS" >/dev/null 2>&1; then
-    echo "$r=EXISTS"
-  else
-    echo "$r=ABSENT"
-  fi
-done
-
-if kubectl get statefulset "$NEW_ID" -n "$GG_NS" >/dev/null 2>&1; then
-  echo "statefulset/$NEW_ID=EXISTS"
-else
-  echo "statefulset/$NEW_ID=ABSENT"
-fi
+echo "===== CURRENT NEW ARGO APPS ====="
+kubectl get applications -n "$ARGO_NS" \
+  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' \
+  | grep -E 'NAME|repltest-001|repltest-002' || true
 EOF
 
-chmod +x mssql-migration-state.sh
-./mssql-migration-state.sh
+chmod +x migration-checkpoint.sh
+./migration-checkpoint.sh
