@@ -4,67 +4,95 @@
 
 
 
+cat > gg-next-diag.sh <<'EOF'
 #!/bin/bash
-
 set -u
 
-echo "===== 1. SECRETS STORE CSI ====="
+echo "===== A. AWS SECRETS PROVIDER PENDING REASON ====="
 
-echo "-- CSI Driver --"
-kubectl get csidriver secrets-store.csi.k8s.io \
-  -o jsonpath='NAME={.metadata.name}{" TOKEN_REQUESTS="}{.spec.tokenRequests}{"\n"}' 2>&1 || true
+PROVIDER_POD="$(
+  kubectl get pods -n kube-system \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{.spec.nodeName}{"\n"}{end}' \
+  | awk -F'|' '$1 ~ /^secrets-store-csi-driver-provider-aws-/ && $2 != "Running" {print $1; exit}'
+)"
 
-echo "-- CSI / AWS Provider DaemonSets --"
-kubectl get daemonsets -A \
-  -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady' \
-  | grep -Ei 'secret|csi|provider' || true
+echo "PENDING_PROVIDER_POD=${PROVIDER_POD:-NONE}"
 
-echo "-- CSI / AWS Provider Pods --"
-kubectl get pods -A \
-  -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,READY:.status.containerStatuses[*].ready,STATUS:.status.phase,NODE:.spec.nodeName' \
-  | grep -Ei 'secret|csi|provider' || true
+if [ -n "${PROVIDER_POD:-}" ]; then
+  kubectl get pod "$PROVIDER_POD" -n kube-system \
+    -o jsonpath='PHASE={.status.phase}{"\n"}NODE={.spec.nodeName}{"\n"}NODE_SELECTOR={.spec.nodeSelector}{"\n"}{range .status.conditions[*]}COND={.type} STATUS={.status} REASON={.reason} MESSAGE={.message}{"\n"}{end}'
 
-
-echo
-echo "===== 2. ARGO ECR TOKEN SYNC ====="
-
-echo "-- ServiceAccount --"
-kubectl get sa argocd-ecr-token-sync -n argocd \
-  -o jsonpath='NAME={.metadata.name}{" ROLE_ARN="}{.metadata.annotations.eks\.amazonaws\.com/role-arn}{"\n"}' 2>&1 || true
-
-echo "-- CronJob --"
-kubectl get cronjob argocd-ecr-token-sync -n argocd \
-  -o jsonpath='NAME={.metadata.name}{" SCHEDULE="}{.spec.schedule}{" LAST_SCHEDULE="}{.status.lastScheduleTime}{" LAST_SUCCESS="}{.status.lastSuccessfulTime}{"\n"}' 2>&1 || true
-
-echo "-- Recent Jobs --"
-kubectl get jobs -n argocd \
-  --sort-by=.metadata.creationTimestamp \
-  -o custom-columns='NAME:.metadata.name,SUCCEEDED:.status.succeeded,FAILED:.status.failed,START:.status.startTime,END:.status.completionTime' \
-  | grep 'argocd-ecr-token-sync' | tail -5 || true
-
-LATEST_JOB="$(kubectl get jobs -n argocd \
-  --sort-by=.metadata.creationTimestamp \
-  -o name 2>/dev/null \
-  | grep 'argocd-ecr-token-sync' \
-  | tail -1)"
-
-echo
-echo "-- Latest Token Sync Job Logs --"
-
-if [ -n "$LATEST_JOB" ]; then
-  echo "JOB=$LATEST_JOB"
-  kubectl logs -n argocd "$LATEST_JOB" --tail=50 2>&1
-else
-  echo "NO_TOKEN_SYNC_JOB_FOUND"
+  echo "--- Scheduling events ---"
+  kubectl get events -n kube-system \
+    --field-selector involvedObject.name="$PROVIDER_POD" \
+    --sort-by='.lastTimestamp' \
+    -o custom-columns='REASON:.reason,MESSAGE:.message' | tail -10
 fi
 
+echo
+echo "--- Provider DaemonSet ---"
+kubectl get daemonset secrets-store-csi-driver-provider-aws -n kube-system \
+  -o jsonpath='DESIRED={.status.desiredNumberScheduled}{"\n"}CURRENT={.status.currentNumberScheduled}{"\n"}READY={.status.numberReady}{"\n"}UNAVAILABLE={.status.numberUnavailable}{"\n"}NODE_SELECTOR={.spec.template.spec.nodeSelector}{"\n"}TOLERATIONS={.spec.template.spec.tolerations}{"\n"}'
 
 echo
-echo "===== 3. ARGO GOLDENGATE OCI SECRET ====="
+echo "--- Nodes / taints ---"
+kubectl get nodes \
+  -o custom-columns='NODE:.metadata.name,TAINTS:.spec.taints,UNSCHEDULABLE:.spec.unschedulable'
 
-kubectl get secret argocd-ecr-goldengate-oci -n argocd \
-  -o jsonpath='NAME={.metadata.name}{" TYPE="}{.type}{" CREATED="}{.metadata.creationTimestamp}{"\n"}' 2>&1 || true
 
-echo -n "DATA_KEYS="
-kubectl get secret argocd-ecr-goldengate-oci -n argocd \
-  -o go-template='{{range $k,$v := .data}}{{$k}} {{end}}{{"\n"}}' 2>&1 || true
+echo
+echo "===== B. ARGO OCI 403 DIAGNOSTIC ====="
+
+APP="goldengate-dev-postgresql-repltest-01"
+SECRET="argocd-ecr-goldengate-oci"
+
+echo "--- Application source / current error ---"
+kubectl get application "$APP" -n argocd \
+  -o jsonpath='REPO_URL={.spec.source.repoURL}{"\n"}TARGET_REVISION={.spec.source.targetRevision}{"\n"}{range .status.conditions[*]}TYPE={.type} MESSAGE={.message}{"\n"}{end}'
+
+echo
+echo "--- Repository Secret non-sensitive fields ---"
+
+echo -n "TYPE="
+kubectl get secret "$SECRET" -n argocd \
+  -o jsonpath='{.data.type}' | base64 -d
+echo
+
+echo -n "URL="
+kubectl get secret "$SECRET" -n argocd \
+  -o jsonpath='{.data.url}' | base64 -d
+echo
+
+echo -n "USERNAME="
+kubectl get secret "$SECRET" -n argocd \
+  -o jsonpath='{.data.username}' | base64 -d
+echo
+
+echo -n "RESOURCE_VERSION="
+kubectl get secret "$SECRET" -n argocd \
+  -o jsonpath='{.metadata.resourceVersion}'
+echo
+
+echo
+echo "--- Argo repo-server ---"
+
+kubectl get pods -n argocd \
+  -l app.kubernetes.io/name=argocd-repo-server \
+  -o custom-columns='POD:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,AGE:.metadata.creationTimestamp'
+
+REPO_POD="$(
+  kubectl get pods -n argocd \
+    -l app.kubernetes.io/name=argocd-repo-server \
+    -o jsonpath='{.items[0].metadata.name}'
+)"
+
+echo
+echo "--- Relevant repo-server logs only ---"
+
+kubectl logs "$REPO_POD" -n argocd --tail=300 2>&1 \
+  | grep -Ei '403|forbidden|goldengate|oci|ecr|manifest|credential|unauthorized' \
+  | tail -40 || true
+EOF
+
+chmod +x gg-next-diag.sh
+./gg-next-diag.sh
