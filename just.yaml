@@ -1,98 +1,40 @@
-#ignore this file
-#this is on.y for personel use
-#dont delete or do any modifiction in to this file.
-
-
-
-cat > gg-next-diag.sh <<'EOF'
+cat > node-capacity-check.sh <<'EOF'
 #!/bin/bash
 set -u
 
-echo "===== A. AWS SECRETS PROVIDER PENDING REASON ====="
+TARGET_NODE="ip-10-238-186-143.eu-west-1.compute.internal"
 
-PROVIDER_POD="$(
-  kubectl get pods -n kube-system \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{.spec.nodeName}{"\n"}{end}' \
-  | awk -F'|' '$1 ~ /^secrets-store-csi-driver-provider-aws-/ && $2 != "Running" {print $1; exit}'
-)"
+echo "===== TARGET NODE CAPACITY ====="
 
-echo "PENDING_PROVIDER_POD=${PROVIDER_POD:-NONE}"
-
-if [ -n "${PROVIDER_POD:-}" ]; then
-  kubectl get pod "$PROVIDER_POD" -n kube-system \
-    -o jsonpath='PHASE={.status.phase}{"\n"}NODE={.spec.nodeName}{"\n"}NODE_SELECTOR={.spec.nodeSelector}{"\n"}{range .status.conditions[*]}COND={.type} STATUS={.status} REASON={.reason} MESSAGE={.message}{"\n"}{end}'
-
-  echo "--- Scheduling events ---"
-  kubectl get events -n kube-system \
-    --field-selector involvedObject.name="$PROVIDER_POD" \
-    --sort-by='.lastTimestamp' \
-    -o custom-columns='REASON:.reason,MESSAGE:.message' | tail -10
-fi
+kubectl get node "$TARGET_NODE" \
+  -o jsonpath='NODE={.metadata.name}{"\n"}CAPACITY_PODS={.status.capacity.pods}{"\n"}ALLOCATABLE_PODS={.status.allocatable.pods}{"\n"}'
 
 echo
-echo "--- Provider DaemonSet ---"
-kubectl get daemonset secrets-store-csi-driver-provider-aws -n kube-system \
-  -o jsonpath='DESIRED={.status.desiredNumberScheduled}{"\n"}CURRENT={.status.currentNumberScheduled}{"\n"}READY={.status.numberReady}{"\n"}UNAVAILABLE={.status.numberUnavailable}{"\n"}NODE_SELECTOR={.spec.template.spec.nodeSelector}{"\n"}TOLERATIONS={.spec.template.spec.tolerations}{"\n"}'
+echo "===== CURRENT POD COUNT ON TARGET NODE ====="
+
+COUNT=$(kubectl get pods -A \
+  --field-selector spec.nodeName="$TARGET_NODE" \
+  --no-headers 2>/dev/null | wc -l)
+
+echo "CURRENT_PODS=$COUNT"
 
 echo
-echo "--- Nodes / taints ---"
-kubectl get nodes \
-  -o custom-columns='NODE:.metadata.name,TAINTS:.spec.taints,UNSCHEDULABLE:.spec.unschedulable'
+echo "===== PODS ON TARGET NODE ====="
 
-
-echo
-echo "===== B. ARGO OCI 403 DIAGNOSTIC ====="
-
-APP="goldengate-dev-postgresql-repltest-01"
-SECRET="argocd-ecr-goldengate-oci"
-
-echo "--- Application source / current error ---"
-kubectl get application "$APP" -n argocd \
-  -o jsonpath='REPO_URL={.spec.source.repoURL}{"\n"}TARGET_REVISION={.spec.source.targetRevision}{"\n"}{range .status.conditions[*]}TYPE={.type} MESSAGE={.message}{"\n"}{end}'
+kubectl get pods -A \
+  --field-selector spec.nodeName="$TARGET_NODE" \
+  -o custom-columns='NS:.metadata.namespace,POD:.metadata.name,OWNER_KIND:.metadata.ownerReferences[0].kind,OWNER_NAME:.metadata.ownerReferences[0].name,PHASE:.status.phase' \
+  --sort-by=.metadata.namespace
 
 echo
-echo "--- Repository Secret non-sensitive fields ---"
+echo "===== ALL NODE POD CAPACITY ====="
 
-echo -n "TYPE="
-kubectl get secret "$SECRET" -n argocd \
-  -o jsonpath='{.data.type}' | base64 -d
-echo
-
-echo -n "URL="
-kubectl get secret "$SECRET" -n argocd \
-  -o jsonpath='{.data.url}' | base64 -d
-echo
-
-echo -n "USERNAME="
-kubectl get secret "$SECRET" -n argocd \
-  -o jsonpath='{.data.username}' | base64 -d
-echo
-
-echo -n "RESOURCE_VERSION="
-kubectl get secret "$SECRET" -n argocd \
-  -o jsonpath='{.metadata.resourceVersion}'
-echo
-
-echo
-echo "--- Argo repo-server ---"
-
-kubectl get pods -n argocd \
-  -l app.kubernetes.io/name=argocd-repo-server \
-  -o custom-columns='POD:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,AGE:.metadata.creationTimestamp'
-
-REPO_POD="$(
-  kubectl get pods -n argocd \
-    -l app.kubernetes.io/name=argocd-repo-server \
-    -o jsonpath='{.items[0].metadata.name}'
-)"
-
-echo
-echo "--- Relevant repo-server logs only ---"
-
-kubectl logs "$REPO_POD" -n argocd --tail=300 2>&1 \
-  | grep -Ei '403|forbidden|goldengate|oci|ecr|manifest|credential|unauthorized' \
-  | tail -40 || true
+for node in $(kubectl get nodes -o name | sed 's#node/##'); do
+  alloc=$(kubectl get node "$node" -o jsonpath='{.status.allocatable.pods}')
+  count=$(kubectl get pods -A --field-selector spec.nodeName="$node" --no-headers 2>/dev/null | wc -l)
+  echo "NODE=$node PODS=$count ALLOCATABLE=$alloc"
+done
 EOF
 
-chmod +x gg-next-diag.sh
-./gg-next-diag.sh
+chmod +x node-capacity-check.sh
+./node-capacity-check.sh
