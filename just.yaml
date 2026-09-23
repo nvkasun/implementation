@@ -1,3 +1,36 @@
 #ignore this file
 #this is on.y for personel use
 #dont delete or do any modifiction in to this file.
+
+
+# Confirm cluster/context first
+aws eks update-kubeconfig --region eu-west-1 --name gg-poc-dev
+kubectl config current-context
+
+echo "===== ARGO APPLICATIONSETS ====="
+kubectl get applicationsets -n argocd -o wide
+
+echo "===== ARGO APPLICATIONS ====="
+kubectl get applications -n argocd -o wide
+
+echo "===== GOLDENGATE STATEFULSETS ====="
+kubectl get statefulsets -n goldengate-dev -o wide
+
+echo "===== GOLDENGATE PODS ====="
+kubectl get pods -n goldengate-dev -o wide
+
+echo "===== GOLDENGATE PVCs ====="
+kubectl get pvc -n goldengate-dev -o wide
+
+echo "===== GOLDENGATE PV DETAILS ====="
+for pvc in \
+  gg-postgresql-repltest-01-u02 \
+  gg-mssql-repltest-01-u02 \
+  gg-oracle-repltest-01-u02 \
+  gg-postgresql-repltest-02-u02
+do
+  echo
+  echo "===== $pvc ====="
+  kubectl get pvc "$pvc" -n goldengate-dev \
+    -o jsonpath='PVC={.metadata.name}{"\n"}STATUS={.status.phase}{"\n"}PV={.spec.volumeName}{"\n"}STORAGECLASS={.spec.storageClassName}{"\n"}'
+done
