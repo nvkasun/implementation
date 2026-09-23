@@ -1,44 +1,80 @@
-cat > final-health-check.sh <<'EOF'
+cat > mssql-migration-state.sh <<'EOF'
 #!/bin/bash
 set -u
 
-echo "===== NODE CAPACITY ====="
-for node in $(kubectl get nodes -o name | sed 's#node/##'); do
-  alloc=$(kubectl get node "$node" -o jsonpath='{.status.allocatable.pods}')
-  count=$(kubectl get pods -A --field-selector spec.nodeName="$node" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-  echo "$node PODS=$count/$alloc"
+ARGO_NS="argocd"
+GG_NS="goldengate-dev"
+
+OLD_APP="goldengate-dev-mssql-repltest-01"
+OLD_APPSET="goldengate-dev-mssql-repltest-01-appset"
+OLD_ID="gg-mssql-repltest-01"
+
+NEW_APP="goldengate-dev-mssql-repltest-001"
+NEW_APPSET="goldengate-dev-mssql-repltest-001-appset"
+NEW_ID="gg-mssql-repltest-001"
+
+PVC="gg-mssql-repltest-01-u02"
+
+echo "===== OLD IDENTITY ====="
+
+for r in \
+  "applicationset/$OLD_APPSET" \
+  "application/$OLD_APP"
+do
+  if kubectl get "$r" -n "$ARGO_NS" >/dev/null 2>&1; then
+    echo "$r=EXISTS"
+  else
+    echo "$r=ABSENT"
+  fi
+done
+
+for r in \
+  "statefulset/$OLD_ID" \
+  "service/$OLD_ID" \
+  "service/${OLD_ID}-headless"
+do
+  if kubectl get "$r" -n "$GG_NS" >/dev/null 2>&1; then
+    echo "$r=EXISTS"
+  else
+    echo "$r=ABSENT"
+  fi
 done
 
 echo
-echo "===== CSI PROVIDER ====="
-kubectl get ds secrets-store-csi-driver-provider-aws -n kube-system \
-  -o custom-columns='DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady,AVAILABLE:.status.numberAvailable'
+echo "===== RETAINED STORAGE ====="
+
+if kubectl get pvc "$PVC" -n "$GG_NS" >/dev/null 2>&1; then
+  PV="$(kubectl get pvc "$PVC" -n "$GG_NS" -o jsonpath='{.spec.volumeName}')"
+
+  kubectl get pvc "$PVC" -n "$GG_NS" \
+    -o jsonpath='PVC={.metadata.name}{" STATUS="}{.status.phase}{" PV="}{.spec.volumeName}{"\n"}'
+
+  kubectl get pv "$PV" \
+    -o jsonpath='PV={.metadata.name}{" STATUS="}{.status.phase}{" DRIVER="}{.spec.csi.driver}{" HANDLE="}{.spec.csi.volumeHandle}{"\n"}'
+else
+  echo "PVC=$PVC ABSENT"
+fi
 
 echo
-echo "===== FLUENT BIT ====="
-kubectl get ds gg-fluent-bit -n goldengate-dev \
-  -o custom-columns='DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady,AVAILABLE:.status.numberAvailable,UNAVAILABLE:.status.numberUnavailable'
+echo "===== NEW IDENTITY ====="
 
-kubectl get pods -n goldengate-dev \
-  -l app.kubernetes.io/name=fluent-bit \
-  -o custom-columns='POD:.metadata.name,READY:.status.containerStatuses[*].ready,STATUS:.status.phase,NODE:.spec.nodeName'
+for r in \
+  "applicationset/$NEW_APPSET" \
+  "application/$NEW_APP"
+do
+  if kubectl get "$r" -n "$ARGO_NS" >/dev/null 2>&1; then
+    echo "$r=EXISTS"
+  else
+    echo "$r=ABSENT"
+  fi
+done
 
-echo
-echo "===== GOLDENGATE ====="
-kubectl get sts -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,REPLICAS:.status.replicas'
-
-echo
-echo "===== ARGO APPLICATIONS ====="
-kubectl get applications -n argocd \
-  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' \
-  | grep -E 'NAME|goldengate-dev-(postgresql|mssql|oracle)-repltest|goldengate-dev-platform|goldengate-monitor'
-
-echo
-echo "===== PENDING PODS ====="
-kubectl get pods -A --field-selector status.phase=Pending \
-  -o custom-columns='NS:.metadata.namespace,POD:.metadata.name,NODE:.spec.nodeName'
+if kubectl get statefulset "$NEW_ID" -n "$GG_NS" >/dev/null 2>&1; then
+  echo "statefulset/$NEW_ID=EXISTS"
+else
+  echo "statefulset/$NEW_ID=ABSENT"
+fi
 EOF
 
-chmod +x final-health-check.sh
-./final-health-check.sh
+chmod +x mssql-migration-state.sh
+./mssql-migration-state.sh
