@@ -1,6 +1,7 @@
-vm_id = one(concat(
-  azurerm_linux_virtual_machine.linux_vm[*].id,
-  azurerm_windows_virtual_machine.windows_vm[*].id,
-  azurerm_linux_virtual_machine.specialized_linux_vm[*].id,
-  azurerm_virtual_machine.attached_disks_vm[*].id
-))
+depends_on = [
+  azurerm_linux_virtual_machine.linux_vm,
+  azurerm_windows_virtual_machine.windows_vm,
+  azurerm_linux_virtual_machine.specialized_linux_vm,
+  azurerm_virtual_machine.attached_disks_vm,
+  azurerm_virtual_machine_extension.extensions
+]
