@@ -1,5 +1,42 @@
-The module already uses azurerm_virtual_machine without os_profile for the existing specialized-disk attach mode. The specialized Gallery image path appears to need a similar legacy-resource path, but with storage_image_reference.id = source_image_id and create_option = "FromImage" rather than Attach.
+locals {
+  # Generate admin credentials if not provided
+  generate_password = var.admin_password == null
 
-And bro, Microsoft explicitly says a specialized image keeps the existing machine/account information and does not have an osProfile, exactly matching the Azure error you hit.
+  # Determine final admin credentials
+  admin_username = coalesce(var.admin_username, "azureuser")
+  admin_password = var.admin_password != null ? var.admin_password : random_password.admin[0].result
 
-https://learn.microsoft.com/en-us/azure/virtual-machines/vm-specialized-image-version?utm_source=chatgpt.com&tabs=cli%2Ccli2%2Ccli3%2Ccli4%2Ccli5
+  environment        = var.environment
+  location           = "uaenorth"
+  location_shortcode = "uan"
+  role_definition_resource_substring = "/providers/Microsoft.Authorization/roleDefinitions"
+
+  vm_name       = substr(format("vm-%s-%s-%s", var.application_name, var.environment, local.location_shortcode, random_string.unique_id.result), 0, 24)
+  computer_name = substr(replace(local.vm_name, "-", ""), 0, 15)
+
+  # Attach mode: reuse pre-created OS/data disks instead of building the VM from a marketplace image
+  use_existing_os_disk = var.existing_os_disk != null
+
+  # Specialized Compute Gallery image support
+  specialized_image = var.source_image_id != null && var.source_image_specialized && !local.use_existing_os_disk
+  attach_existing_disks = local.use_existing_os_disk || local.specialized_image
+
+  attached_os_disk_name = local.use_existing_os_disk ? data.azurerm_managed_disk.existing_os[0].name : one(azurerm_managed_disk.image_os[*].name)
+  attached_os_disk_id   = local.use_existing_os_disk ? data.azurerm_managed_disk.existing_os[0].id   : one(azurerm_managed_disk.image_os[*].id)
+
+  # A managed disk can only be attached to a VM in its own availability zone.
+  availability_zone = local.use_existing_os_disk ? one(data.azurerm_managed_disk.existing_os[0].zones) : var.availability_zone
+
+  # OS type in the casing the legacy azurerm_virtual_machine resource expects.
+  os_type_title = lower(var.vm.os_type) == "windows" ? "Windows" : "Linux"
+
+  vm_id = one(concat(
+    azurerm_linux_virtual_machine.linux_vm[*].id,
+    azurerm_windows_virtual_machine.windows_vm[*].id,
+    azurerm_linux_virtual_machine.specialized_linux_vm[*].id,
+    azurerm_virtual_machine.attached_disks_vm[*].id
+  ))
+
+  # Apply exactly the tags the caller provides.
+  tags = var.tags
+}
