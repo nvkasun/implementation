@@ -43,7 +43,7 @@ class FakeProc:
 
 
 class ScriptedRun:
-    """Replaces phase5_runtime.run with a scripted responder: a list of (predicate, FakeProc) pairs consulted in order (later registrations take precedence), falling back to a default success. Every call is recorded for assertion."""
+    """Replaces phase5_runtime.run with a scripted responder: a list of (predicate, proc) pairs consulted in reverse-registration order (later registrations take precedence), falling back to a default success. `proc` may be a plain FakeProc, or a callable(argv) -> FakeProc for responses that must vary call-to-call (e.g. simulating an Application that exists for several polls before going NotFound) -- resolved via `_resolve`. Every call is recorded for assertion."""
 
     def __init__(self, default=None):
         self.rules = []
@@ -54,14 +54,18 @@ class ScriptedRun:
         self.rules.append((predicate, proc))
         return self
 
+    def _resolve(self, proc_or_fn, argv):
+        return proc_or_fn(argv) if callable(proc_or_fn) and not isinstance(proc_or_fn, FakeProc) else proc_or_fn
+
     def __call__(self, argv, env=None, cwd=None, check=True, capture_output=True, input_text=None):
         self.calls.append({"argv": list(argv), "env": env, "input_text": input_text})
         # Capture any file://-referenced temp file's content NOW -- production code deletes such temp files (e.g. the ECR repository-policy document) right after this call returns.
         for arg in argv:
             if isinstance(arg, str) and arg.startswith("file://") and Path(arg[len("file://"):]).is_file():
                 self.calls[-1]["file_contents"] = Path(arg[len("file://"):]).read_text()
-        for predicate, proc in reversed(self.rules):
+        for predicate, proc_or_fn in reversed(self.rules):
             if predicate(argv):
+                proc = self._resolve(proc_or_fn, argv)
                 if check and proc.returncode != 0:
                     raise phase5_runtime.Phase5Error(f"{' '.join(str(a) for a in argv)} failed: {proc.stdout}\n{proc.stderr}")
                 return proc
@@ -76,6 +80,27 @@ def _starts_with(*prefix):
 
 def _contains(*substrs):
     return lambda argv: all(any(s in str(a) for a in argv) for s in substrs)
+
+
+def _argo_app_notfound_proc(app_name="app"):
+    """The exact `kubectl get application <name> -n <ns> -o json` failure shape k8s_common.get_json() recognizes as a positive, explicit NotFound (not a generic failure) -- used as the default "delete already finished" poll response in fixtures that don't care about the new bounded-wait mechanics themselves."""
+    return FakeProc(1, "", f'Error from server (NotFound): applications.argoproj.io "{app_name}" not found (NotFound)')
+
+
+def _argo_app_exists_proc(deletion_timestamp=None, finalizers=None):
+    """A `kubectl get application ... -o json` success response for an Application that still exists (mid-deletion or otherwise) -- optionally carrying deletionTimestamp/finalizers for the timeout-diagnostics tests."""
+    metadata = {}
+    if deletion_timestamp is not None:
+        metadata["deletionTimestamp"] = deletion_timestamp
+    if finalizers is not None:
+        metadata["finalizers"] = finalizers
+    return FakeProc(0, json.dumps({"metadata": metadata}))
+
+
+def _register_default_argo_app_scripted_responses(scripted, app_name):
+    """Registers the DEFAULT "delete request accepted, and the very next poll already observes NotFound" response shape for --wait=false Application deletion -- used by fixture builders that exercise unrelated behavior (ordering, targeting, PVC/PV untouched, etc.) and must not need to know about the new bounded-poll mechanics themselves. Tests that actually exercise the poll/timeout logic register their own more specific `kubectl get application` responses, which take precedence (ScriptedRun consults registrations in reverse order). Matched by kind only (never a specific name) -- every one of these fixtures targets exactly one Application per test run."""
+    scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+    scripted.when(_starts_with("kubectl", "get", "application"), _argo_app_notfound_proc(app_name))
 
 
 class argparse_namespace:
@@ -1773,19 +1798,21 @@ class RemoveRuntimeTests(TempStateCase):
         self.assertEqual(scripted.calls, [], "no kubectl get/patch/delete calls at all -- preflight's own application_found is authoritative")
 
     def test_owned_application_found_true_patch_delete_allowed(self):
+        # Live-Proven Argo Application Deletion Timeout Fix: the delete REQUEST is now non-blocking (--wait=false, never --wait=true/--timeout=10m) -- kubectl's own exit code is no longer the authority for deletion success; a separate bounded poll (exercised by its own dedicated tests below) is.
         self._set_state("OWNED", True)
         scripted = ScriptedRun()
         scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
         scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
-        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+        _register_default_argo_app_scripted_responses(scripted, _canonical_argocd_app_name())
+        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep"), _env_patch():
             _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
         patch_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "patch"]]
-        delete_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"]]
+        delete_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"] and c["argv"][2] == "application"]
         self.assertEqual(len(patch_calls), 1)
         self.assertEqual(len(delete_calls), 1)
-        self.assertIn("--wait=true", delete_calls[0]["argv"])
-        self.assertIn("--timeout=10m", delete_calls[0]["argv"])
+        self.assertIn("--wait=false", delete_calls[0]["argv"])
+        self.assertNotIn("--wait=true", delete_calls[0]["argv"])
+        self.assertFalse(any("--timeout=10m" in a for a in delete_calls[0]["argv"]))
 
     def test_delete_patch_failure_fails(self):
         self._set_state("OWNED", True)
@@ -1796,12 +1823,13 @@ class RemoveRuntimeTests(TempStateCase):
             with self.assertRaises(phase5_runtime.Phase5Error):
                 _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
 
-    def test_delete_failure_fails(self):
+    def test_delete_request_failure_fails(self):
+        # The initial --wait=false delete REQUEST can still fail outright (e.g. Forbidden) -- distinct from the bounded-poll timeout tested separately below.
         self._set_state("OWNED", True)
         scripted = ScriptedRun()
         scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
         scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(1, "", "timed out"))
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(1, "", "Forbidden"))
         with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
             with self.assertRaises(phase5_runtime.Phase5Error):
                 _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
@@ -1812,8 +1840,8 @@ class RemoveRuntimeTests(TempStateCase):
         scripted = ScriptedRun()
         scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
         scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
-        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+        _register_default_argo_app_scripted_responses(scripted, _canonical_argocd_app_name())
+        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep"), _env_patch():
             _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
         return [c["argv"] for c in scripted.calls]
 
@@ -2321,15 +2349,16 @@ class RemovalMutationStateTests(TempStateCase):
         scripted = ScriptedRun()
         scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
         scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
-        with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+        _register_default_argo_app_scripted_responses(scripted, _canonical_argocd_app_name())
+        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep"), _env_patch():
             _run_quiet(phase5_runtime.cmd_remove_runtime, self.args)
         patch_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "patch"]]
-        delete_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"]]
+        delete_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"] and c["argv"][2] == "application"]
         self.assertEqual(len(patch_calls), 1)
         self.assertEqual(len(delete_calls), 1)
-        self.assertIn("--wait=true", delete_calls[0]["argv"])
-        self.assertIn("--timeout=10m", delete_calls[0]["argv"])
+        self.assertIn("--wait=false", delete_calls[0]["argv"])
+        self.assertNotIn("--wait=true", delete_calls[0]["argv"])
+        self.assertFalse(any("--timeout=10m" in a for a in delete_calls[0]["argv"]))
 
 
 class LiteralDeployBooleanTests(unittest.TestCase):
@@ -2583,12 +2612,12 @@ class CrossRuntimeRemovalStateTests(unittest.TestCase):
             scripted = ScriptedRun()
             scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
             scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-            scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
-            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            _register_default_argo_app_scripted_responses(scripted, _canonical_argocd_app_name())
+            with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep"), _env_patch():
                 _run_quiet(phase5_runtime.cmd_remove_runtime, args)
             appset_delete_calls = [c for c in scripted.calls if c["argv"][:3] == ["kubectl", "delete", "applicationset"]]
             patch_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "patch"]]
-            delete_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"]]
+            delete_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"] and c["argv"][2] == "application"]
             self.assertEqual(appset_delete_calls, [], "no ApplicationSet exists yet for this runtime -- removal must never invent one to delete")
             self.assertEqual(len(patch_calls), 1)
             self.assertEqual(len(delete_calls), 1)
@@ -2604,8 +2633,8 @@ class CrossRuntimeRemovalStateTests(unittest.TestCase):
             scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
             scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
             scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-            scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
-            with mock.patch.object(phase5_runtime, "run", scripted), _env_patch():
+            _register_default_argo_app_scripted_responses(scripted, _canonical_argocd_app_name())
+            with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep"), _env_patch():
                 _run_quiet(phase5_runtime.cmd_remove_runtime, args)
             mutation_calls = [c["argv"] for c in scripted.calls if c["argv"][:2] in (["kubectl", "delete"], ["kubectl", "patch"])]
             appset_delete_idx = next(i for i, argv in enumerate(mutation_calls) if argv[:3] == ["kubectl", "delete", "applicationset"])
@@ -4738,6 +4767,162 @@ class MigrationPreflightTests(MigrationTempStateCase):
         self.assertFalse(any(c["argv"][:2] == ["aws", "efs"] for c in scripted.calls))
 
 
+# ==== LIVE-PROVEN ARGO APPLICATION DELETION TIMEOUT FIX ====
+
+class ArgoApplicationDeleteAndAwaitAbsenceTests(unittest.TestCase):
+    """A real VDR environment-wide Deploy proved `kubectl delete application ... --wait=true --timeout=10m` treats a legitimate asynchronous Argo Application cascade deletion that merely takes slightly longer than 10 minutes as an immediate fatal mutation failure, even though deletion was still progressing and completed successfully moments later (confirmed live for the gg-mssql-repltest-01 -> gg-mssql-repltest-001 migration: the OLD Application/StatefulSet/compute fully disappeared, and a retry then completed the migration correctly with the retained PVC/PV/EFS access point unchanged). Focused, direct coverage of _delete_argo_application_and_await_absence() -- the ONE shared helper both cmd_migration_remove_old() and cmd_remove_runtime() now use instead of each keeping its own copy of the old brittle pattern. All time-bounded scenarios mock time.sleep -- no test actually waits."""
+
+    APP_NAME = "goldengate-dev-mssql-repltest-01"
+    NAMESPACE = "argocd"
+
+    def _run_helper(self, scripted):
+        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep") as sleep_mock:
+            phase5_runtime._delete_argo_application_and_await_absence(self.APP_NAME, self.NAMESPACE)
+        return sleep_mock
+
+    # 2: the delete request itself is non-blocking -- --wait=false, never --wait=true/--timeout=10m.
+    def test_delete_request_is_non_blocking_not_dependent_on_old_wait_true_timeout_10m(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application", self.APP_NAME), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), _argo_app_notfound_proc(self.APP_NAME))
+        self._run_helper(scripted)
+        delete_calls = [c for c in scripted.calls if c["argv"][:2] == ["kubectl", "delete"]]
+        self.assertEqual(len(delete_calls), 1)
+        self.assertIn("--wait=false", delete_calls[0]["argv"])
+        self.assertNotIn("--wait=true", delete_calls[0]["argv"])
+        self.assertFalse(any(isinstance(a, str) and a.startswith("--timeout=") for a in delete_calls[0]["argv"]))
+
+    # 3: accepted delete + immediate NotFound succeeds.
+    def test_accepted_delete_and_immediate_notfound_succeeds(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), _argo_app_notfound_proc(self.APP_NAME))
+        sleep_mock = self._run_helper(scripted)
+        sleep_mock.assert_not_called()
+
+    # 4: delete returns explicit NotFound because the Application was already removed -> succeeds.
+    def test_delete_request_itself_returns_notfound_succeeds(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(1, "", f'Error from server (NotFound): applications.argoproj.io "{self.APP_NAME}" not found (NotFound)'))
+        scripted.when(_starts_with("kubectl", "get", "application"), _argo_app_notfound_proc(self.APP_NAME))
+        self._run_helper(scripted)
+
+    # 5: Application remains for several poll intervals, then becomes NotFound -> succeeds.
+    def test_application_remains_for_several_polls_then_notfound_succeeds(self):
+        responses = [_argo_app_exists_proc(), _argo_app_exists_proc(), _argo_app_exists_proc(), _argo_app_notfound_proc(self.APP_NAME)]
+        calls = {"n": 0}
+
+        def _get_response(argv):
+            idx = min(calls["n"], len(responses) - 1)
+            calls["n"] += 1
+            return responses[idx]
+
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), _get_response)
+        sleep_mock = self._run_helper(scripted)
+        self.assertEqual(calls["n"], 4)
+        self.assertEqual(sleep_mock.call_count, 3)
+        for c in sleep_mock.call_args_list:
+            self.assertEqual(c.args[0], 15)
+
+    # 6: deletion takes LONGER than the OLD 10-minute boundary but completes inside the NEW bounded poll window -> succeeds. This is the general case; the exact live incident shape is its own dedicated named regression test in MigrationRemoveOldTests below.
+    def test_deletion_longer_than_old_ten_minute_boundary_but_within_new_bound_succeeds(self):
+        still_exists_polls = 44  # 44 * 15s = 660s (~11 minutes) -- would have failed the OLD --timeout=10m contract outright.
+        calls = {"n": 0}
+
+        def _get_response(argv):
+            calls["n"] += 1
+            return _argo_app_exists_proc() if calls["n"] <= still_exists_polls else _argo_app_notfound_proc(self.APP_NAME)
+
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), _get_response)
+        sleep_mock = self._run_helper(scripted)
+        self.assertEqual(sleep_mock.call_count, still_exists_polls)
+
+    # 7: Application never disappears before the new timeout -> Phase5Error, never a silent success.
+    def test_application_never_disappears_before_new_timeout_fails_closed(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), lambda argv: _argo_app_exists_proc())
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._run_helper(scripted)
+
+    # 8: Forbidden during polling -> Phase5Error.
+    def test_forbidden_during_polling_fails_closed(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), FakeProc(1, "", "Error from server (Forbidden): applications.argoproj.io is forbidden: User cannot get resource"))
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._run_helper(scripted)
+
+    # 9: Unauthorized during polling -> Phase5Error.
+    def test_unauthorized_during_polling_fails_closed(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), FakeProc(1, "", "error: You must be logged in to the server (Unauthorized)"))
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._run_helper(scripted)
+
+    # 10/11: API/network/unknown kubectl failure during polling -> Phase5Error -- no generic non-zero kubectl exit is ever interpreted as absence.
+    def test_unknown_kubectl_failure_during_polling_fails_closed(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), FakeProc(1, "", "Unable to connect to the server: dial tcp: i/o timeout"))
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._run_helper(scripted)
+
+    # 11 (continued): a zero-exit but malformed/unparseable response must also fail closed -- never silently treated as "gone".
+    def test_malformed_json_on_success_exit_fails_closed_never_absence(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), FakeProc(0, "not valid json{{{"))
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            self._run_helper(scripted)
+
+    # 12: timeout diagnostics include Application identity plus deletionTimestamp/finalizers when available.
+    def test_timeout_diagnostics_include_application_identity_and_metadata(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"),
+                      lambda argv: _argo_app_exists_proc(deletion_timestamp="2026-01-01T00:00:00Z", finalizers=["resources-finalizer.argocd.argoproj.io"]))
+        with self.assertRaises(phase5_runtime.Phase5Error) as ctx:
+            self._run_helper(scripted)
+        message = str(ctx.exception)
+        self.assertIn(self.APP_NAME, message)
+        self.assertIn(self.NAMESPACE, message)
+        self.assertIn("2026-01-01T00:00:00Z", message)
+        self.assertIn("resources-finalizer.argocd.argoproj.io", message)
+        self.assertIn("1200", message)
+
+    # 13: the Application finalizer is NEVER stripped/removed as a timeout shortcut, and this helper never patches anything itself.
+    def test_never_patches_or_strips_finalizers_itself(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), _argo_app_notfound_proc(self.APP_NAME))
+        self._run_helper(scripted)
+        self.assertFalse(any(c["argv"][:2] == ["kubectl", "patch"] for c in scripted.calls))
+        self.assertFalse(any("finalizer" in " ".join(str(a) for a in c["argv"]).lower() for c in scripted.calls))
+
+    # 14: the retained PVC/PV are never touched -- this helper issues zero PVC/PV-targeting calls.
+    def test_never_touches_pvc_or_pv(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), _argo_app_notfound_proc(self.APP_NAME))
+        self._run_helper(scripted)
+        self.assertFalse(any("persistentvolumeclaim" in c["argv"] or "persistentvolume" in c["argv"] or "pvc" in c["argv"] for c in scripted.calls))
+
+    # Never force-deletes -- no --force/--grace-period=0 flag is ever constructed.
+    def test_never_force_deletes(self):
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), _argo_app_notfound_proc(self.APP_NAME))
+        self._run_helper(scripted)
+        flat = [str(a) for c in scripted.calls for a in c["argv"]]
+        self.assertFalse(any("--force" in a or "grace-period" in a for a in flat))
+
+
 class MigrationRemoveOldTests(MigrationTempStateCase):
     def _set_state(self, **overrides):
         phase5_runtime.update_state(self.state_path, _migration_state_fixture(**overrides), phase5_runtime.MIGRATION_ALLOWED_STATE_KEYS)
@@ -4774,8 +4959,8 @@ class MigrationRemoveOldTests(MigrationTempStateCase):
         scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
         scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
         scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
+        _register_default_argo_app_scripted_responses(scripted, phase5_runtime._canonical_argocd_app_name(MIGRATION_ENVIRONMENT, MIGRATION_OLD_ID))
+        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep"), self._migration_env_patch():
             _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
         return [c["argv"] for c in scripted.calls]
 
@@ -4827,14 +5012,59 @@ class MigrationRemoveOldTests(MigrationTempStateCase):
         self.assertFalse(any(c["argv"][:2] == ["kubectl", "patch"] or c["argv"][:2] == ["kubectl", "delete"] and c["argv"][2] == "application" for c in scripted.calls))
 
     def test_application_delete_notfound_is_tolerated_idempotent(self):
+        # 4: delete returns explicit NotFound because the Application was already removed -> succeeds, immediately, with no polling needed at all.
         self._set_state()
         scripted = ScriptedRun()
         scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
         scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
         scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
         scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(1, "", "applications.argoproj.io \"x\" not found (NotFound)"))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
+        scripted.when(_starts_with("kubectl", "get", "application"), _argo_app_notfound_proc())
+        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep") as sleep_mock, self._migration_env_patch():
             _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
+        sleep_mock.assert_not_called()
+
+    # 15: cmd_migration_remove_old uses the SAME shared _delete_argo_application_and_await_absence() helper -- proven behaviorally (the --wait=false shape it always constructs), never merely "a delete call happened somehow".
+    def test_uses_the_shared_delete_and_await_absence_helper(self):
+        with mock.patch.object(phase5_runtime, "_delete_argo_application_and_await_absence") as helper_mock:
+            self._set_state()
+            scripted = ScriptedRun()
+            scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+            scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
+            scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
+            with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
+                _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
+        helper_mock.assert_called_once_with(
+            phase5_runtime._canonical_argocd_app_name(MIGRATION_ENVIRONMENT, MIGRATION_OLD_ID),
+            "argocd",
+        )
+        # The helper itself (mocked away here) is what would have issued the actual delete/poll kubectl calls -- confirms cmd_migration_remove_old() never independently constructs its own duplicate `kubectl delete application` call alongside it.
+        self.assertFalse(any(c["argv"][:3] == ["kubectl", "delete", "application"] for c in scripted.calls))
+
+    def test_live_evidence_regression_mssql_migration_application_deletion_exceeds_old_ten_minute_boundary_but_succeeds(self):
+        """Named regression test for the exact real VDR incident that motivated this fix: a live environment-wide Deploy exercising the gg-mssql-repltest-01 -> gg-mssql-repltest-001 migration correctly deleted the OLD ApplicationSet first, then the OLD Application deletion (under the OLD `--wait=true --timeout=10m` contract) failed with "timed out waiting for the condition" even though the Application/StatefulSet/all OLD compute finished deleting normally moments later, and a retry then completed the migration correctly with the retained PVC (gg-mssql-repltest-01-u02)/PV (pvc-2ddd0407-f776-4870-aa50-674dfc55faee)/EFS access point (fsap-0a804c4697816195b) unchanged. This test makes it impossible for a future change to restore that brittle behavior: OLD AppSet deletion succeeds, the Application delete request is accepted, the Application GET reports it still exists for a simulated >600 seconds (comfortably past the OLD 10-minute/600-second boundary), then reports NotFound comfortably before the NEW ~20-minute bound -- cmd_migration_remove_old must succeed."""
+        self._set_state()
+        still_exists_polls = 41  # 41 * 15s = 615s -- exceeds the OLD 600s (--timeout=10m) boundary that failed live, well inside the NEW 1200s bound.
+        poll_calls = {"n": 0}
+
+        def _application_get_response(argv):
+            poll_calls["n"] += 1
+            return _argo_app_exists_proc() if poll_calls["n"] <= still_exists_polls else _argo_app_notfound_proc(phase5_runtime._canonical_argocd_app_name(MIGRATION_ENVIRONMENT, MIGRATION_OLD_ID))
+
+        scripted = ScriptedRun()
+        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        scripted.when(_starts_with("kubectl", "get", "application"), _application_get_response)
+
+        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep") as sleep_mock, self._migration_env_patch():
+            _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)  # must NOT raise
+
+        self.assertEqual(poll_calls["n"], still_exists_polls + 1)
+        self.assertEqual(sleep_mock.call_count, still_exists_polls)
+        appset_delete_calls = [c for c in scripted.calls if c["argv"][:3] == ["kubectl", "delete", "applicationset"]]
+        self.assertEqual(len(appset_delete_calls), 1, "the OLD ApplicationSet must still be deleted first, exactly as in the real incident")
 
 
 class MigrationVerifyOldAbsentTests(MigrationTempStateCase):
@@ -4914,9 +5144,9 @@ class MigrationNeverConcurrentComputeTests(MigrationTempStateCase):
         scripted.when(_starts_with("kubectl", "get", "persistentvolume", MIGRATION_OLD_PV_NAME), _migration_pv_proc())
         scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
         scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
+        _register_default_argo_app_scripted_responses(scripted, phase5_runtime._canonical_argocd_app_name(MIGRATION_ENVIRONMENT, MIGRATION_OLD_ID))
 
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
+        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep"), self._migration_env_patch():
             _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
             preflight_state = phase5_runtime.load_state(self.state_path)
             self.assertIs(preflight_state["bridge_required"], True)

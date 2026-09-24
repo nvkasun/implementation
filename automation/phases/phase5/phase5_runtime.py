@@ -1652,6 +1652,38 @@ def _kubectl_runner(args):
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _delete_argo_application_and_await_absence(argocd_app_name, argocd_namespace):
+    """Live-Proven Argo Application Deletion Timeout Fix: the ONE shared implementation both cmd_migration_remove_old() and cmd_remove_runtime() use to actually delete an Argo CD Application, reused verbatim rather than each keeping its own copy of the same brittle pattern. A real VDR environment-wide Deploy proved `kubectl delete application ... --wait=true --timeout=10m` treats a legitimate asynchronous cascade deletion that merely takes slightly longer than 10 minutes as an immediate fatal mutation failure, even though deletion was still progressing and completed successfully moments later (confirmed live: the OLD gg-mssql-repltest-01 Application/StatefulSet/compute fully disappeared, and a subsequent retry completed the migration correctly with the retained PVC/PV/EFS access point unchanged). The fix: submit the delete request without kubectl's own blocking wait acting as the authority for success, then positively poll for NotFound ourselves via k8s_common.get_json() (the same read-only, fail-closed-on-anything-but-explicit-NotFound primitive runtime_state.py/runtime_acceptance.py already rely on) -- Forbidden/Unauthorized/API-connectivity/malformed-JSON during polling raises ClassifierInspectionError, which this function re-raises as Phase5Error, NEVER downgraded to "must be gone". Never removes/strips finalizers as a shortcut and never force-deletes -- the resources-finalizer patch (if the caller applies one first, exactly as before) remains the sole mechanism that makes Argo CD actually cascade-delete managed resources; this function only ever waits for what that already-approved mechanism produces. Callers must delete the owning ApplicationSet BEFORE calling this -- that ordering is enforced by the caller, not here, exactly as before."""
+    delete_proc = run(["kubectl", "delete", "application", argocd_app_name, "-n", argocd_namespace, "--wait=false"], check=False)
+    if delete_proc.returncode != 0 and "(NotFound)" not in (delete_proc.stderr or ""):
+        raise Phase5Error(f"failed to submit deletion request for Argo CD Application {argocd_app_name}: {((delete_proc.stderr or '') + (delete_proc.stdout or '')).strip()}")
+
+    k8s_common = _load_k8s_common()
+    # 20 minutes: comfortably inside GitHub Actions' default 360-minute job timeout (this workflow sets no tighter timeout-minutes override), well past the ~10-13 minute completion time the live incident actually observed, while still bounded -- this never waits forever.
+    timeout_seconds, interval_seconds, elapsed = 1200, 15, 0
+    while True:
+        try:
+            found, obj = k8s_common.get_json(_kubectl_runner, "application", argocd_app_name, argocd_namespace)
+        except k8s_common.ClassifierInspectionError as exc:
+            raise Phase5Error(f"could not confirm deletion of Argo CD Application {argocd_app_name}: {exc} -- a Forbidden/Unauthorized/API-connectivity/malformed-output failure while polling is never treated as deletion complete.") from exc
+
+        if not found:
+            print(f"OK: Argo CD Application {argocd_app_name} is confirmed absent (elapsed {elapsed}s / {timeout_seconds}s).")
+            return
+
+        if elapsed >= timeout_seconds:
+            metadata = (obj or {}).get("metadata") or {}
+            raise Phase5Error(
+                f"timed out after {timeout_seconds}s waiting for Argo CD Application {argocd_app_name} (namespace {argocd_namespace}) to be positively confirmed absent -- "
+                f"deletionTimestamp={metadata.get('deletionTimestamp')!r}, remaining finalizers={metadata.get('finalizers')!r}. "
+                "The delete request was already accepted and cascade deletion may still be progressing -- this refuses to force-delete or strip finalizers to accelerate it; "
+                "investigate the diagnostics above, or simply re-run this step once deletion has actually finished."
+            )
+        print(f"Argo CD Application {argocd_app_name} still present -- deletion in progress (elapsed {elapsed}s / {timeout_seconds}s).")
+        time.sleep(interval_seconds)
+        elapsed += interval_seconds
+
+
 def _validate_migration_state_identity(state, environment, new_deployment_id):
     """Binds a persisted migration-state JSON document back to the CURRENT CLI environment/new_deployment_id AND the one bounded (environment, new_deployment_id) -> old_deployment_id pair RUNTIME_IDENTITY_MIGRATIONS itself names -- applied before any cluster connection or mutating call from a migration-state consumer (migration-remove-old, migration-verify-old-absent), so a stale/cross-runtime migration state file can never control a different runtime's mutation. Returns (old_deployment_id, bridge_required)."""
     if not isinstance(state, dict):
@@ -1792,9 +1824,7 @@ def cmd_migration_remove_old(args):
         if patch_proc.returncode != 0 and "(NotFound)" not in (patch_proc.stderr or ""):
             raise Phase5Error(f"failed to patch finalizers on OLD migration-identity Argo CD Application {argocd_app_name}: {((patch_proc.stderr or '') + (patch_proc.stdout or '')).strip()}")
 
-        delete_proc = run(["kubectl", "delete", "application", argocd_app_name, "-n", argocd_namespace, "--wait=true", "--timeout=10m"], check=False)
-        if delete_proc.returncode != 0 and "(NotFound)" not in (delete_proc.stderr or ""):
-            raise Phase5Error(f"failed to delete OLD migration-identity Argo CD Application {argocd_app_name}: {((delete_proc.stderr or '') + (delete_proc.stdout or '')).strip()}")
+        _delete_argo_application_and_await_absence(argocd_app_name, argocd_namespace)
         print(f"Argo CD Application {argocd_app_name} (OLD migration identity {old_deployment_id!r}) deleted. Argo CD will cascade-delete its managed resources.")
 
     print(f"The retained /u02 PersistentVolumeClaim {state.get('old_pvc_name')!r} is never deleted here -- its own argocd.argoproj.io/sync-options: Prune=false,Delete=false annotation protects it. The shared runtime namespace is never deleted either.")
@@ -2284,9 +2314,7 @@ def cmd_remove_runtime(args):
         if patch_proc.returncode != 0 and "(NotFound)" not in (patch_proc.stderr or ""):
             raise Phase5Error(f"failed to patch finalizers on Argo CD Application {argocd_app_name}: {((patch_proc.stderr or '') + (patch_proc.stdout or '')).strip()}")
 
-        delete_proc = run(["kubectl", "delete", "application", argocd_app_name, "-n", argocd_namespace, "--wait=true", "--timeout=10m"], check=False)
-        if delete_proc.returncode != 0 and "(NotFound)" not in (delete_proc.stderr or ""):
-            raise Phase5Error(f"failed to delete Argo CD Application {argocd_app_name}: {((delete_proc.stderr or '') + (delete_proc.stdout or '')).strip()}")
+        _delete_argo_application_and_await_absence(argocd_app_name, argocd_namespace)
         print(f"Argo CD Application {argocd_app_name} deleted. Argo CD will cascade-delete its managed resources.")
 
     print("The shared runtime namespace is never deleted by this workflow -- singleRuntime does not own it. The retained /u02 PersistentVolumeClaim (Prune=false), any EFS filesystem, and Secrets Manager secrets are never deleted here either.")

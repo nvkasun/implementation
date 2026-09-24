@@ -17190,6 +17190,9 @@ def fake_run(argv, env=None, cwd=None, check=True, capture_output=True, input_te
     remove_runtime_calls.append(list(argv))
     if argv[:2] == ["aws", "eks"]:
         return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    if argv[:3] == ["kubectl", "get", "application"]:
+        # Live-Proven Argo Application Deletion Timeout Fix: cmd_remove_runtime now polls `kubectl get application ... -o json` (via k8s_common.get_json) after submitting a non-blocking delete, positively confirming NotFound rather than trusting kubectl's own blocking --wait. This fixture's delete request is treated as instantly effective -- the very next poll observes the Application already gone.
+        return type("Proc", (), {"returncode": 1, "stdout": "", "stderr": f'Error from server (NotFound): applications.argoproj.io "{argv[3]}" not found (NotFound)'})()
     return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
 
