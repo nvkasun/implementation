@@ -1,42 +1,68 @@
-locals {
-  # Generate admin credentials if not provided
-  generate_password = var.admin_password == null
+# ==============================================================================
+# Specialized Linux Virtual Machine
+#
+# For a specialized Compute Gallery image, the OS disk is created above
+# with the module DES/CMK and attached here as an existing managed OS disk.
+# This avoids sending an OSProfile to Azure.
+# ==============================================================================
 
-  # Determine final admin credentials
-  admin_username = coalesce(var.admin_username, "azureuser")
-  admin_password = var.admin_password != null ? var.admin_password : random_password.admin[0].result
+resource "azurerm_linux_virtual_machine" "specialized_linux_vm" {
+  count = local.specialized_image && lower(var.vm.os_type) == "linux" ? 1 : 0
 
-  environment        = var.environment
-  location           = "uaenorth"
-  location_shortcode = "uan"
-  role_definition_resource_substring = "/providers/Microsoft.Authorization/roleDefinitions"
+  depends_on = [
+    time_sleep.wait_for_kv_rbac,
+    azurerm_managed_disk.image_os
+  ]
 
-  vm_name       = substr(format("vm-%s-%s-%s", var.application_name, var.environment, local.location_shortcode, random_string.unique_id.result), 0, 24)
-  computer_name = substr(replace(local.vm_name, "-", ""), 0, 15)
+  name                = local.vm_name
+  location            = "uaenorth"
+  resource_group_name = var.resource_group_name
+  size                = var.vm_size
 
-  # Attach mode: reuse pre-created OS/data disks instead of building the VM from a marketplace image
-  use_existing_os_disk = var.existing_os_disk != null
+  network_interface_ids = [azurerm_network_interface.vm.id]
+  zone                  = local.availability_zone
 
-  # Specialized Compute Gallery image support
-  specialized_image = var.source_image_id != null && var.source_image_specialized && !local.use_existing_os_disk
-  attach_existing_disks = local.use_existing_os_disk || local.specialized_image
+  proximity_placement_group_id = var.proximity_placement_group_id
 
-  attached_os_disk_name = local.use_existing_os_disk ? data.azurerm_managed_disk.existing_os[0].name : one(azurerm_managed_disk.image_os[*].name)
-  attached_os_disk_id   = local.use_existing_os_disk ? data.azurerm_managed_disk.existing_os[0].id   : one(azurerm_managed_disk.image_os[*].id)
+  # Attach the OS disk created from the specialized gallery image.
+  # Do not send admin credentials or any other OSProfile properties.
+  os_managed_disk_id = local.attached_os_disk_id
 
-  # A managed disk can only be attached to a VM in its own availability zone.
-  availability_zone = local.use_existing_os_disk ? one(data.azurerm_managed_disk.existing_os[0].zones) : var.availability_zone
+  os_disk {
+    caching                = var.os_disk.caching
+    disk_encryption_set_id = azurerm_disk_encryption_set.des.id
+  }
 
-  # OS type in the casing the legacy azurerm_virtual_machine resource expects.
-  os_type_title = lower(var.vm.os_type) == "windows" ? "Windows" : "Linux"
+  dynamic "identity" {
+    for_each = var.managed_identities.system_assigned || length(var.managed_identities.user_assigned_resource_ids) > 0 ? [1] : []
 
-  vm_id = one(concat(
-    azurerm_linux_virtual_machine.linux_vm[*].id,
-    azurerm_windows_virtual_machine.windows_vm[*].id,
-    azurerm_linux_virtual_machine.specialized_linux_vm[*].id,
-    azurerm_virtual_machine.attached_disks_vm[*].id
-  ))
+    content {
+      type = var.managed_identities.system_assigned && length(var.managed_identities.user_assigned_resource_ids) > 0 ? "SystemAssigned, UserAssigned" : var.managed_identities.system_assigned ? "SystemAssigned" : "UserAssigned"
+      identity_ids = length(var.managed_identities.user_assigned_resource_ids) > 0 ? var.managed_identities.user_assigned_resource_ids : null
+    }
+  }
 
-  # Apply exactly the tags the caller provides.
-  tags = var.tags
+  dynamic "boot_diagnostics" {
+    for_each = var.enable_boot_diagnostics ? [1] : []
+
+    content {
+      storage_account_uri = var.boot_diagnostics_storage_account_uri
+    }
+  }
+
+  allow_extension_operations = true
+  encryption_at_host_enabled = var.encryption_at_host_enabled
+  license_type               = var.vm.license_type
+
+  tags = local.tags
+}
+
+# Preserve existing-data-disk support for specialized Linux VMs.
+resource "azurerm_virtual_machine_data_disk_attachment" "existing_data_specialized_linux" {
+  for_each = local.specialized_image && lower(var.vm.os_type) == "linux" ? var.existing_data_disks : {}
+
+  managed_disk_id    = data.azurerm_managed_disk.existing_data[each.key].id
+  virtual_machine_id = azurerm_linux_virtual_machine.specialized_linux_vm[0].id
+  lun                = each.value.lun
+  caching            = each.value.caching
 }
