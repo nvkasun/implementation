@@ -1,47 +1,5 @@
-module "oracle_binary_vm05" {
-  source = "./modules/virtual-machine"
+The module already uses azurerm_virtual_machine without os_profile for the existing specialized-disk attach mode. The specialized Gallery image path appears to need a similar legacy-resource path, but with storage_image_reference.id = source_image_id and create_option = "FromImage" rather than Attach.
 
-  resource_group_name = module.oracle_db_resource_group.rg_name
-  application_name     = "005"
-  environment          = var.environment
+And bro, Microsoft explicitly says a specialized image keeps the existing machine/account information and does not have an osProfile, exactly matching the Azure error you hit.
 
-  subnet_id = module.base-infra.subnet_map[
-    "snet-lb-cl-factory-uaenorth-001"
-  ].id
-
-  key_vault_id = module.azure_key_vault.id
-
-  vm = {
-    os_type = "linux"
-  }
-
-  vm_size           = "Standard_E8s_v5"
-  availability_zone = "3"
-
-  source_image_id = "/subscriptions/1a233215-09f6-404f-8536-bc83100ba1fa/resourceGroups/rg-CloudFactory-dev-uaenorth-oracledb/providers/Microsoft.Compute/galleries/acgCloudFactorydevuaenorthoracledb/images/RHEL-9.8-oracle-db/versions/1.0.0"
-
-  admin_username = "azureuser"
-  admin_password = var.oracle_db_vm_admin_password
-
-  managed_identities = {
-    system_assigned = false
-
-    user_assigned_resource_ids = [
-      azurerm_user_assigned_identity.oracle_binary_vm.id
-    ]
-  }
-
-  os_disk = {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = null
-  }
-
-  accelerated_networking_enabled = true
-  ip_forwarding_enabled           = false
-  enable_boot_diagnostics         = true
-  encryption_at_host_enabled      = false
-  patch_mode_linux                = "ImageDefault"
-
-  tags = local.tags
-}
+https://learn.microsoft.com/en-us/azure/virtual-machines/vm-specialized-image-version?utm_source=chatgpt.com&tabs=cli%2Ccli2%2Ccli3%2Ccli4%2Ccli5
