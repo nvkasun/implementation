@@ -1,80 +1,59 @@
-1. First exit from oraade
+First, check the exact ownership
 
-You're currently here:
+Stay as azureuser and run this exact block:
 
-[oraade@vm-004...]
+sudo stat -c '%A %U:%G %n' \
+/OraHome/ora26ai_DB_Home/network/log \
+/OraHome/ora26ai_DB_Home/network/log/listener.log \
+/OraHome/ora26ai_DB_Home/rdbms/log \
+/OraHome/ora26ai_DB_Home/rdbms/log/startup.log \
+/OraHome/ora26ai_DB_Home/rdbms/log/shutdown.log 2>/dev/null
 
-Run:
+Then:
 
-exit
+sudo ls -la /OraHome/ora26ai_DB_Home/network/log
 
-Make sure you're back to:
+and:
 
-[azureuser@vm-004...]
-2. Confirm the unit really contains oraade
-sudo systemctl cat oracle-database.service | grep -E '^(User|Group)='
+sudo ls -la /OraHome/ora26ai_DB_Home/rdbms/log
 
-Expected:
+I expect we may find something similar to:
 
-User=oraade
-Group=dba
+oracle:dba ... listener.log
+oracle:dba ... startup.log
 
-Now also prove that oraade can write the exact directory that previously failed:
+while the directories themselves are owned by:
 
-sudo -u oraade touch /OraHome/ora26ai_DB_Home/rdbms/log/oraade-write-test
+oraade:dba
+If you see oracle ownership there
 
-Check:
+We can safely correct the ownership of these runtime log directories only:
 
-ls -l /OraHome/ora26ai_DB_Home/rdbms/log/oraade-write-test
+sudo chown -R oraade:dba \
+/OraHome/ora26ai_DB_Home/network/log \
+/OraHome/ora26ai_DB_Home/rdbms/log
 
-It should show oraade dba.
+Then set directory permissions:
 
-Then remove test file:
+sudo chmod 750 \
+/OraHome/ora26ai_DB_Home/network/log \
+/OraHome/ora26ai_DB_Home/rdbms/log
 
-sudo rm -f /OraHome/ora26ai_DB_Home/rdbms/log/oraade-write-test
+And verify:
 
-If that succeeds, the previous startup.log: Permission denied problem should be solved.
+sudo stat -c '%A %U:%G %n' \
+/OraHome/ora26ai_DB_Home/network/log \
+/OraHome/ora26ai_DB_Home/rdbms/log
 
-3. Actually restart the oneshot service
+We want:
 
-First stop it:
+oraade:dba
 
-sudo systemctl stop oracle-database.service
+Do not run a recursive chown against the whole /OraHome or the whole Oracle home. We're only fixing these runtime log locations.
 
-Then check:
+Then test the listener manually as oraade
 
-sudo systemctl status oracle-database.service --no-pager
-
-We should see something such as:
-
-Active: inactive (dead)
-
-Also check whether listener stopped:
-
-sudo ss -lntp | grep 1521 || echo "1521 not listening"
-
-Now reload the unit once more:
-
-sudo systemctl daemon-reload
-sudo systemctl reset-failed oracle-database.service
-
-Then start it fresh:
-
-sudo systemctl start oracle-database.service
-
-Immediately check:
-
-sudo systemctl status oracle-database.service --no-pager
-
-And only look at the new journal entries:
-
-sudo journalctl -u oracle-database.service --since "2 minutes ago" --no-pager
-
-This is much better than -n 80, because the old permission errors won't confuse us.
-
-4. Verify Oracle, not only systemd
-
-Now:
+Before involving systemd again:
 
 sudo -iu oraade
 
@@ -84,45 +63,51 @@ export ORACLE_HOME=/OraHome/ora26ai_DB_Home
 export ORACLE_SID=DFCASHUAT1
 export PATH=$ORACLE_HOME/bin:$PATH
 
-Run:
+Start the listener directly:
 
-sqlplus / as sysdba
-
-Then:
-
-select instance_name, status from v$instance;
-select name, open_mode, database_role from v$database;
-exit;
-
-We need something like:
-
-INSTANCE_NAME   STATUS
-DFCASHUAT1      OPEN
-
-and:
-
-NAME       OPEN_MODE    DATABASE_ROLE
-DFCASHUA   READ WRITE   PRIMARY
+lsnrctl start
 
 Then:
 
 lsnrctl status
-5. Finally verify the health endpoint
 
-Exit back:
+If that works, we should get:
+
+STATUS of the LISTENER
+...
+Listening Endpoints Summary...
+...
+The command completed successfully
+
+Then exit:
 
 exit
+Only after lsnrctl start works
 
-Wait around 15 seconds:
+Run the systemd service again from a completely clean state:
 
-sleep 15
-curl -i http://127.0.0.1:8080/health
+sudo systemctl stop oracle-database.service 2>/dev/null || true
+sudo systemctl reset-failed oracle-database.service
+sudo systemctl daemon-reload
+sudo systemctl start oracle-database.service
 
-Expected:
+Then:
 
-HTTP/1.0 200 OK
+sudo systemctl status oracle-database.service --no-pager
 
-with:
+and importantly:
 
-"healthy": true,
-"status": "HEALTHY"
+sudo journalctl -u oracle-database.service \
+  --since "2 minutes ago" \
+  --no-pager
+
+One more important observation from your screenshot: your oraade-write-test succeeded:
+
+-rw-r--r--. 1 oraade dba ... oraade-write-test
+
+That proves oraade can write to the directory. So the problem is very likely an existing file inside that directory with old ownership/permissions, rather than the mount or filesystem itself.
+
+Send me the output of these two commands first:
+
+sudo ls -la /OraHome/ora26ai_DB_Home/network/log
+sudo ls -la /OraHome/ora26ai_DB_Home/rdbms/log
