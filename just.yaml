@@ -1,169 +1,356 @@
-Step 1 — update only this NetworkManager file
+Follow these steps exactly.
 
-Don't delete Wired connection 1 yet.
+First confirm IMDS from VM4. Run these as azureuser:
+curl --noproxy "*" -sS \
+  -H Metadata:true \
+  "http://169.254.169.254/metadata/instance/compute/name?api-version=2025-04-07&format=text"
 
-First back up the file:
+echo
+
+curl --noproxy "*" -sS \
+  -H Metadata:true \
+  "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/privateIpAddress?api-version=2025-04-07&format=text"
+
+echo
+
+On this VM4, I expect approximately:
+
+vm-004-dev-uan-b245iy
+10.114.32.136
+
+That confirms Azure metadata is returning exactly what we need.
+
+Now back up the current working hostname script:
 
 sudo cp \
-  /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf \
-  /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf.backup-before-mana
+  /usr/local/sbin/oracle-hostname-fix.sh \
+  /usr/local/sbin/oracle-hostname-fix.sh.backup-before-imds
 
-Now check it once:
+Replace it completely with this:
 
-sudo cat /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf
+sudo tee /usr/local/sbin/oracle-hostname-fix.sh >/dev/null <<'EOF'
+#!/bin/bash
 
-Then replace it with:
+set -euo pipefail
 
-sudo tee /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf >/dev/null <<'EOF'
-[keyfile]
-unmanaged-devices=driver:mlx4_core;driver:mlx5_core;driver:mana
+IMDS_BASE="http://169.254.169.254/metadata/instance"
+API_VERSION="2025-04-07"
+MARKER="# ORACLE_VM_HOST_MAPPING"
+
+NAME_URL="${IMDS_BASE}/compute/name?api-version=${API_VERSION}&format=text"
+IP_URL="${IMDS_BASE}/network/interface/0/ipv4/ipAddress/0/privateIpAddress?api-version=${API_VERSION}&format=text"
+
+echo "Starting Oracle Azure hostname configuration..."
+
+if [[ ! -x /usr/bin/curl ]]; then
+    echo "ERROR: /usr/bin/curl is not available."
+    exit 1
+fi
+
+if [[ ! -x /usr/bin/hostnamectl ]]; then
+    echo "ERROR: /usr/bin/hostnamectl is not available."
+    exit 1
+fi
+
+VM_NAME=""
+PRIVATE_IP=""
+
+# Azure networking/IMDS may need a few seconds during early boot.
+# Retry for up to approximately 60 seconds.
+for attempt in $(seq 1 30); do
+
+    VM_NAME=$(
+        /usr/bin/curl \
+            --noproxy "*" \
+            --fail \
+            --silent \
+            --show-error \
+            --connect-timeout 2 \
+            --max-time 5 \
+            -H "Metadata:true" \
+            "${NAME_URL}" 2>/dev/null || true
+    )
+
+    PRIVATE_IP=$(
+        /usr/bin/curl \
+            --noproxy "*" \
+            --fail \
+            --silent \
+            --show-error \
+            --connect-timeout 2 \
+            --max-time 5 \
+            -H "Metadata:true" \
+            "${IP_URL}" 2>/dev/null || true
+    )
+
+    VM_NAME=$(printf '%s' "${VM_NAME}" | tr -d '\r\n')
+    PRIVATE_IP=$(printf '%s' "${PRIVATE_IP}" | tr -d '\r\n')
+
+    if [[ -n "${VM_NAME}" && -n "${PRIVATE_IP}" ]]; then
+        break
+    fi
+
+    echo "IMDS not ready yet - attempt ${attempt}/30"
+    sleep 2
+done
+
+if [[ -z "${VM_NAME}" ]]; then
+    echo "ERROR: Unable to obtain Azure VM name from IMDS."
+    exit 1
+fi
+
+if [[ -z "${PRIVATE_IP}" ]]; then
+    echo "ERROR: Unable to obtain Azure primary private IP from IMDS."
+    exit 1
+fi
+
+if ! [[ "${PRIVATE_IP}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "ERROR: Invalid IPv4 address returned by IMDS: ${PRIVATE_IP}"
+    exit 1
+fi
+
+echo "Azure VM name    : ${VM_NAME}"
+echo "Azure private IP : ${PRIVATE_IP}"
+
+CURRENT_HOSTNAME="$(hostname)"
+
+if [[ "${CURRENT_HOSTNAME}" != "${VM_NAME}" ]]; then
+    echo "Changing hostname:"
+    echo "  Old: ${CURRENT_HOSTNAME}"
+    echo "  New: ${VM_NAME}"
+
+    /usr/bin/hostnamectl set-hostname "${VM_NAME}"
+else
+    echo "Hostname already correct: ${VM_NAME}"
+fi
+
+# Remove only the entry previously managed by this script.
+TMP_HOSTS="$(mktemp)"
+
+awk -v marker="${MARKER}" '
+    index($0, marker) == 0
+' /etc/hosts > "${TMP_HOSTS}"
+
+printf '%s\t%s\t%s\n' \
+    "${PRIVATE_IP}" \
+    "${VM_NAME}" \
+    "${MARKER}" >> "${TMP_HOSTS}"
+
+# Write into the existing /etc/hosts file instead of replacing its inode.
+cat "${TMP_HOSTS}" > /etc/hosts
+rm -f "${TMP_HOSTS}"
+
+echo
+echo "Current managed /etc/hosts entry:"
+grep -F "${MARKER}" /etc/hosts
+
+RESOLVED_IP="$(
+    getent ahostsv4 "${VM_NAME}" 2>/dev/null |
+    awk 'NR == 1 {print $1}'
+)"
+
+if [[ "${RESOLVED_IP}" != "${PRIVATE_IP}" ]]; then
+    echo "ERROR: Hostname ${VM_NAME} resolved to '${RESOLVED_IP}', expected '${PRIVATE_IP}'."
+    exit 1
+fi
+
+echo
+echo "Hostname resolution verified:"
+echo "${VM_NAME} -> ${RESOLVED_IP}"
+
+echo
+echo "Oracle hostname mapping configured successfully."
 EOF
 
-Both commas and semicolons are valid separators in NetworkManager, but I'm using semicolons because it's clearer and matches the documented form.
+Set the permissions:
 
-Verify:
+sudo chown root:root /usr/local/sbin/oracle-hostname-fix.sh
+sudo chmod 755 /usr/local/sbin/oracle-hostname-fix.sh
 
-sudo cat /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf
+Now replace the hostname systemd unit so the order is unambiguous:
 
-Expected:
+sudo cp \
+  /etc/systemd/system/oracle-hostname-fix.service \
+  /etc/systemd/system/oracle-hostname-fix.service.backup-before-imds
 
-[keyfile]
-unmanaged-devices=driver:mlx4_core;driver:mlx5_core;driver:mana
-Step 2 — verify NetworkManager understands the configuration
+Then:
 
-Run:
+sudo tee /etc/systemd/system/oracle-hostname-fix.service >/dev/null <<'EOF'
+[Unit]
+Description=Configure Oracle VM hostname from Azure IMDS
+Wants=network-online.target
+After=network-online.target
+Before=oracle-database.service
 
-sudo NetworkManager --print-config | grep -A3 -B2 unmanaged-devices
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oracle-hostname-fix.sh
+RemainAfterExit=yes
 
-We want to see mana included.
+[Install]
+WantedBy=multi-user.target
+EOF
 
-Also run:
+Reload and verify:
 
-nmcli -f GENERAL.DEVICE,GENERAL.DRIVER,GENERAL.STATE device show eth0
+sudo systemctl daemon-reload
 
-and:
+sudo systemd-analyze verify \
+  /etc/systemd/system/oracle-hostname-fix.service
 
-nmcli -f GENERAL.DEVICE,GENERAL.DRIVER,GENERAL.STATE device show eth1
+No output from systemd-analyze verify = good.
 
-At this stage don't restart NetworkManager manually. You're connected through SSH and we don't gain anything by introducing that risk.
+Your oracle-database.service already has the important dependency we created earlier:
 
-Step 3 — reboot
+After=network-online.target oracle-hostname-fix.service
+Requires=oracle-hostname-fix.service
 
-Since our ultimate requirement is proving the custom-image boot sequence anyway, this is actually the correct test:
+So do not modify oracle-database.service now. That means our final boot dependency becomes:
 
-sudo reboot
+network-online
+      ↓
+oracle-hostname-fix
+      ↓
+oracle-database
+      ↓
+oracle-health
 
-Reconnect through the same current primary IP 10.114.32.136 after it comes back.
+Now test the new hostname script without rebooting yet:
 
-Then immediately run:
+sudo systemctl restart oracle-hostname-fix.service
 
-hostname
-
-ip -br addr
-
-ip route
-
-nmcli device status
-
-nmcli connection show
-
-The important desired result is approximately:
-
-eth0    ethernet   connected
-eth1    ethernet   unmanaged
-
-Most importantly, the L3 address should be associated with the routable synthetic interface eth0; the MANA VF remains paired beneath it. Microsoft describes exactly this model: the hv_netvsc interface is the routable interface and the MANA interface is its accelerated VF/child.
-
-Then check:
-
-nmcli -f GENERAL.DEVICE,GENERAL.DRIVER,GENERAL.STATE device show eth1
-
-We are looking for something similar to:
-
-GENERAL.DEVICE:  eth1
-GENERAL.DRIVER:  mana
-GENERAL.STATE:   10 (unmanaged)
-Step 4 — check that MANA is still attached correctly
-
-Run:
-
-ip -d link show eth0
-ip -d link show eth1
-
-cat /sys/class/net/eth0/address
-cat /sys/class/net/eth1/address
-
-Don't worry if the MAC addresses are still the same. That's expected for this Azure synthetic-interface/VF relationship.
-
-Also:
-
-sudo ethtool -i eth0
-sudo ethtool -i eth1
-
-Expected:
-
-eth0 → hv_netvsc
-eth1 → mana
-
-Microsoft also recommends checking the VF counters through the routable interface.
-
-sudo ethtool -S eth0 | grep -E 'vf_(rx|tx)'
-Step 5 — only after networking looks correct, verify Oracle
-
-Then we make sure our previous work survived this network cleanup/reboot:
-
-df -hT | grep -E 'OraHome|OraData'
+Check:
 
 sudo systemctl status oracle-hostname-fix.service --no-pager
 
-sudo systemctl status oracle-database.service --no-pager
-
-sudo systemctl status oracle-health.service --no-pager
-
-sudo ss -lntp | grep -E '1521|8080'
-
-curl -i http://127.0.0.1:8080/health
-
 We want:
 
-Oracle DB      OPEN
-Database       READ WRITE
-Role           PRIMARY
+Active: active (exited)
+status=0/SUCCESS
 
-1521           LISTEN
-8080           LISTEN
+Then:
 
-/health        HTTP/1.0 200 OK
-status         HEALTHY
+hostname
 
-And finally:
+hostname -I
 
+grep "ORACLE_VM_HOST_MAPPING" /etc/hosts
+
+getent ahostsv4 "$(hostname)"
+
+For VM4 you should still get approximately:
+
+hostname:
+vm-004-dev-uan-b245iy
+
+and:
+
+/etc/hosts:
+
+10.114.32.136    vm-004-dev-uan-b245iy    # ORACLE_VM_HOST_MAPPING
+
+This VM won't visibly change because Azure IMDS correctly returns the same VM4 name. The important part is that after cloning:
+
+Azure VM1 metadata
+name = vm-001-prod-...
+IP   = <VM1 new IP>
+
+                 ↓
+
+/etc/hosts
+<VM1-IP> vm-001-prod-...
+
+while VM2 independently gets:
+
+Azure VM2 metadata
+name = vm-002-prod-...
+IP   = <VM2 new IP>
+
+                 ↓
+
+/etc/hosts
+<VM2-IP> vm-002-prod-...
+
+There is zero subnet, VNet, IP, resource-group, or hostname hardcoding in this mechanism.
+
+Before rebooting, confirm the database dependency one more time:
+
+sudo systemctl cat oracle-database.service | \
+grep -E '^(After|Requires)='
+
+We should see something equivalent to:
+
+After=network-online.target oracle-hostname-fix.service
+Requires=oracle-hostname-fix.service
+
+Then check all three remain enabled:
+
+sudo systemctl is-enabled oracle-hostname-fix.service
+sudo systemctl is-enabled oracle-database.service
+sudo systemctl is-enabled oracle-health.service
+
+Expected:
+
+enabled
+enabled
+enabled
+Then yes — final reboot
+
+Run:
+
+sudo reboot
+
+After reconnecting, don't manually start anything. Give it maybe 1–2 minutes and run this exact validation:
+
+echo "=== HOST ==="
+hostname
+hostname -I
+grep "ORACLE_VM_HOST_MAPPING" /etc/hosts
+
+echo
+echo "=== MOUNTS ==="
+df -hT | grep -E 'OraHome|OraData'
+
+echo
+echo "=== SERVICES ==="
+sudo systemctl status oracle-hostname-fix.service --no-pager
+sudo systemctl status oracle-database.service --no-pager
+sudo systemctl status oracle-health.service --no-pager
+
+echo
+echo "=== PORTS ==="
+sudo ss -lntp | grep -E '1521|8080'
+
+echo
+echo "=== HEALTH ==="
+curl -i http://127.0.0.1:8080/health
+
+echo
+echo "=== FIREWALL ==="
 sudo firewall-cmd --list-all
 
-still needs:
+The final target is:
+
+oracle-hostname-fix     active (exited)   ✅
+oracle-database         active (exited)   ✅
+oracle-health           active (running)  ✅
+
+1521                     LISTEN            ✅
+8080                     LISTEN            ✅
+
+/health                  HTTP 200           ✅
+healthy                  true               ✅
+database_role            PRIMARY            ✅
+pdb_open_mode            READ WRITE         ✅
+listener_reachable       true               ✅
+service_registered       true               ✅
+service_ready            true               ✅
+sql_query                true               ✅
+
+And firewall:
 
 ports:
   1521/tcp
 
 rich rules:
   rule family="ipv4" source address="168.63.129.16/32" port port="8080" protocol="tcp" accept
-One important thing, bro
-
-Do not delete Wired connection 1 before the reboot.
-
-First make MANA unmanaged through NetworkManager, reboot, and prove networking works. If after reboot eth1 is correctly unmanaged but the old Wired connection 1 profile is still sitting there, then we'll safely remove that stale profile before creating the image.
-
-So right now do only:
-
-sudo cp \
-  /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf \
-  /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf.backup-before-mana
-
-sudo tee /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf >/dev/null <<'EOF'
-[keyfile]
-unmanaged-devices=driver:mlx4_core;driver:mlx5_core;driver:mana
-EOF
-
-sudo cat /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf
-
-sudo NetworkManager --print-config | grep -A3 -B2 unmanaged-devices
