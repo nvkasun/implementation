@@ -172,3 +172,44 @@ Then wait maybe 10–20 seconds for the LB health probes and test:
 
 timeout 5 bash -c '</dev/tcp/10.114.32.134/1521' \
 && echo "LB SUCCESS" || echo "LB FAILED"
+
+
+
+*********************************************************************
+
+Next step: bring VM2 healthy
+
+Now repeat the exact same startup procedure on VM2:
+
+sudo su - oracle
+
+export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
+export ORACLE_SID=ORCL
+export PATH=$ORACLE_HOME/bin:$PATH
+
+lsnrctl start
+
+sqlplus / as sysdba
+
+Then:
+
+startup;
+
+alter pluggable database PDB1 open;
+alter pluggable database PDB1 save state;
+
+alter system register;
+
+exit
+
+Then verify:
+
+lsnrctl status
+
+Exit back to azureuser:
+
+exit
+
+and:
+
+curl http://127.0.0.1:8080/health
