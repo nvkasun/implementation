@@ -1,25 +1,19 @@
-Finally, I would verify Oracle directly once after reboot:
+sudo ethtool -i eth0
+sudo ethtool -i eth1
 
-sudo -iu oraade
-export ORACLE_HOME=/OraHome/ora26ai_DB_Home
-export ORACLE_SID=DFCASHUAT1
-export PATH=$ORACLE_HOME/bin:$PATH
-sqlplus / as sysdba
+echo "ETH0 MAC:"
+cat /sys/class/net/eth0/address
 
-Then:
+echo "ETH1 MAC:"
+cat /sys/class/net/eth1/address
 
-select instance_name, status from v$instance;
-select name, open_mode, database_role from v$database;
-exit;
+echo "=== LINK DETAILS ==="
+ip -d link show eth0
+ip -d link show eth1
 
-Expected:
+echo "=== NM CONNECTIONS ==="
+nmcli -f NAME,UUID,TYPE,DEVICE connection show
 
-DFCASHUAT1   OPEN
-DFCASHUA     READ WRITE   PRIMARY
-
-
-
-ip -br addr
-ip route
-nmcli device status
-nmcli connection show
+echo "=== AZURE/HYPER-V DEVICES ==="
+ls -l /sys/class/net/eth0/device/driver 2>/dev/null
+ls -l /sys/class/net/eth1/device/driver 2>/dev/null
