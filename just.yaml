@@ -1,6 +1,31 @@
-sudo pvs
+seful result. Don't mount anything yet. Run these one at a time, pressing Enter after each command:
+
 sudo vgs
+
+Then:
+
 sudo lvs -o lv_name,vg_name,lv_size,lv_path,devices
-cat /etc/oratab 2>/dev/null
-cat /etc/oraInst.loc 2>/dev/null
+
+Then:
+
+sudo blkid /dev/mapper/oradatavg-OraHomelv
+
+Then:
+
+sudo blkid /dev/mapper/oradatavg-OraDatalv
+
+Then:
+
+cat /etc/oratab
+
+Then:
+
+cat /etc/oraInst.loc
+
+Then:
+
 sudo -iu oracle bash -lc 'cat ~/.bash_profile'
+
+Also run this, because it may immediately reveal the DBA's intended Oracle paths:
+
+sudo find / -maxdepth 3 -type d \( -name "u01" -o -name "oradata" -o -name "oracle" \) 2>/dev/null
