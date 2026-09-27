@@ -1,80 +1,55 @@
-Run the single installer:
-chmod +x install_oracle_health_vm4.sh
-sudo ./install_oracle_health_vm4.sh
+Now comes the most important test: reboot
 
+Before rebooting, just confirm all three services are enabled:
 
-Run:
-
-sudo systemctl status oracle-health.service --no-pager
-
-We want:
-
-Active: active (running)
-
-Then:
-
-sudo ss -lntp | grep 8080
+sudo systemctl is-enabled oracle-hostname-fix.service
+sudo systemctl is-enabled oracle-database.service
+sudo systemctl is-enabled oracle-health.service
 
 Expected:
 
-LISTEN ... :8080 ... python3
+enabled
+enabled
+enabled
+
+Then reboot:
+
+sudo reboot
+
+Do nothing manually after the VM comes back. Give it maybe 1–2 minutes, SSH back in, and run this sequence:
+
+hostname
+hostname -I
+
+df -hT | grep -E 'OraHome|OraData'
+
+getent ahostsv4 "$(hostname)"
+
+sudo systemctl status oracle-hostname-fix.service --no-pager
+sudo systemctl status oracle-database.service --no-pager
+sudo systemctl status oracle-health.service --no-pager
+
+sudo ss -lntp | grep -E '1521|8080'
+
+curl -i http://127.0.0.1:8080/health
+
+sudo firewall-cmd --list-all
+
+And finally verify Oracle independently:
+
+sudo su - oracle
+export ORACLE_HOME=/OraHome/ora26ai_DB_Home
+export ORACLE_SID=DFCASHUAT1
+export PATH=$ORACLE_HOME/bin:$PATH
+
+sqlplus / as sysdba
+
+Inside SQL*Plus:
+
+select instance_name, status from v$instance;
+select name, open_mode, database_role from v$database;
+exit;
 
 Then:
 
-curl -i http://127.0.0.1:8080/health
-
-We want:
-
-HTTP/1.0 200 OK
-
-and JSON containing important values such as:
-
-{
-  "healthy": true,
-  "status": "HEALTHY",
-  "oracle_sid": "DFCASHUAT1",
-  "target_pdb": "CDB$ROOT",
-  "target_service": "DFCASHUAT1",
-  "database_role": "PRIMARY",
-  "pdb_open_mode": "READ WRITE",
-  "sql_query": true,
-  "listener_running": true,
-  "listener_reachable": true,
-  "service_registered": true,
-  "service_ready": true
-}
-
-Finally check the firewall:
-
-sudo firewall-cmd --list-all
-
-Our target is:
-
-ports: 1521/tcp
-
-rich rules:
-  rule family="ipv4" source address="168.63.129.16/32" port port="8080" protocol="tcp" accept
-
-So, bro, don't manually run these setup operations afterward:
-
-sudo chown ...
-sudo chmod ...
-sudo vi /etc/systemd/system/oracle-health.service
-sudo systemctl enable oracle-health.service
-sudo firewall-cmd --add-rich-rule ...
-
-They're already handled by the installer.
-
-The only manual commands I recommend after running the script are:
-
-sudo systemctl status oracle-health.service --no-pager
-
-sudo ss -lntp | grep 8080
-
-curl -i http://127.0.0.1:8080/health
-
-sudo firewall-cmd --list-all
-
-If /health is not 200, also run:
-
-sudo journalctl -u oracle-health.service -n 100 --no-pager
+lsnrctl status
