@@ -1,137 +1,100 @@
-Run these first:
+Then do these exact commands.
 
-id oraade
-id oracle
+sudo cp /etc/systemd/system/oracle-database.service \
+/etc/systemd/system/oracle-database.service.backup-before-oraade
 
-ls -ld /OraHome/ora26ai_DB_Home
-ls -ld /OraHome/ora26ai_DB_Home/rdbms
-ls -ld /OraHome/ora26ai_DB_Home/rdbms/log
+Now update only the service user:
 
-I expect something similar to:
+sudo sed -i 's/^User=oracle$/User=oraade/' \
+/etc/systemd/system/oracle-database.service
 
-oraade dba ... /OraHome/ora26ai_DB_Home/rdbms/log
+Verify:
 
-with no group-write permission.
+grep -E '^(User|Group)=' /etc/systemd/system/oracle-database.service
 
-Most likely correct fix
-
-For oracle-database.service only, we should run Oracle's own startup utilities using the actual Oracle software owner, oraade.
-
-Change:
-
-User=oracle
-Group=dba
-
-to:
+Expected:
 
 User=oraade
 Group=dba
 
-Do not change the health agent. oracle-health.service can remain:
-
-User=oracle
-Group=dba
-
-because we've already proven the health agent works perfectly as that account.
-
-So your corrected DB unit should be:
-
-[Unit]
-Description=Oracle Database and Listener
-RequiresMountsFor=/OraHome /OraData
-After=network-online.target oracle-hostname-fix.service
-Wants=network-online.target
-Requires=oracle-hostname-fix.service
-
-[Service]
-Type=oneshot
-User=oraade
-Group=dba
-RemainAfterExit=yes
-
-Environment="ORACLE_HOME=/OraHome/ora26ai_DB_Home"
-Environment="ORACLE_SID=DFCASHUAT1"
-Environment="PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
-Environment="LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib"
-
-ExecStart=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 || /OraHome/ora26ai_DB_Home/bin/lsnrctl start'
-ExecStart=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
-
-ExecStop=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home
-ExecStop=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 && /OraHome/ora26ai_DB_Home/bin/lsnrctl stop || true'
-
-TimeoutStartSec=300
-TimeoutStopSec=300
-
-[Install]
-WantedBy=multi-user.target
-Test before another reboot
-
-Edit:
-
-sudo vi /etc/systemd/system/oracle-database.service
-
-Only change:
-
-User=oracle
-
-to:
-
-User=oraade
-
-Then:
+Then reload systemd:
 
 sudo systemctl daemon-reload
+
+Validate the unit:
+
 sudo systemd-analyze verify /etc/systemd/system/oracle-database.service
+
+No output = good.
+
+Clear the previous failed state:
+
 sudo systemctl reset-failed oracle-database.service
-sudo systemctl stop oracle-database.service 2>/dev/null || true
+
+Because the listener from the previous attempt may still be running, that's okay. Now start the service:
+
 sudo systemctl start oracle-database.service
 
-Now check:
+Then:
 
 sudo systemctl status oracle-database.service --no-pager
 
-But this time don't trust only active (exited). We learned something important: dbstart can return exit code 0 even when its internal startup failed.
+We want:
 
-Check the real DB:
+Active: active (exited)
+
+But this time also check the logs carefully:
+
+sudo journalctl -u oracle-database.service -n 80 --no-pager
+
+We must not see:
+
+startup.log: Permission denied
+ORA-01034
+
+Then verify Oracle itself using the actual software owner:
 
 sudo -iu oraade
 
-Then:
+Set environment:
 
 export ORACLE_HOME=/OraHome/ora26ai_DB_Home
 export ORACLE_SID=DFCASHUAT1
 export PATH=$ORACLE_HOME/bin:$PATH
 
+Then:
+
 sqlplus / as sysdba
 
-Inside:
+Inside SQL*Plus:
 
 select instance_name, status from v$instance;
 select name, open_mode, database_role from v$database;
 exit;
 
-We want:
+Target result:
 
 DFCASHUAT1    OPEN
-
 DFCASHUA      READ WRITE    PRIMARY
 
-Then:
+Then check listener:
 
 lsnrctl status
 
-After that return to azureuser:
+Finally exit back:
 
 exit
+
+Wait for the health agent to detect recovery:
+
 sleep 15
 curl -i http://127.0.0.1:8080/health
 
-We want the health agent to automatically change back to:
+We want:
 
 HTTP/1.0 200 OK
 
-with:
+and:
 
-"healthy": true
+"healthy": true,
 "status": "HEALTHY"
