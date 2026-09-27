@@ -1,33 +1,8 @@
-1. Change /etc/oratab from N to Y
-
-You currently have:
-
-DFCASHUAT1:/OraHome/ora26ai_DB_Home:N
-
-As azureuser, first back it up:
-
-sudo cp /etc/oratab /etc/oratab.backup-before-autostart
-
-Then:
-
-sudo sed -i \
-'s#^DFCASHUAT1:/OraHome/ora26ai_DB_Home:N#DFCASHUAT1:/OraHome/ora26ai_DB_Home:Y#' \
-/etc/oratab
-
-Verify:
-
-grep DFCASHUAT1 /etc/oratab
-
-Expected:
-
-DFCASHUAT1:/OraHome/ora26ai_DB_Home:Y
-2. Create the Oracle startup service
-
-Create:
+Update:
 
 sudo vi /etc/systemd/system/oracle-database.service
 
-Use this:
+and use this version:
 
 [Unit]
 Description=Oracle Database and Listener
@@ -46,8 +21,11 @@ Environment="ORACLE_HOME=/OraHome/ora26ai_DB_Home"
 Environment="ORACLE_SID=DFCASHUAT1"
 Environment="PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
 
-ExecStart=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl start >/tmp/oracle-listener-start.log 2>&1 || true; /OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home'
-ExecStop=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home; /OraHome/ora26ai_DB_Home/bin/lsnrctl stop || true'
+ExecStart=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 || /OraHome/ora26ai_DB_Home/bin/lsnrctl start'
+ExecStart=/OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
+
+ExecStop=/OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home
+ExecStop=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 && /OraHome/ora26ai_DB_Home/bin/lsnrctl stop || true'
 
 TimeoutStartSec=300
 TimeoutStopSec=300
@@ -58,24 +36,25 @@ WantedBy=multi-user.target
 Then:
 
 sudo systemctl daemon-reload
-sudo systemctl enable oracle-database.service
-
-Check:
-
-sudo systemctl is-enabled oracle-hostname-fix.service
-sudo systemctl is-enabled oracle-database.service
-
-Both should say:
-
-enabled
-3. Don't restart it right now
-
-Your DB and listener are already running manually, so don't run:
-
-sudo systemctl start oracle-database
-
-on top of the current Oracle processes.
-
-Instead, first validate the unit:
-
 sudo systemd-analyze verify /etc/systemd/system/oracle-database.service
+
+Again, no output is good.
+
+Next: prepare the health agent
+
+Before I give you the VM4 health-agent code, let's check what Python this RHEL 9.8 build has. VM1/VM2 used an older Python-based agent, but I don't want to assume the same runtime exists here.
+
+Run these as azureuser:
+
+python3 --version
+which python3
+
+and:
+
+python --version 2>&1
+which python 2>/dev/null
+
+Also verify that the Oracle service is reachable locally now:
+
+timeout 5 bash -c '</dev/tcp/127.0.0.1/1521' \
+&& echo "LOCAL 1521 SUCCESS" || echo "LOCAL 1521 FAILED"
