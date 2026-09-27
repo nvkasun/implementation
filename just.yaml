@@ -49,3 +49,75 @@ From 10.114.32.135:
 
 timeout 5 bash -c '</dev/tcp/10.114.32.132/1521' \
 && echo "VM1 SUCCESS" || echo "VM1 FAILED"
+
+
+=========================================================
+
+Then:
+
+export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
+export ORACLE_SID=ORCL
+export PATH=$ORACLE_HOME/bin:$PATH
+
+Open SQL*Plus:
+
+sqlplus / as sysdba
+
+Inside SQL*Plus run:
+
+select instance_name, status from v$instance;
+
+Then:
+
+select name, open_mode from v$database;
+
+And:
+
+show pdbs;
+
+We want the instance/database to be open, and your PDB used by the test script to be open.
+
+Your script is trying:
+
+Oracle service : pdb1
+
+so check:
+
+select name, open_mode from v$pdbs;
+
+If PDB1 exists but is mounted instead of open:
+
+alter pluggable database PDB1 open;
+
+Then save its state:
+
+alter pluggable database PDB1 save state;
+
+Finally:
+
+alter system register;
+
+Exit:
+
+exit
+
+Then:
+
+lsnrctl status
+
+or even better:
+
+lsnrctl services
+
+At this point we should no longer see:
+
+The listener supports no services
+
+We should see a service such as:
+
+Service "pdb1" has 1 instance(s)
+3. Check /health again
+
+After Oracle is running and registered:
+
+curl http://127.0.0.1:8080/health
