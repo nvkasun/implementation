@@ -1,40 +1,93 @@
-Run:
-
-sudo ls -l /OraHome/ora26ai_DB_Home/dbs/
-
-Then:
-
-sudo strings /OraHome/ora26ai_DB_Home/dbs/spfileDFCASHUAT1.ora \
-  | grep -Ei 'control_files|OraData|DFCASHUAT1|recovery'
-
-Also:
-
-sudo grep -R "/OraData" /OraHome/ora26ai_DB_Home \
-  --include="*.ora" 2>/dev/null
-
-If we see something like:
-
-control_files=/OraData/DFCASHUAT1/control01.ctl,...
-
-then we have definitive confirmation.
-
-If it confirms /OraData
-
-Then do:
-
+Move the data LV from the temporary mount to the correct path:
 sudo umount /mnt/oradata-check
+
 sudo mkdir -p /OraData
+
 sudo mount /dev/oradatavg/OraDatalv /OraData
 
-Verify:
+Verify both Oracle volumes:
 
 df -hT | grep -E 'OraHome|OraData'
 
-We want:
+ls -ld /OraHome
+ls -ld /OraData
+ls -ld /OraData/DFCASHUAT1
 
-/dev/mapper/oradatavg-OraHomelv   70G   ...  /OraHome
-/dev/mapper/oradatavg-OraDatalv  300G   ...  /OraData
+We want approximately:
 
-and:
+/dev/mapper/oradatavg-OraHomelv   70G   ... /OraHome
+/dev/mapper/oradatavg-OraDatalv  300G   ... /OraData
+Make both mounts persistent across reboot.
 
-ls -lah /OraData/DFCASHUAT1
+First back up fstab:
+
+sudo cp /etc/fstab /etc/fstab.backup-before-oracle
+
+Then add:
+
+sudo tee -a /etc/fstab >/dev/null <<'EOF'
+UUID=94a37b0c-0ce6-4f74-b094-db70e44a6c6b /OraHome xfs defaults,nofail,x-systemd.device-timeout=60 0 0
+UUID=db0b3070-aa99-4379-afd5-d560326f7481 /OraData xfs defaults,nofail,x-systemd.device-timeout=60 0 0
+EOF
+
+Then validate the file before rebooting:
+
+sudo systemctl daemon-reload
+sudo findmnt --verify --verbose
+
+Also check:
+
+cat /etc/fstab
+
+Do not reboot yet if findmnt --verify reports an error.
+
+Now test Oracle using VM4's actual Oracle configuration:
+sudo su - oracle
+
+Then:
+
+export ORACLE_HOME=/OraHome/ora26ai_DB_Home
+export ORACLE_SID=DFCASHUAT1
+export PATH=$ORACLE_HOME/bin:$PATH
+
+Confirm:
+
+which sqlplus
+which lsnrctl
+
+Then check the database:
+
+sqlplus / as sysdba
+
+Inside:
+
+select instance_name, status from v$instance;
+select name, open_mode from v$database;
+show pdbs;
+
+If you get:
+
+Connected to an idle instance
+
+then run:
+
+startup;
+
+After it opens:
+
+select instance_name, status from v$instance;
+select name, open_mode from v$database;
+show pdbs;
+
+Don't assume the PDB on VM4 is named PDB1; this DBA build may use a different PDB name.
+
+Then check/start the listener:
+lsnrctl status
+
+If it's stopped:
+
+lsnrctl start
+
+Then:
+
+lsnrctl services
