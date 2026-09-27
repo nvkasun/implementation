@@ -1,60 +1,93 @@
-Update:
+Set ownership and permissions:
 
-sudo vi /etc/systemd/system/oracle-database.service
+sudo chown -R oracle:dba /opt/oracle-health
+sudo chmod 750 /opt/oracle-health/oracle_health.py
 
-and use this version:
+Before systemd, check the Python syntax:
+
+sudo -u oracle /usr/bin/python3 -m py_compile \
+/opt/oracle-health/oracle_health.py
+
+No output = good.
+
+Create the systemd service:
+sudo vi /etc/systemd/system/oracle-health.service
+
+Paste:
 
 [Unit]
-Description=Oracle Database and Listener
+Description=Oracle Database Health Agent
+After=network-online.target oracle-database.service
 RequiresMountsFor=/OraHome /OraData
-After=network-online.target oracle-hostname-fix.service
 Wants=network-online.target
-Requires=oracle-hostname-fix.service
 
 [Service]
-Type=oneshot
+Type=simple
 User=oracle
 Group=dba
-RemainAfterExit=yes
 
 Environment="ORACLE_HOME=/OraHome/ora26ai_DB_Home"
 Environment="ORACLE_SID=DFCASHUAT1"
 Environment="PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
+Environment="LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib"
 
-ExecStart=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 || /OraHome/ora26ai_DB_Home/bin/lsnrctl start'
-ExecStart=/OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
+ExecStart=/usr/bin/python3 /opt/oracle-health/oracle_health.py
 
-ExecStop=/OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home
-ExecStop=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 && /OraHome/ora26ai_DB_Home/bin/lsnrctl stop || true'
-
-TimeoutStartSec=300
-TimeoutStopSec=300
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 
+Notice I'm deliberately using:
+
+After=oracle-database.service
+
+but not:
+
+Requires=oracle-database.service
+
+right now. Both services will be enabled at boot, and systemd will order them correctly. This also means starting the health agent now won't unnecessarily try to start Oracle again on top of the manually running DB.
+
 Then:
 
 sudo systemctl daemon-reload
-sudo systemd-analyze verify /etc/systemd/system/oracle-database.service
+
+sudo systemd-analyze verify \
+/etc/systemd/system/oracle-health.service
 
 Again, no output is good.
 
-Next: prepare the health agent
+Enable and start it:
 
-Before I give you the VM4 health-agent code, let's check what Python this RHEL 9.8 build has. VM1/VM2 used an older Python-based agent, but I don't want to assume the same runtime exists here.
+sudo systemctl enable oracle-health.service
+sudo systemctl start oracle-health.service
 
-Run these as azureuser:
+Check:
 
-python3 --version
-which python3
+sudo systemctl status oracle-health.service --no-pager
 
-and:
+We want:
 
-python --version 2>&1
-which python 2>/dev/null
+Active: active (running)
+Now check port 8080:
+sudo ss -lntp | grep 8080
 
-Also verify that the Oracle service is reachable locally now:
+Expected approximately:
 
-timeout 5 bash -c '</dev/tcp/127.0.0.1/1521' \
-&& echo "LOCAL 1521 SUCCESS" || echo "LOCAL 1521 FAILED"
+LISTEN ... *:8080 ... python3
+
+Then the important test:
+
+curl -v http://127.0.0.1:8080/health
+
+Only after local /health gives HTTP 200, add the Azure LB probe firewall rule:
+sudo firewall-cmd --permanent \
+  --add-rich-rule='rule family="ipv4" source address="168.63.129.16/32" port port="8080" protocol="tcp" accept'
+
+Then:
+
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-all
+
+Our desired final firewall state on VM4 is:
