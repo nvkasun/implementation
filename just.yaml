@@ -1,44 +1,7 @@
-if you're still logged in as oracle, then:
-
-sudo firewall-cmd --permanent --zone=public --add-port=1521/tcp
-sudo firewall-cmd --reload
-sudo firewall-cmd --list-all
-
-We want to see:
-
-ports: 1521/tcp
-
-Then check whether the listener process is already there:
-
-sudo ss -lntp | grep 1521
-
-If you see tnslsnr, don't start another listener.
-
-Now switch back:
-
-sudo su - oracle
-export ORACLE_HOME=/OraHome/ora26ai_DB_Home
-export ORACLE_SID=DFCASHUAT1
-export PATH=$ORACLE_HOME/bin:$PATH
-
-and run:
-
-lsnrctl status
-lsnrctl services
-
-I expect that to work once 1521/tcp is allowed.
-
-One other thing I noticed: VM4 currently shows only:
-
-PDB$SEED
-
-under show pdbs;. That's different from VM1/VM2, which had PDB1. That's not necessarily wrong — VM4 is a different DBA-built Oracle 26ai image — but before we build the health agent we need to identify the actual service/database model on VM4 rather than hard-coding PDB1.
-
-After the listener works, run:
-
-lsnrctl services
-
-and inside SQL*Plus:
-
-show parameter service_names;
-select name from v$services order by name;
+hostname -f
+hostname -I
+ip -br addr
+getent hosts "$(hostname)"
+getent hosts "$(hostname -f)"
+cat /etc/hosts
+sudo cat /OraHome/ora26ai_DB_Home/network/admin/listener.ora
