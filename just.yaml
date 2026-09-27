@@ -1,215 +1,104 @@
-On VM1, run exactly these commands as oracle
-export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
-export ORACLE_SID=ORCL
-export PATH=$ORACLE_HOME/bin:$PATH
+First — check VM4 before restarting
 
-Confirm:
+On VM4 as your normal azureuser, run:
 
-echo $ORACLE_HOME
-echo $ORACLE_SID
-which lsnrctl
-
-You should get approximately:
-
-/u01/app/oracle/product/21.0.0/dbhome_1
-ORCL
-/u01/app/oracle/product/21.0.0/dbhome_1/bin/lsnrctl
-
-Now start the listener:
-
-lsnrctl start
-
-Do not put sudo in front.
-
-Then:
-
-lsnrctl status
-
-We want to see something similar to:
-
-STATUS of the LISTENER
-...
-Listening Endpoints Summary...
-(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=...)(PORT=1521)))
-
-Then exit back to azureuser:
-
-exit
-
-and verify:
+hostname
 
 sudo ss -lntp | grep 1521
+sudo ss -lntp | grep 8080
 
-We should now see:
+sudo systemctl status oracle-health --no-pager
+sudo systemctl is-enabled oracle-health
 
-LISTEN ... :1521 ...
-Then test VM1 from VM3
+sudo firewall-cmd --list-all
 
-From 10.114.32.135:
+Then check the listener as Oracle:
 
-timeout 5 bash -c '</dev/tcp/10.114.32.132/1521' \
-&& echo "VM1 SUCCESS" || echo "VM1 FAILED"
-
-
-=========================================================
-
-First, start Oracle DB manually on VM1
-
-You're already logged in as oracle and already have:
-
+sudo su - oracle
 export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
 export ORACLE_SID=ORCL
 export PATH=$ORACLE_HOME/bin:$PATH
-
-You're currently inside SQL*Plus, so run:
-
-startup;
-
-Wait for:
-
-ORACLE instance started.
-Database mounted.
-Database opened.
-
-Then verify:
-
-select instance_name, status from v$instance;
-
-Expected roughly:
-
-ORCL    OPEN
-
-Then:
-
-select name, open_mode from v$database;
-
-Expected:
-
-ORCL    READ WRITE
-
-Then:
-
-show pdbs;
-
-Since your test client connects to:
-
-pdb1
-
-we want PDB1 to show:
-
-READ WRITE
-
-If PDB1 isn't open, run:
-
-alter pluggable database PDB1 open;
-
-Then make it survive future DB restarts:
-
-alter pluggable database PDB1 save state;
-
-Then force listener registration:
-
-alter system register;
-
-Exit:
-
-exit
-
-Now as the oracle user run:
 
 lsnrctl status
 
-This time you should not see:
-
-The listener supports no services
-
-You should see ORCL/PDB1 registered.
-
 Then:
-
-exit
-
-to return to azureuser.
-
-Check the health agent again
-
-Run:
-
-curl -v http://127.0.0.1:8080/health
-
-This is the important test.
-
-Previously:
-
-HTTP 503
-healthy: false
-
-After Oracle is up, we want:
-
-HTTP 200
-healthy: true
-
-with fields approximately showing:
-
-{
-  "listener_running": true,
-  "listener_reachable": true,
-  "oracle_service": "ORCL",
-  "open_mode": "READ WRITE",
-  "healthy": true
-}
-
-Once /health becomes 200, Azure's 168.63.129.16 probe should start considering VM1 healthy.
-
-Then test from VM3 again
-
-First direct:
-
-timeout 5 bash -c '</dev/tcp/10.114.32.132/1521' \
-&& echo "VM1 SUCCESS" || echo "VM1 FAILED"
-
-Then wait maybe 10–20 seconds for the LB health probes and test:
-
-timeout 5 bash -c '</dev/tcp/10.114.32.134/1521' \
-&& echo "LB SUCCESS" || echo "LB FAILED"
-
-
-
-*********************************************************************
-
-Next step: bring VM2 healthy
-
-Now repeat the exact same startup procedure on VM2:
-
-sudo su - oracle
-
-export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
-export ORACLE_SID=ORCL
-export PATH=$ORACLE_HOME/bin:$PATH
-
-lsnrctl start
 
 sqlplus / as sysdba
 
-Then:
+Inside SQL*Plus:
 
-startup;
+select instance_name, status from v$instance;
 
-alter pluggable database PDB1 open;
-alter pluggable database PDB1 save state;
+select name, open_mode from v$database;
 
-alter system register;
+show pdbs;
 
 exit
 
-Then verify:
+Then return to azureuser:
+
+exit
+
+Finally check the health endpoint:
+
+curl -v http://127.0.0.1:8080/health
+
+Ideally before reboot we see:
+
+ORCL      OPEN
+database  READ WRITE
+PDB1      READ WRITE
+listener  1521
+health    HTTP 200
+Then reboot VM4
+
+From azureuser:
+
+sudo reboot
+
+Reconnect after the VM comes back.
+
+Do not run lsnrctl start, startup, or restart the health service yet.
+
+Immediately run:
+
+uptime
+
+sudo ss -lntp | grep 1521
+sudo ss -lntp | grep 8080
+
+sudo systemctl status oracle-health --no-pager
+
+Then:
+
+curl -v http://127.0.0.1:8080/health
+
+If that already returns:
+
+HTTP/1.x 200
+
+with something like:
+
+"healthy": true
+
+that's a very strong sign that Oracle and the listener came back correctly.
+
+Then confirm Oracle itself:
+
+sudo su - oracle
+export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
+export ORACLE_SID=ORCL
+export PATH=$ORACLE_HOME/bin:$PATH
 
 lsnrctl status
 
-Exit back to azureuser:
+Then:
 
+sqlplus / as sysdba
+
+Run:
+
+select instance_name, status from v$instance;
+select name, open_mode from v$database;
+show pdbs;
 exit
-
-and:
-
-curl http://127.0.0.1:8080/health
