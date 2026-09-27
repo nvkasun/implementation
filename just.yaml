@@ -1,55 +1,169 @@
-Now comes the most important test: reboot
+Step 1 — first confirm the dbstart/dbshut permissions
 
-Before rebooting, just confirm all three services are enabled:
+Stay as azureuser and run:
 
-sudo systemctl is-enabled oracle-hostname-fix.service
-sudo systemctl is-enabled oracle-database.service
-sudo systemctl is-enabled oracle-health.service
+ls -l /OraHome/ora26ai_DB_Home/bin/dbstart
+ls -l /OraHome/ora26ai_DB_Home/bin/dbshut
 
-Expected:
+head -1 /OraHome/ora26ai_DB_Home/bin/dbstart
+head -1 /OraHome/ora26ai_DB_Home/bin/dbshut
 
-enabled
-enabled
-enabled
+I strongly expect the scripts exist but aren't directly executable in the way systemd is trying to invoke them.
 
-Then reboot:
+Rather than changing permissions inside the Oracle installation, I recommend we make systemd explicitly run those scripts through Bash.
 
-sudo reboot
+Step 2 — update only two lines in oracle-database.service
 
-Do nothing manually after the VM comes back. Give it maybe 1–2 minutes, SSH back in, and run this sequence:
+Open:
 
-hostname
-hostname -I
+sudo vi /etc/systemd/system/oracle-database.service
 
-df -hT | grep -E 'OraHome|OraData'
+Your current line:
 
-getent ahostsv4 "$(hostname)"
+ExecStart=/OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
 
-sudo systemctl status oracle-hostname-fix.service --no-pager
+Change it to:
+
+ExecStart=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
+
+And change:
+
+ExecStop=/OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home
+
+to:
+
+ExecStop=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home
+
+Do not change anything else yet.
+
+Your relevant service section should therefore look like this:
+
+[Service]
+Type=oneshot
+User=oracle
+Group=dba
+RemainAfterExit=yes
+
+Environment="ORACLE_HOME=/OraHome/ora26ai_DB_Home"
+Environment="ORACLE_SID=DFCASHUAT1"
+Environment="PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
+
+ExecStart=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 || /OraHome/ora26ai_DB_Home/bin/lsnrctl start'
+ExecStart=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
+
+ExecStop=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home
+ExecStop=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 && /OraHome/ora26ai_DB_Home/bin/lsnrctl stop || true'
+
+TimeoutStartSec=300
+TimeoutStopSec=300
+
+This avoids modifying Oracle Home permissions and simply tells systemd:
+
+run dbstart and dbshut using Bash.
+
+Step 3 — validate and start it now
+
+Since the DB is currently down, this is actually a perfect time to test the fix without another reboot.
+
+Run:
+
+sudo systemctl daemon-reload
+
+Then:
+
+sudo systemd-analyze verify \
+/etc/systemd/system/oracle-database.service
+
+No output = good.
+
+Clear the previous failed state:
+
+sudo systemctl reset-failed oracle-database.service
+
+Now:
+
+sudo systemctl start oracle-database.service
+
+Then immediately:
+
 sudo systemctl status oracle-database.service --no-pager
-sudo systemctl status oracle-health.service --no-pager
 
-sudo ss -lntp | grep -E '1521|8080'
+We're looking for:
 
-curl -i http://127.0.0.1:8080/health
+Active: active (exited)
 
-sudo firewall-cmd --list-all
+For this Type=oneshot + RemainAfterExit=yes service, active (exited) is correct. It doesn't mean Oracle stopped.
 
-And finally verify Oracle independently:
+Step 4 — check the actual database and listener
+
+Run:
+
+sudo ss -lntp | grep 1521
+
+Then:
 
 sudo su - oracle
+
+and:
+
 export ORACLE_HOME=/OraHome/ora26ai_DB_Home
 export ORACLE_SID=DFCASHUAT1
 export PATH=$ORACLE_HOME/bin:$PATH
 
 sqlplus / as sysdba
 
-Inside SQL*Plus:
+Inside:
 
 select instance_name, status from v$instance;
 select name, open_mode, database_role from v$database;
 exit;
 
+We want:
+
+DFCASHUAT1    OPEN
+
+DFCASHUA      READ WRITE    PRIMARY
+
 Then:
 
 lsnrctl status
+
+We want the service to show READY.
+
+Exit back:
+
+exit
+Step 5 — don't restart the health agent
+
+This is a nice part of our design.
+
+Your health agent is already running and continuously checking every 5 seconds. We shouldn't need to restart it.
+
+Wait:
+
+sleep 15
+
+Then:
+
+curl -i http://127.0.0.1:8080/health
+
+It should transition automatically from:
+
+503 UNHEALTHY
+
+to:
+
+HTTP/1.0 200 OK
+
+with approximately:
+
+"healthy": true,
+"status": "HEALTHY",
+"oracle_sid": "DFCASHUAT1",
+"database_role": "PRIMARY",
+"pdb_open_mode": "READ WRITE",
+"listener_running": true,
+"listener_reachable": true,
+"service_registered": true,
+"service_ready": true,
+"sql_query": true
