@@ -167,3 +167,42 @@ with approximately:
 "service_registered": true,
 "service_ready": true,
 "sql_query": true
+
+
+=====================================================
+[Unit]
+Description=Oracle Database and Listener
+RequiresMountsFor=/OraHome /OraData
+After=network-online.target oracle-hostname-fix.service
+Wants=network-online.target
+Requires=oracle-hostname-fix.service
+
+[Service]
+Type=oneshot
+User=oracle
+Group=dba
+RemainAfterExit=yes
+
+Environment="ORACLE_HOME=/OraHome/ora26ai_DB_Home"
+Environment="ORACLE_SID=DFCASHUAT1"
+Environment="PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
+Environment="LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib"
+
+# Start listener only if it is not already running
+ExecStart=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 || /OraHome/ora26ai_DB_Home/bin/lsnrctl start'
+
+# Start Oracle databases marked Y in /etc/oratab
+# Run through bash because dbstart itself is not directly executable
+ExecStart=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
+
+# During shutdown, stop the database first
+ExecStop=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home
+
+# Then stop the listener
+ExecStop=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 && /OraHome/ora26ai_DB_Home/bin/lsnrctl stop || true'
+
+TimeoutStartSec=300
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
