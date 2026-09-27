@@ -1,122 +1,18 @@
-1. Confirm database is OPEN
-
-Run this as azureuser:
+Finally, I would verify Oracle directly once after reboot:
 
 sudo -iu oraade
-
-Then:
-
 export ORACLE_HOME=/OraHome/ora26ai_DB_Home
 export ORACLE_SID=DFCASHUAT1
 export PATH=$ORACLE_HOME/bin:$PATH
-
 sqlplus / as sysdba
 
-Inside SQL*Plus:
+Then:
 
 select instance_name, status from v$instance;
-
 select name, open_mode, database_role from v$database;
-
-show pdbs;
-
 exit;
-
-We want approximately:
-
-INSTANCE_NAME   STATUS
---------------- ------------
-DFCASHUAT1      OPEN
-
-and:
-
-OPEN_MODE
-----------
-READ WRITE
-2. Confirm listener and service registration
-
-Still as oraade:
-
-lsnrctl status
-
-We want to see port 1521 and something similar to:
-
-Service "DFCASHUAT1" has 1 instance(s).
-Instance "DFCASHUAT1", status READY
-
-Then:
-
-exit
-
-Also verify at OS level:
-
-sudo ss -lntp | grep 1521
-3. Confirm our Python health agent recovered automatically
-
-Because the health agent was designed to continuously recheck Oracle, it should change itself from 503/UNHEALTHY to 200/HEALTHY now that Oracle is running.
-
-Run:
-
-sudo systemctl status oracle-health.service --no-pager
-
-Then:
-
-sudo ss -lntp | grep 8080
-
-Wait around 10–15 seconds and run:
-
-curl -i http://127.0.0.1:8080/health
-
-The important result is:
-
-HTTP/1.0 200 OK
-
-with fields roughly like:
-
-"healthy": true,
-"status": "HEALTHY",
-"oracle_sid": "DFCASHUAT1",
-"database_name": "DFCASHUA",
-"database_role": "PRIMARY",
-"listener_running": true,
-"listener_port": 1521,
-"listener_reachable": true,
-"service_registered": true,
-"service_ready": true,
-"sql_query": true
-4. Then we perform the real test: reboot
-
-This is now the most important part because we're preparing VM4 as the golden/custom image source.
-
-First verify all three services are enabled:
-
-sudo systemctl is-enabled oracle-hostname-fix.service
-sudo systemctl is-enabled oracle-database.service
-sudo systemctl is-enabled oracle-health.service
 
 Expected:
 
-enabled
-enabled
-enabled
-
-Then:
-
-sudo reboot
-
-After VM4 comes back, do not manually start Oracle, listener, or health agent. That's critical. We want to prove the image can initialize itself automatically.
-
-SSH back in and run:
-
-hostname
-hostname -I
-
-df -hT | grep -E 'OraHome|OraData'
-
-sudo systemctl status oracle-hostname-fix.service --no-pager
-sudo systemctl status oracle-database.service --no-pager
-sudo systemctl status oracle-health.service --no-pager
-
-sudo ss -lntp | grep -E '1521|8080'
-
-curl -i http://127.0.0.1:8080/health
+DFCASHUAT1   OPEN
+DFCASHUA     READ WRITE   PRIMARY
