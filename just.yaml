@@ -1,31 +1,48 @@
-seful result. Don't mount anything yet. Run these one at a time, pressing Enter after each command:
+Run as azureuser:
 
-sudo vgs
+sudo mkdir -p /OraHome
+sudo mount /dev/oradatavg/OraHomelv /OraHome
+
+Then verify:
+
+df -hT | grep -i OraHome
+ls -la /OraHome
+
+Then specifically:
+
+ls -l /OraHome/ora26ai_DB_Home/bin/sqlplus
+ls -l /OraHome/ora26ai_DB_Home/bin/lsnrctl
+
+I expect those binaries to appear now.
+
+Then test as Oracle:
+
+sudo su - oracle
+
+and:
+
+export ORACLE_HOME=/OraHome/ora26ai_DB_Home
+export ORACLE_SID=DFCASHUAT1
+export PATH=$ORACLE_HOME/bin:$PATH
+
+which sqlplus
+which lsnrctl
+sqlplus -v
+
+Don't start the database yet.
+
+Next, identify where OraDatalv belongs
+
+The 300 GB volume is clearly Oracle data, but I don't want us to guess its permanent mount point as /OraData until we inspect it.
+
+Temporarily mount it somewhere neutral:
+
+exit
+sudo mkdir -p /mnt/oradata-check
+sudo mount /dev/oradatavg/OraDatalv /mnt/oradata-check
 
 Then:
 
-sudo lvs -o lv_name,vg_name,lv_size,lv_path,devices
-
-Then:
-
-sudo blkid /dev/mapper/oradatavg-OraHomelv
-
-Then:
-
-sudo blkid /dev/mapper/oradatavg-OraDatalv
-
-Then:
-
-cat /etc/oratab
-
-Then:
-
-cat /etc/oraInst.loc
-
-Then:
-
-sudo -iu oracle bash -lc 'cat ~/.bash_profile'
-
-Also run this, because it may immediately reveal the DBA's intended Oracle paths:
-
-sudo find / -maxdepth 3 -type d \( -name "u01" -o -name "oradata" -o -name "oracle" \) 2>/dev/null
+df -hT | grep oradatavg
+sudo ls -lah /mnt/oradata-check
+sudo find /mnt/oradata-check -maxdepth 3 -type f | head -50
