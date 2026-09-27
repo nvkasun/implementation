@@ -1,48 +1,40 @@
-Run as azureuser:
+Run:
 
-sudo mkdir -p /OraHome
-sudo mount /dev/oradatavg/OraHomelv /OraHome
-
-Then verify:
-
-df -hT | grep -i OraHome
-ls -la /OraHome
-
-Then specifically:
-
-ls -l /OraHome/ora26ai_DB_Home/bin/sqlplus
-ls -l /OraHome/ora26ai_DB_Home/bin/lsnrctl
-
-I expect those binaries to appear now.
-
-Then test as Oracle:
-
-sudo su - oracle
-
-and:
-
-export ORACLE_HOME=/OraHome/ora26ai_DB_Home
-export ORACLE_SID=DFCASHUAT1
-export PATH=$ORACLE_HOME/bin:$PATH
-
-which sqlplus
-which lsnrctl
-sqlplus -v
-
-Don't start the database yet.
-
-Next, identify where OraDatalv belongs
-
-The 300 GB volume is clearly Oracle data, but I don't want us to guess its permanent mount point as /OraData until we inspect it.
-
-Temporarily mount it somewhere neutral:
-
-exit
-sudo mkdir -p /mnt/oradata-check
-sudo mount /dev/oradatavg/OraDatalv /mnt/oradata-check
+sudo ls -l /OraHome/ora26ai_DB_Home/dbs/
 
 Then:
 
-df -hT | grep oradatavg
-sudo ls -lah /mnt/oradata-check
-sudo find /mnt/oradata-check -maxdepth 3 -type f | head -50
+sudo strings /OraHome/ora26ai_DB_Home/dbs/spfileDFCASHUAT1.ora \
+  | grep -Ei 'control_files|OraData|DFCASHUAT1|recovery'
+
+Also:
+
+sudo grep -R "/OraData" /OraHome/ora26ai_DB_Home \
+  --include="*.ora" 2>/dev/null
+
+If we see something like:
+
+control_files=/OraData/DFCASHUAT1/control01.ctl,...
+
+then we have definitive confirmation.
+
+If it confirms /OraData
+
+Then do:
+
+sudo umount /mnt/oradata-check
+sudo mkdir -p /OraData
+sudo mount /dev/oradatavg/OraDatalv /OraData
+
+Verify:
+
+df -hT | grep -E 'OraHome|OraData'
+
+We want:
+
+/dev/mapper/oradatavg-OraHomelv   70G   ...  /OraHome
+/dev/mapper/oradatavg-OraDatalv  300G   ...  /OraData
+
+and:
+
+ls -lah /OraData/DFCASHUAT1
