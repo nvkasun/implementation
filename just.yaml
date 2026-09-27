@@ -1,78 +1,56 @@
-Create:
+1. Change /etc/oratab from N to Y
 
-sudo vi /usr/local/sbin/oracle-hostname-fix.sh
+You currently have:
 
-Put this inside:
+DFCASHUAT1:/OraHome/ora26ai_DB_Home:N
 
-#!/bin/bash
-set -e
+As azureuser, first back it up:
 
-SHORT_HOST="$(hostname -s)"
-FQDN="$(hostname -f)"
+sudo cp /etc/oratab /etc/oratab.backup-before-autostart
 
-IP="$(ip -4 route get 168.63.129.16 2>/dev/null | awk '
-{
-    for (i = 1; i <= NF; i++) {
-        if ($i == "src") {
-            print $(i+1)
-            exit
-        }
-    }
-}')"
+Then:
 
-if [ -z "$IP" ]; then
-    IP="$(hostname -I | awk '{print $1}')"
-fi
+sudo sed -i \
+'s#^DFCASHUAT1:/OraHome/ora26ai_DB_Home:N#DFCASHUAT1:/OraHome/ora26ai_DB_Home:Y#' \
+/etc/oratab
 
-if [ -z "$IP" ]; then
-    echo "ERROR: Unable to determine VM IPv4 address"
-    exit 1
-fi
+Verify:
 
-# Remove the previous dynamically managed entry.
-sed -i '/# ORACLE_VM_HOST_MAPPING/d' /etc/hosts
+grep DFCASHUAT1 /etc/oratab
 
-echo "${IP} ${SHORT_HOST} ${FQDN} # ORACLE_VM_HOST_MAPPING" >> /etc/hosts
+Expected:
 
-echo "Oracle hostname mapping configured:"
-echo "${IP} ${SHORT_HOST} ${FQDN}"
-
-Save it and:
-
-sudo chmod 755 /usr/local/sbin/oracle-hostname-fix.sh
-
-Run it manually:
-
-sudo /usr/local/sbin/oracle-hostname-fix.sh
-
-Then check:
-
-tail -5 /etc/hosts
-
-and:
-
-getent ahostsv4 "$(hostname)"
-
-We want .136 right now.
-
-Step 2 — create systemd startup service for that mapping
+DFCASHUAT1:/OraHome/ora26ai_DB_Home:Y
+2. Create the Oracle startup service
 
 Create:
 
-sudo vi /etc/systemd/system/oracle-hostname-fix.service
+sudo vi /etc/systemd/system/oracle-database.service
 
-Put:
+Use this:
 
 [Unit]
-Description=Configure Oracle VM hostname mapping
-After=network-online.target
+Description=Oracle Database and Listener
+RequiresMountsFor=/OraHome /OraData
+After=network-online.target oracle-hostname-fix.service
 Wants=network-online.target
-Before=oracle-database.service
+Requires=oracle-hostname-fix.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/oracle-hostname-fix.sh
+User=oracle
+Group=dba
 RemainAfterExit=yes
+
+Environment="ORACLE_HOME=/OraHome/ora26ai_DB_Home"
+Environment="ORACLE_SID=DFCASHUAT1"
+Environment="PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
+
+ExecStart=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl start >/tmp/oracle-listener-start.log 2>&1 || true; /OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home'
+ExecStop=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home; /OraHome/ora26ai_DB_Home/bin/lsnrctl stop || true'
+
+TimeoutStartSec=300
+TimeoutStopSec=300
 
 [Install]
 WantedBy=multi-user.target
@@ -80,39 +58,24 @@ WantedBy=multi-user.target
 Then:
 
 sudo systemctl daemon-reload
-sudo systemctl enable oracle-hostname-fix.service
-
-Don't reboot yet.
-
-One cleanup first
-
-We currently have the temporary line you manually added:
-
-10.114.32.136 vm-004-dev-uan-b245iy ...
-
-and then our new script may add another line with the marker.
-
-Let's remove the old manual copy safely by restoring the backup you created:
-
-sudo cp /etc/hosts.before-oracle-test /etc/hosts
-
-Then rerun our dynamic script:
-
-sudo /usr/local/sbin/oracle-hostname-fix.sh
+sudo systemctl enable oracle-database.service
 
 Check:
 
-cat /etc/hosts
+sudo systemctl is-enabled oracle-hostname-fix.service
+sudo systemctl is-enabled oracle-database.service
 
-There should be one dynamically managed line like:
+Both should say:
 
-10.114.32.136 vm-004-dev-uan-b245iy <fqdn> # ORACLE_VM_HOST_MAPPING
+enabled
+3. Don't restart it right now
 
-Then confirm Oracle still works:
+Your DB and listener are already running manually, so don't run:
 
-sudo su - oracle
-export ORACLE_HOME=/OraHome/ora26ai_DB_Home
-export ORACLE_SID=DFCASHUAT1
-export PATH=$ORACLE_HOME/bin:$PATH
+sudo systemctl start oracle-database
 
-lsnrctl status
+on top of the current Oracle processes.
+
+Instead, first validate the unit:
+
+sudo systemd-analyze verify /etc/systemd/system/oracle-database.service
