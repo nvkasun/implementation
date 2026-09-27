@@ -1,19 +1,17 @@
-sudo ethtool -i eth0
-sudo ethtool -i eth1
+rpm -q azure-vm-utils 2>/dev/null || echo "azure-vm-utils not installed"
 
-echo "ETH0 MAC:"
-cat /sys/class/net/eth0/address
+echo "=== Azure SR-IOV rules ==="
+sudo ls -l \
+  /usr/lib/udev/rules.d/*azure* \
+  /etc/udev/rules.d/*azure* 2>/dev/null
 
-echo "ETH1 MAC:"
-cat /sys/class/net/eth1/address
+echo "=== Look for MANA unmanaged configuration ==="
+sudo grep -RniE 'mana|NM_UNMANAGED|AZURE_UNMANAGED_SRIOV' \
+  /usr/lib/udev/rules.d \
+  /etc/udev/rules.d \
+  /etc/NetworkManager 2>/dev/null
 
-echo "=== LINK DETAILS ==="
-ip -d link show eth0
-ip -d link show eth1
-
-echo "=== NM CONNECTIONS ==="
-nmcli -f NAME,UUID,TYPE,DEVICE connection show
-
-echo "=== AZURE/HYPER-V DEVICES ==="
-ls -l /sys/class/net/eth0/device/driver 2>/dev/null
-ls -l /sys/class/net/eth1/device/driver 2>/dev/null
+echo "=== eth1 udev properties ==="
+sudo udevadm info -q property -p /sys/class/net/eth1 \
+  | grep -E 'NM_UNMANAGED|AZURE_UNMANAGED_SRIOV|ID_NET_MANAGED_BY' \
+  || echo "No Azure unmanaged properties found"
