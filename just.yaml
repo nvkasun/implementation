@@ -1,52 +1,58 @@
-Step 1 — first confirm the dbstart/dbshut permissions
+Run these first:
 
-Stay as azureuser and run:
+id oraade
+id oracle
 
-ls -l /OraHome/ora26ai_DB_Home/bin/dbstart
-ls -l /OraHome/ora26ai_DB_Home/bin/dbshut
+ls -ld /OraHome/ora26ai_DB_Home
+ls -ld /OraHome/ora26ai_DB_Home/rdbms
+ls -ld /OraHome/ora26ai_DB_Home/rdbms/log
 
-head -1 /OraHome/ora26ai_DB_Home/bin/dbstart
-head -1 /OraHome/ora26ai_DB_Home/bin/dbshut
+I expect something similar to:
 
-I strongly expect the scripts exist but aren't directly executable in the way systemd is trying to invoke them.
+oraade dba ... /OraHome/ora26ai_DB_Home/rdbms/log
 
-Rather than changing permissions inside the Oracle installation, I recommend we make systemd explicitly run those scripts through Bash.
+with no group-write permission.
 
-Step 2 — update only two lines in oracle-database.service
+Most likely correct fix
 
-Open:
+For oracle-database.service only, we should run Oracle's own startup utilities using the actual Oracle software owner, oraade.
 
-sudo vi /etc/systemd/system/oracle-database.service
+Change:
 
-Your current line:
-
-ExecStart=/OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
-
-Change it to:
-
-ExecStart=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
-
-And change:
-
-ExecStop=/OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home
+User=oracle
+Group=dba
 
 to:
 
-ExecStop=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home
+User=oraade
+Group=dba
 
-Do not change anything else yet.
+Do not change the health agent. oracle-health.service can remain:
 
-Your relevant service section should therefore look like this:
+User=oracle
+Group=dba
+
+because we've already proven the health agent works perfectly as that account.
+
+So your corrected DB unit should be:
+
+[Unit]
+Description=Oracle Database and Listener
+RequiresMountsFor=/OraHome /OraData
+After=network-online.target oracle-hostname-fix.service
+Wants=network-online.target
+Requires=oracle-hostname-fix.service
 
 [Service]
 Type=oneshot
-User=oracle
+User=oraade
 Group=dba
 RemainAfterExit=yes
 
 Environment="ORACLE_HOME=/OraHome/ora26ai_DB_Home"
 Environment="ORACLE_SID=DFCASHUAT1"
 Environment="PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
+Environment="LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib"
 
 ExecStart=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 || /OraHome/ora26ai_DB_Home/bin/lsnrctl start'
 ExecStart=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
@@ -57,54 +63,41 @@ ExecStop=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>
 TimeoutStartSec=300
 TimeoutStopSec=300
 
-This avoids modifying Oracle Home permissions and simply tells systemd:
+[Install]
+WantedBy=multi-user.target
+Test before another reboot
 
-run dbstart and dbshut using Bash.
+Edit:
 
-Step 3 — validate and start it now
+sudo vi /etc/systemd/system/oracle-database.service
 
-Since the DB is currently down, this is actually a perfect time to test the fix without another reboot.
+Only change:
 
-Run:
+User=oracle
 
-sudo systemctl daemon-reload
+to:
+
+User=oraade
 
 Then:
 
-sudo systemd-analyze verify \
-/etc/systemd/system/oracle-database.service
-
-No output = good.
-
-Clear the previous failed state:
-
+sudo systemctl daemon-reload
+sudo systemd-analyze verify /etc/systemd/system/oracle-database.service
 sudo systemctl reset-failed oracle-database.service
-
-Now:
-
+sudo systemctl stop oracle-database.service 2>/dev/null || true
 sudo systemctl start oracle-database.service
 
-Then immediately:
+Now check:
 
 sudo systemctl status oracle-database.service --no-pager
 
-We're looking for:
+But this time don't trust only active (exited). We learned something important: dbstart can return exit code 0 even when its internal startup failed.
 
-Active: active (exited)
+Check the real DB:
 
-For this Type=oneshot + RemainAfterExit=yes service, active (exited) is correct. It doesn't mean Oracle stopped.
-
-Step 4 — check the actual database and listener
-
-Run:
-
-sudo ss -lntp | grep 1521
+sudo -iu oraade
 
 Then:
-
-sudo su - oracle
-
-and:
 
 export ORACLE_HOME=/OraHome/ora26ai_DB_Home
 export ORACLE_SID=DFCASHUAT1
@@ -128,81 +121,17 @@ Then:
 
 lsnrctl status
 
-We want the service to show READY.
-
-Exit back:
+After that return to azureuser:
 
 exit
-Step 5 — don't restart the health agent
-
-This is a nice part of our design.
-
-Your health agent is already running and continuously checking every 5 seconds. We shouldn't need to restart it.
-
-Wait:
-
 sleep 15
-
-Then:
-
 curl -i http://127.0.0.1:8080/health
 
-It should transition automatically from:
-
-503 UNHEALTHY
-
-to:
+We want the health agent to automatically change back to:
 
 HTTP/1.0 200 OK
 
-with approximately:
+with:
 
-"healthy": true,
-"status": "HEALTHY",
-"oracle_sid": "DFCASHUAT1",
-"database_role": "PRIMARY",
-"pdb_open_mode": "READ WRITE",
-"listener_running": true,
-"listener_reachable": true,
-"service_registered": true,
-"service_ready": true,
-"sql_query": true
-
-
-=====================================================
-[Unit]
-Description=Oracle Database and Listener
-RequiresMountsFor=/OraHome /OraData
-After=network-online.target oracle-hostname-fix.service
-Wants=network-online.target
-Requires=oracle-hostname-fix.service
-
-[Service]
-Type=oneshot
-User=oracle
-Group=dba
-RemainAfterExit=yes
-
-Environment="ORACLE_HOME=/OraHome/ora26ai_DB_Home"
-Environment="ORACLE_SID=DFCASHUAT1"
-Environment="PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
-Environment="LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib"
-
-# Start listener only if it is not already running
-ExecStart=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 || /OraHome/ora26ai_DB_Home/bin/lsnrctl start'
-
-# Start Oracle databases marked Y in /etc/oratab
-# Run through bash because dbstart itself is not directly executable
-ExecStart=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbstart /OraHome/ora26ai_DB_Home
-
-# During shutdown, stop the database first
-ExecStop=/bin/bash /OraHome/ora26ai_DB_Home/bin/dbshut /OraHome/ora26ai_DB_Home
-
-# Then stop the listener
-ExecStop=/bin/bash -c '/OraHome/ora26ai_DB_Home/bin/lsnrctl status >/dev/null 2>&1 && /OraHome/ora26ai_DB_Home/bin/lsnrctl stop || true'
-
-TimeoutStartSec=300
-TimeoutStopSec=300
-
-[Install]
-WantedBy=multi-user.target
+"healthy": true
+"status": "HEALTHY"
