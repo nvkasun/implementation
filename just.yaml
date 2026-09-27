@@ -1,17 +1,169 @@
-rpm -q azure-vm-utils 2>/dev/null || echo "azure-vm-utils not installed"
+Step 1 — update only this NetworkManager file
 
-echo "=== Azure SR-IOV rules ==="
-sudo ls -l \
-  /usr/lib/udev/rules.d/*azure* \
-  /etc/udev/rules.d/*azure* 2>/dev/null
+Don't delete Wired connection 1 yet.
 
-echo "=== Look for MANA unmanaged configuration ==="
-sudo grep -RniE 'mana|NM_UNMANAGED|AZURE_UNMANAGED_SRIOV' \
-  /usr/lib/udev/rules.d \
-  /etc/udev/rules.d \
-  /etc/NetworkManager 2>/dev/null
+First back up the file:
 
-echo "=== eth1 udev properties ==="
-sudo udevadm info -q property -p /sys/class/net/eth1 \
-  | grep -E 'NM_UNMANAGED|AZURE_UNMANAGED_SRIOV|ID_NET_MANAGED_BY' \
-  || echo "No Azure unmanaged properties found"
+sudo cp \
+  /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf \
+  /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf.backup-before-mana
+
+Now check it once:
+
+sudo cat /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf
+
+Then replace it with:
+
+sudo tee /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf >/dev/null <<'EOF'
+[keyfile]
+unmanaged-devices=driver:mlx4_core;driver:mlx5_core;driver:mana
+EOF
+
+Both commas and semicolons are valid separators in NetworkManager, but I'm using semicolons because it's clearer and matches the documented form.
+
+Verify:
+
+sudo cat /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf
+
+Expected:
+
+[keyfile]
+unmanaged-devices=driver:mlx4_core;driver:mlx5_core;driver:mana
+Step 2 — verify NetworkManager understands the configuration
+
+Run:
+
+sudo NetworkManager --print-config | grep -A3 -B2 unmanaged-devices
+
+We want to see mana included.
+
+Also run:
+
+nmcli -f GENERAL.DEVICE,GENERAL.DRIVER,GENERAL.STATE device show eth0
+
+and:
+
+nmcli -f GENERAL.DEVICE,GENERAL.DRIVER,GENERAL.STATE device show eth1
+
+At this stage don't restart NetworkManager manually. You're connected through SSH and we don't gain anything by introducing that risk.
+
+Step 3 — reboot
+
+Since our ultimate requirement is proving the custom-image boot sequence anyway, this is actually the correct test:
+
+sudo reboot
+
+Reconnect through the same current primary IP 10.114.32.136 after it comes back.
+
+Then immediately run:
+
+hostname
+
+ip -br addr
+
+ip route
+
+nmcli device status
+
+nmcli connection show
+
+The important desired result is approximately:
+
+eth0    ethernet   connected
+eth1    ethernet   unmanaged
+
+Most importantly, the L3 address should be associated with the routable synthetic interface eth0; the MANA VF remains paired beneath it. Microsoft describes exactly this model: the hv_netvsc interface is the routable interface and the MANA interface is its accelerated VF/child.
+
+Then check:
+
+nmcli -f GENERAL.DEVICE,GENERAL.DRIVER,GENERAL.STATE device show eth1
+
+We are looking for something similar to:
+
+GENERAL.DEVICE:  eth1
+GENERAL.DRIVER:  mana
+GENERAL.STATE:   10 (unmanaged)
+Step 4 — check that MANA is still attached correctly
+
+Run:
+
+ip -d link show eth0
+ip -d link show eth1
+
+cat /sys/class/net/eth0/address
+cat /sys/class/net/eth1/address
+
+Don't worry if the MAC addresses are still the same. That's expected for this Azure synthetic-interface/VF relationship.
+
+Also:
+
+sudo ethtool -i eth0
+sudo ethtool -i eth1
+
+Expected:
+
+eth0 → hv_netvsc
+eth1 → mana
+
+Microsoft also recommends checking the VF counters through the routable interface.
+
+sudo ethtool -S eth0 | grep -E 'vf_(rx|tx)'
+Step 5 — only after networking looks correct, verify Oracle
+
+Then we make sure our previous work survived this network cleanup/reboot:
+
+df -hT | grep -E 'OraHome|OraData'
+
+sudo systemctl status oracle-hostname-fix.service --no-pager
+
+sudo systemctl status oracle-database.service --no-pager
+
+sudo systemctl status oracle-health.service --no-pager
+
+sudo ss -lntp | grep -E '1521|8080'
+
+curl -i http://127.0.0.1:8080/health
+
+We want:
+
+Oracle DB      OPEN
+Database       READ WRITE
+Role           PRIMARY
+
+1521           LISTEN
+8080           LISTEN
+
+/health        HTTP/1.0 200 OK
+status         HEALTHY
+
+And finally:
+
+sudo firewall-cmd --list-all
+
+still needs:
+
+ports:
+  1521/tcp
+
+rich rules:
+  rule family="ipv4" source address="168.63.129.16/32" port port="8080" protocol="tcp" accept
+One important thing, bro
+
+Do not delete Wired connection 1 before the reboot.
+
+First make MANA unmanaged through NetworkManager, reboot, and prove networking works. If after reboot eth1 is correctly unmanaged but the old Wired connection 1 profile is still sitting there, then we'll safely remove that stale profile before creating the image.
+
+So right now do only:
+
+sudo cp \
+  /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf \
+  /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf.backup-before-mana
+
+sudo tee /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf >/dev/null <<'EOF'
+[keyfile]
+unmanaged-devices=driver:mlx4_core;driver:mlx5_core;driver:mana
+EOF
+
+sudo cat /etc/NetworkManager/conf.d/99-azure-unmanaged-devices.conf
+
+sudo NetworkManager --print-config | grep -A3 -B2 unmanaged-devices
