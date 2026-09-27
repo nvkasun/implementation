@@ -1,28 +1,114 @@
-Temporarily prove the diagnosis on VM4. Add VM4's current hostname → current IP mapping, run lsnrctl status, and then remove it:
+Create:
 
-hostname
+sudo vi /usr/local/sbin/oracle-hostname-fix.sh
 
-Your hostname is:
+Put this inside:
 
-vm-004-dev-uan-b245iy
+#!/bin/bash
+set -e
 
-Back up /etc/hosts:
+SHORT_HOST="$(hostname -s)"
+FQDN="$(hostname -f)"
 
-sudo cp /etc/hosts /etc/hosts.before-oracle-test
+IP="$(ip -4 route get 168.63.129.16 2>/dev/null | awk '
+{
+    for (i = 1; i <= NF; i++) {
+        if ($i == "src") {
+            print $(i+1)
+            exit
+        }
+    }
+}')"
 
-Temporarily add:
+if [ -z "$IP" ]; then
+    IP="$(hostname -I | awk '{print $1}')"
+fi
 
-echo '10.114.32.136 vm-004-dev-uan-b245iy vm-004-dev-uan-b245iy.pc5knl1mzb5ufh5wqckcpgxi3b.dxbx.internal.cloudapp.net' \
-| sudo tee -a /etc/hosts
+if [ -z "$IP" ]; then
+    echo "ERROR: Unable to determine VM IPv4 address"
+    exit 1
+fi
 
-Verify:
+# Remove the previous dynamically managed entry.
+sed -i '/# ORACLE_VM_HOST_MAPPING/d' /etc/hosts
 
-getent hosts "$(hostname)"
-getent hosts "$(hostname -f)"
+echo "${IP} ${SHORT_HOST} ${FQDN} # ORACLE_VM_HOST_MAPPING" >> /etc/hosts
 
-Both should now resolve to .136.
+echo "Oracle hostname mapping configured:"
+echo "${IP} ${SHORT_HOST} ${FQDN}"
+
+Save it and:
+
+sudo chmod 755 /usr/local/sbin/oracle-hostname-fix.sh
+
+Run it manually:
+
+sudo /usr/local/sbin/oracle-hostname-fix.sh
+
+Then check:
+
+tail -5 /etc/hosts
+
+and:
+
+getent ahostsv4 "$(hostname)"
+
+We want .136 right now.
+
+Step 2 — create systemd startup service for that mapping
+
+Create:
+
+sudo vi /etc/systemd/system/oracle-hostname-fix.service
+
+Put:
+
+[Unit]
+Description=Configure Oracle VM hostname mapping
+After=network-online.target
+Wants=network-online.target
+Before=oracle-database.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oracle-hostname-fix.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
 
 Then:
+
+sudo systemctl daemon-reload
+sudo systemctl enable oracle-hostname-fix.service
+
+Don't reboot yet.
+
+One cleanup first
+
+We currently have the temporary line you manually added:
+
+10.114.32.136 vm-004-dev-uan-b245iy ...
+
+and then our new script may add another line with the marker.
+
+Let's remove the old manual copy safely by restoring the backup you created:
+
+sudo cp /etc/hosts.before-oracle-test /etc/hosts
+
+Then rerun our dynamic script:
+
+sudo /usr/local/sbin/oracle-hostname-fix.sh
+
+Check:
+
+cat /etc/hosts
+
+There should be one dynamically managed line like:
+
+10.114.32.136 vm-004-dev-uan-b245iy <fqdn> # ORACLE_VM_HOST_MAPPING
+
+Then confirm Oracle still works:
 
 sudo su - oracle
 export ORACLE_HOME=/OraHome/ora26ai_DB_Home
