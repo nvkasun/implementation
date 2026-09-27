@@ -16,3 +16,10 @@ Expected:
 
 DFCASHUAT1   OPEN
 DFCASHUA     READ WRITE   PRIMARY
+
+
+
+ip -br addr
+ip route
+nmcli device status
+nmcli connection show
