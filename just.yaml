@@ -1,83 +1,38 @@
-We are very close. Run these one by one, not as one big pasted block.
+echo "=== SERVICES ==="
 
-First Oracle service:
+sudo systemctl is-enabled oracle-hostname-fix.service
+sudo systemctl is-enabled oracle-database.service
+sudo systemctl is-enabled oracle-health.service
 
 sudo systemctl status oracle-database.service --no-pager
-
-We want:
-
-Active: active (exited)
-
-Then health agent:
-
 sudo systemctl status oracle-health.service --no-pager
 
-We want:
+echo
+echo "=== MOUNTS ==="
 
-Active: active (running)
+df -hT | grep -E 'OraHome|OraData'
 
-Then confirm both ports:
+echo
+echo "=== PORTS ==="
 
 sudo ss -lntp | grep -E '1521|8080'
 
-We should see something like:
-
-*:1521    ... tnslsnr
-0.0.0.0:8080 ... python3
-
-Then:
+echo
+echo "=== HEALTH ==="
 
 curl -i http://127.0.0.1:8080/health
 
-This is the most important check. We need:
-
-HTTP/1.0 200 OK
-
-and inside JSON:
-
-"healthy": true,
-"status": "HEALTHY",
-"database_role": "PRIMARY",
-"pdb_open_mode": "READ WRITE",
-"listener_running": true,
-"listener_reachable": true,
-"service_registered": true,
-"service_ready": true,
-"sql_query": true
-
-Then firewall:
+echo
+echo "=== FIREWALL ==="
 
 sudo firewall-cmd --list-all
 
-We want only the relevant configuration:
+echo
+echo "=== ORATAB ==="
 
-ports: 1521/tcp
+grep DFCASHUAT1 /etc/oratab
 
-and:
+echo
+echo "=== HOST MAPPING ==="
 
-rule family="ipv4" source address="168.63.129.16/32" port port="8080" protocol="tcp" accept
-
-Finally, let's directly verify Oracle after this reboot as well:
-
-sudo -iu oraade
-
-Then:
-
-export ORACLE_HOME=/OraHome/ora26ai_DB_Home
-export ORACLE_SID=DFCASHUAT1
-export PATH=$ORACLE_HOME/bin:$PATH
-sqlplus / as sysdba
-
-Inside SQL*Plus:
-
-select instance_name, status from v$instance;
-select name, open_mode, database_role from v$database;
-exit;
-
-Expected:
-
-DFCASHUAT1    OPEN
-
-and:
-
-DFCASHUA    READ WRITE    PRIMARY
+grep ORACLE_VM_HOST_MAPPING /etc/hosts
