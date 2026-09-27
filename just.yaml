@@ -1,41 +1,32 @@
-Run these as azureuser, one by one:
+Temporarily prove the diagnosis on VM4. Add VM4's current hostname → current IP mapping, run lsnrctl status, and then remove it:
 
 hostname
-hostname -f
-hostname -I
-ip route
-ip addr show eth0
-ip addr show eth1
-getent ahostsv4 "$(hostname)"
-getent ahostsv4 "$(hostname -f)"
 
-Now test the listener directly using the IP that is really on the VM:
+Your hostname is:
 
-timeout 5 bash -c '</dev/tcp/10.114.32.136/1521' \
-&& echo "10.114.32.136:1521 SUCCESS" || echo "10.114.32.136:1521 FAILED"
+vm-004-dev-uan-b245iy
 
-Then test the address DNS is returning:
+Back up /etc/hosts:
 
-timeout 5 bash -c '</dev/tcp/10.114.32.137/1521' \
-&& echo "10.114.32.137:1521 SUCCESS" || echo "10.114.32.137:1521 FAILED"
+sudo cp /etc/hosts /etc/hosts.before-oracle-test
 
-I expect something like:
+Temporarily add:
 
-10.114.32.136:1521 SUCCESS
-10.114.32.137:1521 FAILED
+echo '10.114.32.136 vm-004-dev-uan-b245iy vm-004-dev-uan-b245iy.pc5knl1mzb5ufh5wqckcpgxi3b.dxbx.internal.cloudapp.net' \
+| sudo tee -a /etc/hosts
 
-If that happens, we've identified the listener-control problem.
+Verify:
 
-Also run:
+getent hosts "$(hostname)"
+getent hosts "$(hostname -f)"
 
-ps -ef | grep '[t]nslsnr'
+Both should now resolve to .136.
 
-That will show exactly how the listener was started.
+Then:
 
-One more useful check:
+sudo su - oracle
+export ORACLE_HOME=/OraHome/ora26ai_DB_Home
+export ORACLE_SID=DFCASHUAT1
+export PATH=$ORACLE_HOME/bin:$PATH
 
-sudo ss -lntp | grep 1521
-
-You already had:
-
-*:1521
+lsnrctl status
