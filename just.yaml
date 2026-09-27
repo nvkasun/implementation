@@ -1,100 +1,128 @@
-Then do these exact commands.
+1. First exit from oraade
 
-sudo cp /etc/systemd/system/oracle-database.service \
-/etc/systemd/system/oracle-database.service.backup-before-oraade
+You're currently here:
 
-Now update only the service user:
+[oraade@vm-004...]
 
-sudo sed -i 's/^User=oracle$/User=oraade/' \
-/etc/systemd/system/oracle-database.service
+Run:
 
-Verify:
+exit
 
-grep -E '^(User|Group)=' /etc/systemd/system/oracle-database.service
+Make sure you're back to:
+
+[azureuser@vm-004...]
+2. Confirm the unit really contains oraade
+sudo systemctl cat oracle-database.service | grep -E '^(User|Group)='
 
 Expected:
 
 User=oraade
 Group=dba
 
-Then reload systemd:
+Now also prove that oraade can write the exact directory that previously failed:
 
-sudo systemctl daemon-reload
+sudo -u oraade touch /OraHome/ora26ai_DB_Home/rdbms/log/oraade-write-test
 
-Validate the unit:
+Check:
 
-sudo systemd-analyze verify /etc/systemd/system/oracle-database.service
+ls -l /OraHome/ora26ai_DB_Home/rdbms/log/oraade-write-test
 
-No output = good.
+It should show oraade dba.
 
-Clear the previous failed state:
+Then remove test file:
 
-sudo systemctl reset-failed oracle-database.service
+sudo rm -f /OraHome/ora26ai_DB_Home/rdbms/log/oraade-write-test
 
-Because the listener from the previous attempt may still be running, that's okay. Now start the service:
+If that succeeds, the previous startup.log: Permission denied problem should be solved.
 
-sudo systemctl start oracle-database.service
+3. Actually restart the oneshot service
 
-Then:
+First stop it:
+
+sudo systemctl stop oracle-database.service
+
+Then check:
 
 sudo systemctl status oracle-database.service --no-pager
 
-We want:
+We should see something such as:
 
-Active: active (exited)
+Active: inactive (dead)
 
-But this time also check the logs carefully:
+Also check whether listener stopped:
 
-sudo journalctl -u oracle-database.service -n 80 --no-pager
+sudo ss -lntp | grep 1521 || echo "1521 not listening"
 
-We must not see:
+Now reload the unit once more:
 
-startup.log: Permission denied
-ORA-01034
+sudo systemctl daemon-reload
+sudo systemctl reset-failed oracle-database.service
 
-Then verify Oracle itself using the actual software owner:
+Then start it fresh:
+
+sudo systemctl start oracle-database.service
+
+Immediately check:
+
+sudo systemctl status oracle-database.service --no-pager
+
+And only look at the new journal entries:
+
+sudo journalctl -u oracle-database.service --since "2 minutes ago" --no-pager
+
+This is much better than -n 80, because the old permission errors won't confuse us.
+
+4. Verify Oracle, not only systemd
+
+Now:
 
 sudo -iu oraade
 
-Set environment:
+Then:
 
 export ORACLE_HOME=/OraHome/ora26ai_DB_Home
 export ORACLE_SID=DFCASHUAT1
 export PATH=$ORACLE_HOME/bin:$PATH
 
-Then:
+Run:
 
 sqlplus / as sysdba
 
-Inside SQL*Plus:
+Then:
 
 select instance_name, status from v$instance;
 select name, open_mode, database_role from v$database;
 exit;
 
-Target result:
+We need something like:
 
-DFCASHUAT1    OPEN
-DFCASHUA      READ WRITE    PRIMARY
+INSTANCE_NAME   STATUS
+DFCASHUAT1      OPEN
 
-Then check listener:
+and:
+
+NAME       OPEN_MODE    DATABASE_ROLE
+DFCASHUA   READ WRITE   PRIMARY
+
+Then:
 
 lsnrctl status
+5. Finally verify the health endpoint
 
-Finally exit back:
+Exit back:
 
 exit
 
-Wait for the health agent to detect recovery:
+Wait around 15 seconds:
 
 sleep 15
 curl -i http://127.0.0.1:8080/health
 
-We want:
+Expected:
 
 HTTP/1.0 200 OK
 
-and:
+with:
 
 "healthy": true,
 "status": "HEALTHY"
