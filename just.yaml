@@ -1,104 +1,80 @@
-First — check VM4 before restarting
+Step 1 — show us the disks and mount points
 
-On VM4 as your normal azureuser, run:
+On VM4 as azureuser, run:
 
-hostname
-
-sudo ss -lntp | grep 1521
-sudo ss -lntp | grep 8080
-
-sudo systemctl status oracle-health --no-pager
-sudo systemctl is-enabled oracle-health
-
-sudo firewall-cmd --list-all
-
-Then check the listener as Oracle:
-
-sudo su - oracle
-export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
-export ORACLE_SID=ORCL
-export PATH=$ORACLE_HOME/bin:$PATH
-
-lsnrctl status
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS
 
 Then:
 
-sqlplus / as sysdba
+df -hT
 
-Inside SQL*Plus:
+And:
 
-select instance_name, status from v$instance;
+cat /etc/fstab
 
-select name, open_mode from v$database;
+We are specifically looking for the ~400 GB disk and where it is mounted.
 
-show pdbs;
+For example, we might discover:
 
-exit
+sda       64G
+└─sda1    /
 
-Then return to azureuser:
+sdc      400G
+└─sdc1   /u01
 
-exit
+If the 400 GB disk exists but its MOUNTPOINTS field is empty, then yes bro — that's probably the problem.
 
-Finally check the health endpoint:
-
-curl -v http://127.0.0.1:8080/health
-
-Ideally before reboot we see:
-
-ORCL      OPEN
-database  READ WRITE
-PDB1      READ WRITE
-listener  1521
-health    HTTP 200
-Then reboot VM4
-
-From azureuser:
-
-sudo reboot
-
-Reconnect after the VM comes back.
-
-Do not run lsnrctl start, startup, or restart the health service yet.
-
-Immediately run:
-
-uptime
-
-sudo ss -lntp | grep 1521
-sudo ss -lntp | grep 8080
-
-sudo systemctl status oracle-health --no-pager
-
-Then:
-
-curl -v http://127.0.0.1:8080/health
-
-If that already returns:
-
-HTTP/1.x 200
-
-with something like:
-
-"healthy": true
-
-that's a very strong sign that Oracle and the listener came back correctly.
-
-Then confirm Oracle itself:
-
-sudo su - oracle
-export ORACLE_HOME=/u01/app/oracle/product/21.0.0/dbhome_1
-export ORACLE_SID=ORCL
-export PATH=$ORACLE_HOME/bin:$PATH
-
-lsnrctl status
-
-Then:
-
-sqlplus / as sysdba
+Step 2 — check whether the Oracle path actually exists
 
 Run:
 
-select instance_name, status from v$instance;
-select name, open_mode from v$database;
-show pdbs;
-exit
+ls -ld /u01
+ls -ld /u01/app
+ls -ld /u01/app/oracle
+ls -ld /u01/app/oracle/product/21.0.0/dbhome_1
+
+Then:
+
+ls -l /u01/app/oracle/product/21.0.0/dbhome_1/bin/sqlplus
+
+and:
+
+ls -l /u01/app/oracle/product/21.0.0/dbhome_1/bin/lsnrctl
+
+If you get:
+
+No such file or directory
+
+then the Oracle installation is definitely not currently available at that path.
+
+Step 3 — find the real Oracle installation
+
+Use:
+
+sudo find /u01 /opt /oracle /app -type f \
+  \( -name sqlplus -o -name lsnrctl \) 2>/dev/null
+
+Also check Oracle's configuration file:
+
+cat /etc/oratab
+
+You may see something like:
+
+ORCL:/some/other/path/product/21.0.0/dbhome_1:N
+
+That would tell us the real ORACLE_HOME.
+
+Also run:
+
+sudo -iu oracle env | grep -E 'ORACLE|PATH'
+
+and:
+
+sudo -iu oracle bash -lc 'echo ORACLE_HOME=$ORACLE_HOME; echo PATH=$PATH'
+Step 4 — check whether any Oracle process is running at all
+ps -ef | grep -E 'ora_pmon|tnslsnr' | grep -v grep
+
+If Oracle were running, we'd expect something like:
+
+ora_pmon_ORCL
+tnslsnr
