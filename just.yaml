@@ -1,356 +1,83 @@
-Follow these steps exactly.
+We are very close. Run these one by one, not as one big pasted block.
 
-First confirm IMDS from VM4. Run these as azureuser:
-curl --noproxy "*" -sS \
-  -H Metadata:true \
-  "http://169.254.169.254/metadata/instance/compute/name?api-version=2025-04-07&format=text"
+First Oracle service:
 
-echo
-
-curl --noproxy "*" -sS \
-  -H Metadata:true \
-  "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/privateIpAddress?api-version=2025-04-07&format=text"
-
-echo
-
-On this VM4, I expect approximately:
-
-vm-004-dev-uan-b245iy
-10.114.32.136
-
-That confirms Azure metadata is returning exactly what we need.
-
-Now back up the current working hostname script:
-
-sudo cp \
-  /usr/local/sbin/oracle-hostname-fix.sh \
-  /usr/local/sbin/oracle-hostname-fix.sh.backup-before-imds
-
-Replace it completely with this:
-
-sudo tee /usr/local/sbin/oracle-hostname-fix.sh >/dev/null <<'EOF'
-#!/bin/bash
-
-set -euo pipefail
-
-IMDS_BASE="http://169.254.169.254/metadata/instance"
-API_VERSION="2025-04-07"
-MARKER="# ORACLE_VM_HOST_MAPPING"
-
-NAME_URL="${IMDS_BASE}/compute/name?api-version=${API_VERSION}&format=text"
-IP_URL="${IMDS_BASE}/network/interface/0/ipv4/ipAddress/0/privateIpAddress?api-version=${API_VERSION}&format=text"
-
-echo "Starting Oracle Azure hostname configuration..."
-
-if [[ ! -x /usr/bin/curl ]]; then
-    echo "ERROR: /usr/bin/curl is not available."
-    exit 1
-fi
-
-if [[ ! -x /usr/bin/hostnamectl ]]; then
-    echo "ERROR: /usr/bin/hostnamectl is not available."
-    exit 1
-fi
-
-VM_NAME=""
-PRIVATE_IP=""
-
-# Azure networking/IMDS may need a few seconds during early boot.
-# Retry for up to approximately 60 seconds.
-for attempt in $(seq 1 30); do
-
-    VM_NAME=$(
-        /usr/bin/curl \
-            --noproxy "*" \
-            --fail \
-            --silent \
-            --show-error \
-            --connect-timeout 2 \
-            --max-time 5 \
-            -H "Metadata:true" \
-            "${NAME_URL}" 2>/dev/null || true
-    )
-
-    PRIVATE_IP=$(
-        /usr/bin/curl \
-            --noproxy "*" \
-            --fail \
-            --silent \
-            --show-error \
-            --connect-timeout 2 \
-            --max-time 5 \
-            -H "Metadata:true" \
-            "${IP_URL}" 2>/dev/null || true
-    )
-
-    VM_NAME=$(printf '%s' "${VM_NAME}" | tr -d '\r\n')
-    PRIVATE_IP=$(printf '%s' "${PRIVATE_IP}" | tr -d '\r\n')
-
-    if [[ -n "${VM_NAME}" && -n "${PRIVATE_IP}" ]]; then
-        break
-    fi
-
-    echo "IMDS not ready yet - attempt ${attempt}/30"
-    sleep 2
-done
-
-if [[ -z "${VM_NAME}" ]]; then
-    echo "ERROR: Unable to obtain Azure VM name from IMDS."
-    exit 1
-fi
-
-if [[ -z "${PRIVATE_IP}" ]]; then
-    echo "ERROR: Unable to obtain Azure primary private IP from IMDS."
-    exit 1
-fi
-
-if ! [[ "${PRIVATE_IP}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    echo "ERROR: Invalid IPv4 address returned by IMDS: ${PRIVATE_IP}"
-    exit 1
-fi
-
-echo "Azure VM name    : ${VM_NAME}"
-echo "Azure private IP : ${PRIVATE_IP}"
-
-CURRENT_HOSTNAME="$(hostname)"
-
-if [[ "${CURRENT_HOSTNAME}" != "${VM_NAME}" ]]; then
-    echo "Changing hostname:"
-    echo "  Old: ${CURRENT_HOSTNAME}"
-    echo "  New: ${VM_NAME}"
-
-    /usr/bin/hostnamectl set-hostname "${VM_NAME}"
-else
-    echo "Hostname already correct: ${VM_NAME}"
-fi
-
-# Remove only the entry previously managed by this script.
-TMP_HOSTS="$(mktemp)"
-
-awk -v marker="${MARKER}" '
-    index($0, marker) == 0
-' /etc/hosts > "${TMP_HOSTS}"
-
-printf '%s\t%s\t%s\n' \
-    "${PRIVATE_IP}" \
-    "${VM_NAME}" \
-    "${MARKER}" >> "${TMP_HOSTS}"
-
-# Write into the existing /etc/hosts file instead of replacing its inode.
-cat "${TMP_HOSTS}" > /etc/hosts
-rm -f "${TMP_HOSTS}"
-
-echo
-echo "Current managed /etc/hosts entry:"
-grep -F "${MARKER}" /etc/hosts
-
-RESOLVED_IP="$(
-    getent ahostsv4 "${VM_NAME}" 2>/dev/null |
-    awk 'NR == 1 {print $1}'
-)"
-
-if [[ "${RESOLVED_IP}" != "${PRIVATE_IP}" ]]; then
-    echo "ERROR: Hostname ${VM_NAME} resolved to '${RESOLVED_IP}', expected '${PRIVATE_IP}'."
-    exit 1
-fi
-
-echo
-echo "Hostname resolution verified:"
-echo "${VM_NAME} -> ${RESOLVED_IP}"
-
-echo
-echo "Oracle hostname mapping configured successfully."
-EOF
-
-Set the permissions:
-
-sudo chown root:root /usr/local/sbin/oracle-hostname-fix.sh
-sudo chmod 755 /usr/local/sbin/oracle-hostname-fix.sh
-
-Now replace the hostname systemd unit so the order is unambiguous:
-
-sudo cp \
-  /etc/systemd/system/oracle-hostname-fix.service \
-  /etc/systemd/system/oracle-hostname-fix.service.backup-before-imds
-
-Then:
-
-sudo tee /etc/systemd/system/oracle-hostname-fix.service >/dev/null <<'EOF'
-[Unit]
-Description=Configure Oracle VM hostname from Azure IMDS
-Wants=network-online.target
-After=network-online.target
-Before=oracle-database.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/oracle-hostname-fix.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-Reload and verify:
-
-sudo systemctl daemon-reload
-
-sudo systemd-analyze verify \
-  /etc/systemd/system/oracle-hostname-fix.service
-
-No output from systemd-analyze verify = good.
-
-Your oracle-database.service already has the important dependency we created earlier:
-
-After=network-online.target oracle-hostname-fix.service
-Requires=oracle-hostname-fix.service
-
-So do not modify oracle-database.service now. That means our final boot dependency becomes:
-
-network-online
-      ↓
-oracle-hostname-fix
-      ↓
-oracle-database
-      ↓
-oracle-health
-
-Now test the new hostname script without rebooting yet:
-
-sudo systemctl restart oracle-hostname-fix.service
-
-Check:
-
-sudo systemctl status oracle-hostname-fix.service --no-pager
+sudo systemctl status oracle-database.service --no-pager
 
 We want:
 
 Active: active (exited)
-status=0/SUCCESS
+
+Then health agent:
+
+sudo systemctl status oracle-health.service --no-pager
+
+We want:
+
+Active: active (running)
+
+Then confirm both ports:
+
+sudo ss -lntp | grep -E '1521|8080'
+
+We should see something like:
+
+*:1521    ... tnslsnr
+0.0.0.0:8080 ... python3
 
 Then:
 
-hostname
+curl -i http://127.0.0.1:8080/health
 
-hostname -I
+This is the most important check. We need:
 
-grep "ORACLE_VM_HOST_MAPPING" /etc/hosts
+HTTP/1.0 200 OK
 
-getent ahostsv4 "$(hostname)"
+and inside JSON:
 
-For VM4 you should still get approximately:
+"healthy": true,
+"status": "HEALTHY",
+"database_role": "PRIMARY",
+"pdb_open_mode": "READ WRITE",
+"listener_running": true,
+"listener_reachable": true,
+"service_registered": true,
+"service_ready": true,
+"sql_query": true
 
-hostname:
-vm-004-dev-uan-b245iy
+Then firewall:
+
+sudo firewall-cmd --list-all
+
+We want only the relevant configuration:
+
+ports: 1521/tcp
 
 and:
 
-/etc/hosts:
+rule family="ipv4" source address="168.63.129.16/32" port port="8080" protocol="tcp" accept
 
-10.114.32.136    vm-004-dev-uan-b245iy    # ORACLE_VM_HOST_MAPPING
+Finally, let's directly verify Oracle after this reboot as well:
 
-This VM won't visibly change because Azure IMDS correctly returns the same VM4 name. The important part is that after cloning:
+sudo -iu oraade
 
-Azure VM1 metadata
-name = vm-001-prod-...
-IP   = <VM1 new IP>
+Then:
 
-                 ↓
+export ORACLE_HOME=/OraHome/ora26ai_DB_Home
+export ORACLE_SID=DFCASHUAT1
+export PATH=$ORACLE_HOME/bin:$PATH
+sqlplus / as sysdba
 
-/etc/hosts
-<VM1-IP> vm-001-prod-...
+Inside SQL*Plus:
 
-while VM2 independently gets:
-
-Azure VM2 metadata
-name = vm-002-prod-...
-IP   = <VM2 new IP>
-
-                 ↓
-
-/etc/hosts
-<VM2-IP> vm-002-prod-...
-
-There is zero subnet, VNet, IP, resource-group, or hostname hardcoding in this mechanism.
-
-Before rebooting, confirm the database dependency one more time:
-
-sudo systemctl cat oracle-database.service | \
-grep -E '^(After|Requires)='
-
-We should see something equivalent to:
-
-After=network-online.target oracle-hostname-fix.service
-Requires=oracle-hostname-fix.service
-
-Then check all three remain enabled:
-
-sudo systemctl is-enabled oracle-hostname-fix.service
-sudo systemctl is-enabled oracle-database.service
-sudo systemctl is-enabled oracle-health.service
+select instance_name, status from v$instance;
+select name, open_mode, database_role from v$database;
+exit;
 
 Expected:
 
-enabled
-enabled
-enabled
-Then yes — final reboot
+DFCASHUAT1    OPEN
 
-Run:
+and:
 
-sudo reboot
-
-After reconnecting, don't manually start anything. Give it maybe 1–2 minutes and run this exact validation:
-
-echo "=== HOST ==="
-hostname
-hostname -I
-grep "ORACLE_VM_HOST_MAPPING" /etc/hosts
-
-echo
-echo "=== MOUNTS ==="
-df -hT | grep -E 'OraHome|OraData'
-
-echo
-echo "=== SERVICES ==="
-sudo systemctl status oracle-hostname-fix.service --no-pager
-sudo systemctl status oracle-database.service --no-pager
-sudo systemctl status oracle-health.service --no-pager
-
-echo
-echo "=== PORTS ==="
-sudo ss -lntp | grep -E '1521|8080'
-
-echo
-echo "=== HEALTH ==="
-curl -i http://127.0.0.1:8080/health
-
-echo
-echo "=== FIREWALL ==="
-sudo firewall-cmd --list-all
-
-The final target is:
-
-oracle-hostname-fix     active (exited)   ✅
-oracle-database         active (exited)   ✅
-oracle-health           active (running)  ✅
-
-1521                     LISTEN            ✅
-8080                     LISTEN            ✅
-
-/health                  HTTP 200           ✅
-healthy                  true               ✅
-database_role            PRIMARY            ✅
-pdb_open_mode            READ WRITE         ✅
-listener_reachable       true               ✅
-service_registered       true               ✅
-service_ready            true               ✅
-sql_query                true               ✅
-
-And firewall:
-
-ports:
-  1521/tcp
-
-rich rules:
-  rule family="ipv4" source address="168.63.129.16/32" port port="8080" protocol="tcp" accept
+DFCASHUA    READ WRITE    PRIMARY
