@@ -1,7 +1,41 @@
+Run these as azureuser, one by one:
+
+hostname
 hostname -f
 hostname -I
-ip -br addr
-getent hosts "$(hostname)"
-getent hosts "$(hostname -f)"
-cat /etc/hosts
-sudo cat /OraHome/ora26ai_DB_Home/network/admin/listener.ora
+ip route
+ip addr show eth0
+ip addr show eth1
+getent ahostsv4 "$(hostname)"
+getent ahostsv4 "$(hostname -f)"
+
+Now test the listener directly using the IP that is really on the VM:
+
+timeout 5 bash -c '</dev/tcp/10.114.32.136/1521' \
+&& echo "10.114.32.136:1521 SUCCESS" || echo "10.114.32.136:1521 FAILED"
+
+Then test the address DNS is returning:
+
+timeout 5 bash -c '</dev/tcp/10.114.32.137/1521' \
+&& echo "10.114.32.137:1521 SUCCESS" || echo "10.114.32.137:1521 FAILED"
+
+I expect something like:
+
+10.114.32.136:1521 SUCCESS
+10.114.32.137:1521 FAILED
+
+If that happens, we've identified the listener-control problem.
+
+Also run:
+
+ps -ef | grep '[t]nslsnr'
+
+That will show exactly how the listener was started.
+
+One more useful check:
+
+sudo ss -lntp | grep 1521
+
+You already had:
+
+*:1521
