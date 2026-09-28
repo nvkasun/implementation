@@ -1,57 +1,72 @@
-echo "===== 1. HOST / NETWORK ====="
-hostname
-hostname -f
-hostname -I
-ip -br addr
-ip route
+Let's prove exactly what Azure gave VM5
+
+Run this on VM5:
+
+echo "===== BLOCK DEVICES ====="
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
 
 echo
-echo "===== 2. NETWORKMANAGER ====="
-nmcli device status
-nmcli connection show
+echo "===== ALL DISKS SEEN BY OS ====="
+sudo fdisk -l | grep -E '^Disk /dev/'
 
 echo
-echo "===== 3. HOSTNAME MAPPING ====="
-grep "ORACLE_VM_HOST_MAPPING" /etc/hosts
-getent ahostsv4 "$(hostname)"
+echo "===== LVM ====="
+sudo pvs
+sudo vgs
+sudo lvs -o lv_name,vg_name,lv_size,lv_path,devices
 
 echo
-echo "===== 4. ORACLE DISKS / MOUNTS ====="
-lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS
-df -hT | grep -E 'OraHome|OraData'
+echo "===== FSTAB ====="
+grep -E 'OraHome|OraData' /etc/fstab
 
-echo
-echo "===== 5. ENABLED SERVICES ====="
-sudo systemctl is-enabled oracle-hostname-fix.service
-sudo systemctl is-enabled oracle-database.service
-sudo systemctl is-enabled oracle-health.service
+I expect the last command to still show the two correct image entries:
 
-echo
-echo "===== 6. HOSTNAME FIX SERVICE ====="
-sudo systemctl status oracle-hostname-fix.service --no-pager
+UUID=... /OraHome xfs ...
+UUID=... /OraData xfs ...
 
-echo
-echo "===== 7. ORACLE DATABASE SERVICE ====="
-sudo systemctl status oracle-database.service --no-pager
+but pvs will probably only show the OS/root volume because the 400-GB disk isn't attached.
 
-echo
-echo "===== 8. HEALTH AGENT SERVICE ====="
-sudo systemctl status oracle-health.service --no-pager
+Now also ask Azure IMDS what disks it thinks VM5 has:
 
-echo
-echo "===== 9. LISTENING PORTS ====="
-sudo ss -lntp | grep -E '1521|8080'
+curl --noproxy "*" -s \
+  -H Metadata:true \
+  "http://169.254.169.254/metadata/instance?api-version=2025-04-07" \
+  > /tmp/imds.json
 
-echo
-echo "===== 10. LOCAL ORACLE PORT ====="
-timeout 5 bash -c '</dev/tcp/127.0.0.1/1521' \
-  && echo "LOCAL 1521 SUCCESS" \
-  || echo "LOCAL 1521 FAILED"
+python3 - <<'PY'
+import json
 
-echo
-echo "===== 11. HEALTH ENDPOINT ====="
-curl -i http://127.0.0.1:8080/health
+with open("/tmp/imds.json") as f:
+    x = json.load(f)
 
-echo
-echo "===== 12. FIREWALL ====="
-sudo firewall-cmd --list-all
+c = x["compute"]
+
+print("VM Name:", c.get("name"))
+print("Resource Group:", c.get("resourceGroupName"))
+print("OS Disk:", c.get("storageProfile", {}).get("osDisk"))
+print("Data Disks:", c.get("storageProfile", {}).get("dataDisks"))
+PY
+
+The important line is:
+
+Data Disks:
+
+If it gives:
+
+Data Disks: []
+
+then we have absolute confirmation that Azure created VM5 without any data disk, not merely that Linux failed to mount it.
+
+Why this is interesting
+
+Earlier, your 2.0.0 image version resource JSON showed:
+
+"dataDiskImages": [
+  {
+    "lun": 0,
+    "sizeInGB": 400,
+    "hostCaching": "None"
+  }
+]
+
+So we already have evidence that the gallery image version itself contains a 400-GB LUN 0 data-disk image.
