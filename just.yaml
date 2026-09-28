@@ -1,16 +1,7 @@
-elif [[ "${{ github.event.inputs.MODULE }}" == "oracle-vm-infra" ]]; then
-  echo "Deploying Oracle VM infrastructure dependencies..."
-
-  terraform init -plugin-dir="$PWD/.terraform/providers" \
-    -backend-config="config/${{ env.TFVARS_ENV }}.config"
-
-  terraform refresh \
-    -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars"
-
-  terraform plan \
+elif [[ "${{ github.event.inputs.MODULE }}" == "oracle_vm_resource_group" ]]; then
+  echo "Deploying Oracle VM infrastructure with its dependent resources..."
+  terraform init -plugin-dir="$PWD/.terraform/providers" -backend-config="config/${{ env.TFVARS_ENV }}.config"
+  terraform refresh -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars"
+  terraform plan --target=module.$MODULE \
     --target=module.base-infra \
-    --target=module.oracle_vm_resource_group \
-    -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars" \
-    -out=plan.tfout
-
-else
+    -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars" -out=plan.tfout
