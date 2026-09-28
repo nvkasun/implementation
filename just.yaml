@@ -1,7 +1,16 @@
-module "oracle_vm_resource_group" {
-  source = "git::https://github.com/AbuDhabiCommercialBank/maz-tf-module-resource-groups.git?ref=0.0.1"
+elif [[ "${{ github.event.inputs.MODULE }}" == "oracle-vm-infra" ]]; then
+  echo "Deploying Oracle VM infrastructure dependencies..."
 
-  rg_name  = var.oracle_vm_resource_group_name
-  location = var.location
-  tags     = local.tags
-}
+  terraform init -plugin-dir="$PWD/.terraform/providers" \
+    -backend-config="config/${{ env.TFVARS_ENV }}.config"
+
+  terraform refresh \
+    -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars"
+
+  terraform plan \
+    --target=module.base-infra \
+    --target=module.oracle_vm_resource_group \
+    -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars" \
+    -out=plan.tfout
+
+else
