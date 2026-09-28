@@ -1,10 +1,4 @@
-oracle-vm-subnet = {
-  subnet_name           = "snet-oracle-vm-cibg-uaenorth-001"
-  subnet_address_prefix = ["10.114.83.0/26"]
-
-  private_endpoint_network_policies = "Enabled"
-
-  route_table_rules = [
-    ["udr-to-fw", "0.0.0.0/0", "VirtualAppliance", "10.115.1.4"]
-  ]
+variable "oracle_vm_resource_group_name" {
+  description = "Dedicated resource group name for Oracle VM resources"
+  type        = string
 }
