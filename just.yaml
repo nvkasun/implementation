@@ -1,1 +1,7 @@
-oracle_vm_resource_group_name = "rg-cibg-dev-uaenorth-oracle-vm-001"
+module "oracle_vm_resource_group" {
+  source = "git::https://github.com/AbuDhabiCommercialBank/maz-tf-module-resource-groups.git?ref=0.0.1"
+
+  rg_name  = var.oracle_vm_resource_group_name
+  location = var.location
+  tags     = local.tags
+}
