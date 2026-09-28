@@ -1,7 +1,74 @@
-elif [[ "${{ github.event.inputs.MODULE }}" == "oracle_vm_resource_group" ]]; then
-  echo "Deploying Oracle VM infrastructure with its dependent resources..."
-  terraform init -plugin-dir="$PWD/.terraform/providers" -backend-config="config/${{ env.TFVARS_ENV }}.config"
-  terraform refresh -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars"
-  terraform plan --target=module.$MODULE \
-    --target=module.base-infra \
-    -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars" -out=plan.tfout
+# # =========================
+# # test VM 04
+
+module "oracle_binary_vm04" {
+  source = "./modules/virtual-machine"
+
+  resource_group_name = module.oracle_db_resource_group.rg_name
+  application_name    = "004"
+  environment         = var.environment
+
+  subnet_id = module.base-infra.subnet_map[
+    "snet-lb-cl-factory-uaenorth-001"
+  ].id
+
+  key_vault_id = module.azure_key_vault.id
+
+  dns_servers   = []
+  computer_name = "oraclebinvm04"
+
+  vm = {
+    os_type = "linux"
+  }
+
+  vm_size           = "Standard_E8s_v5"
+  availability_zone = "3"
+
+  source_image_reference = {
+    publisher = "RedHat"
+    offer     = "RHEL"
+    sku       = "9-lvm-gen2"
+    version   = "latest"
+  }
+
+  admin_username = "azureuser"
+  admin_password = var.oracle_db_vm_admin_password
+
+  managed_identities = {
+    system_assigned = false
+
+    user_assigned_resource_ids = [
+      azurerm_user_assigned_identity.oracle_binary_vm.id
+    ]
+  }
+
+  # Enlarged OS disk.
+  #
+  # The Oracle software installation area will be created from
+  # this OS disk as a separate Linux LVM/filesystem, for example:
+  #
+  #   /OraHome
+  #
+  # This avoids creating a separate Azure data disk for the
+  # Oracle installation binaries.
+  os_disk = {
+    caching              = "ReadWrite"
+    storage_account_type = "StandardSSD_LRS"
+    disk_size_gb         = 128
+  }
+
+  # No Azure data disk is required while preparing the
+  # Oracle binary/custom image VM.
+  #
+  # Oracle database data disks can be added later through
+  # this module's data_disks input when required.
+  data_disks = {}
+
+  accelerated_networking_enabled = true
+  ip_forwarding_enabled          = false
+  enable_boot_diagnostics        = true
+  encryption_at_host_enabled     = false
+  patch_mode_linux               = "ImageDefault"
+
+  tags = local.tags
+}
