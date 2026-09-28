@@ -1,7 +1,57 @@
-Hi Maria, Rizwan,
-Thank you both for your support and for implementing the requested enhancement to the VM Terraform module.
-We have completed the validation from our side, and I can confirm that we are now able to successfully provision Azure VMs using Azure Compute Gallery image versions through the newly introduced source_image_id support.
-The implementation is working as expected for our specialized gallery image use case, including provisioning from the required image version while retaining the existing module behavior.
-Thanks again for your support and coordination on this requirement.
-Kind Regards,
-Kasun
+echo "===== 1. HOST / NETWORK ====="
+hostname
+hostname -f
+hostname -I
+ip -br addr
+ip route
+
+echo
+echo "===== 2. NETWORKMANAGER ====="
+nmcli device status
+nmcli connection show
+
+echo
+echo "===== 3. HOSTNAME MAPPING ====="
+grep "ORACLE_VM_HOST_MAPPING" /etc/hosts
+getent ahostsv4 "$(hostname)"
+
+echo
+echo "===== 4. ORACLE DISKS / MOUNTS ====="
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS
+df -hT | grep -E 'OraHome|OraData'
+
+echo
+echo "===== 5. ENABLED SERVICES ====="
+sudo systemctl is-enabled oracle-hostname-fix.service
+sudo systemctl is-enabled oracle-database.service
+sudo systemctl is-enabled oracle-health.service
+
+echo
+echo "===== 6. HOSTNAME FIX SERVICE ====="
+sudo systemctl status oracle-hostname-fix.service --no-pager
+
+echo
+echo "===== 7. ORACLE DATABASE SERVICE ====="
+sudo systemctl status oracle-database.service --no-pager
+
+echo
+echo "===== 8. HEALTH AGENT SERVICE ====="
+sudo systemctl status oracle-health.service --no-pager
+
+echo
+echo "===== 9. LISTENING PORTS ====="
+sudo ss -lntp | grep -E '1521|8080'
+
+echo
+echo "===== 10. LOCAL ORACLE PORT ====="
+timeout 5 bash -c '</dev/tcp/127.0.0.1/1521' \
+  && echo "LOCAL 1521 SUCCESS" \
+  || echo "LOCAL 1521 FAILED"
+
+echo
+echo "===== 11. HEALTH ENDPOINT ====="
+curl -i http://127.0.0.1:8080/health
+
+echo
+echo "===== 12. FIREWALL ====="
+sudo firewall-cmd --list-all
