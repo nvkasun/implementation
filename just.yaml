@@ -1,74 +1,133 @@
-# # =========================
-# # test VM 04
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
 
-module "oracle_binary_vm04" {
-  source = "./modules/virtual-machine"
+  "parameters": {
+    "galleryName": {
+      "type": "string",
+      "defaultValue": "acgCloudFactoryydevuaenorthoracledb",
+      "metadata": {
+        "description": "Existing Azure Compute Gallery name."
+      }
+    },
 
-  resource_group_name = module.oracle_db_resource_group.rg_name
-  application_name    = "004"
-  environment         = var.environment
+    "imageDefinitionName": {
+      "type": "string",
+      "defaultValue": "RHEL-9.8-oracle-db",
+      "metadata": {
+        "description": "Existing specialized image definition created for the Oracle VM."
+      }
+    },
 
-  subnet_id = module.base-infra.subnet_map[
-    "snet-lb-cl-factory-uaenorth-001"
-  ].id
+    "imageVersion": {
+      "type": "string",
+      "defaultValue": "3.0.0",
+      "metadata": {
+        "description": "Azure Compute Gallery image version."
+      }
+    },
 
-  key_vault_id = module.azure_key_vault.id
+    "sourceVmName": {
+      "type": "string",
+      "defaultValue": "vm-004-dev-uan-b245iy",
+      "metadata": {
+        "description": "Prepared source VM containing the Oracle installation and configuration on the OS disk only."
+      }
+    },
 
-  dns_servers   = []
-  computer_name = "oraclebinvm04"
+    "location": {
+      "type": "string",
+      "defaultValue": "uaenorth",
+      "metadata": {
+        "description": "Azure region containing the source VM, gallery and Disk Encryption Set."
+      }
+    },
 
-  vm = {
-    os_type = "linux"
+    "diskEncryptionSetResourceId": {
+      "type": "string",
+      "defaultValue": "/subscriptions/1a233215-09f6-404f-8536-bc83100ba1fa/resourceGroups/rg-CloudFactory-dev-uaenorth-oracledb/providers/Microsoft.Compute/diskEncryptionSets/vm-004-dev-uan-b245iy-des",
+      "metadata": {
+        "description": "Full resource ID of the Disk Encryption Set used for CMK encryption of the OS disk image."
+      }
+    }
+  },
+
+  "variables": {
+    "commonTags": {
+      "ApplicationName": "CloudFactory",
+      "BusinessCriticality": "Low",
+      "BusinessUnit": "TechnologyPlatform",
+      "BusinessUnitOwner": "TechnologyPlatform",
+      "CostCenter": "219",
+      "DataClassification": "General",
+      "DeployedBy": "Manual",
+      "Environment": "dev",
+      "RequestReference": "P015763"
+    }
+  },
+
+  "resources": [
+    {
+      "type": "Microsoft.Compute/galleries/images/versions",
+      "apiVersion": "2024-03-03",
+
+      "name": "[format('{0}/{1}/{2}', parameters('galleryName'), parameters('imageDefinitionName'), parameters('imageVersion'))]",
+
+      "location": "[parameters('location')]",
+
+      "tags": "[variables('commonTags')]",
+
+      "properties": {
+        "publishingProfile": {
+          "excludeFromLatest": false,
+          "replicaCount": 1,
+          "replicationMode": "Full",
+          "storageAccountType": "Standard_ZRS",
+
+          "targetRegions": [
+            {
+              "name": "[parameters('location')]",
+              "regionalReplicaCount": 1,
+              "storageAccountType": "Standard_ZRS",
+              "excludeFromLatest": false,
+
+              "encryption": {
+                "osDiskImage": {
+                  "diskEncryptionSetId": "[parameters('diskEncryptionSetResourceId')]"
+                }
+              }
+            }
+          ]
+        },
+
+        "storageProfile": {
+          "source": {
+            "virtualMachineId": "[resourceId('Microsoft.Compute/virtualMachines', parameters('sourceVmName'))]"
+          }
+        },
+
+        "safetyProfile": {
+          "allowDeletionOfReplicatedLocations": false,
+          "blockDeletionBeforeEndOfLife": false
+        }
+      }
+    }
+  ],
+
+  "outputs": {
+    "imageVersionId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/galleries/images/versions', parameters('galleryName'), parameters('imageDefinitionName'), parameters('imageVersion'))]"
+    },
+
+    "sourceVmId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/virtualMachines', parameters('sourceVmName'))]"
+    },
+
+    "diskEncryptionSetId": {
+      "type": "string",
+      "value": "[parameters('diskEncryptionSetResourceId')]"
+    }
   }
-
-  vm_size           = "Standard_E8s_v5"
-  availability_zone = "3"
-
-  source_image_reference = {
-    publisher = "RedHat"
-    offer     = "RHEL"
-    sku       = "9-lvm-gen2"
-    version   = "latest"
-  }
-
-  admin_username = "azureuser"
-  admin_password = var.oracle_db_vm_admin_password
-
-  managed_identities = {
-    system_assigned = false
-
-    user_assigned_resource_ids = [
-      azurerm_user_assigned_identity.oracle_binary_vm.id
-    ]
-  }
-
-  # Enlarged OS disk.
-  #
-  # The Oracle software installation area will be created from
-  # this OS disk as a separate Linux LVM/filesystem, for example:
-  #
-  #   /OraHome
-  #
-  # This avoids creating a separate Azure data disk for the
-  # Oracle installation binaries.
-  os_disk = {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = 128
-  }
-
-  # No Azure data disk is required while preparing the
-  # Oracle binary/custom image VM.
-  #
-  # Oracle database data disks can be added later through
-  # this module's data_disks input when required.
-  data_disks = {}
-
-  accelerated_networking_enabled = true
-  ip_forwarding_enabled          = false
-  enable_boot_diagnostics        = true
-  encryption_at_host_enabled     = false
-  patch_mode_linux               = "ImageDefault"
-
-  tags = local.tags
 }
