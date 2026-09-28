@@ -1,4 +1,1 @@
-variable "oracle_vm_resource_group_name" {
-  description = "Dedicated resource group name for Oracle VM resources"
-  type        = string
-}
+oracle_vm_resource_group_name = "rg-cibg-dev-uaenorth-oracle-vm-001"
