@@ -1,5 +1,12 @@
-Thanks a lot for the support bro. This is related to the email I sent you and Maria about the Azure Image Gallery module change.
-
-The team is raising the firewall request today to deploy the custom image VM in the CIBG environment, but I’m still facing the CMK issue. Could you please treat this as a priority? It’s quite urgent from our side, that’s why I’m troubling you again 😄
-
-I’ve shared my fixes below for reference. This version fixes the specialized gallery image CMK issue from my testing. I still believe the remaining issue is with the base module, since the custom image disks already have CMK configured.
+  # Separate Oracle data disk
+  data_disks = {
+    oracle_data = {
+      name                 = "oracle-data"
+      storage_account_type = "StandardSSD_LRS"
+      disk_size_gb         = 400
+      lun                  = 0
+      caching              = "None"
+      create_option        = "Empty"
+      tags                 = local.tags
+    }
+  }
