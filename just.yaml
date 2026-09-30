@@ -1,12 +1,14 @@
-  # Separate Oracle data disk
-  data_disks = {
-    oracle_data = {
-      name                 = "oracle-data"
-      storage_account_type = "StandardSSD_LRS"
-      disk_size_gb         = 400
-      lun                  = 0
-      caching              = "None"
-      create_option        = "Empty"
-      tags                 = local.tags
-    }
-  }
+Hi Udey,
+
+I had a discussion with Jiwan Thapa from the Access Control team regarding my office access card validity.
+
+My current contract period is due to expire on 1 October. However, our contract period has been extended until 31 October, so the office access card validity also needs to be extended accordingly.
+
+Jiwan informed me that approval from my line manager is required via email to proceed with the access card extension.
+
+Could you please provide your approval to extend my office access card validity until 31 October?
+
+Thank you for your support.
+
+Best regards,
+Kasun
