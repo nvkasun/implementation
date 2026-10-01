@@ -1,32 +1,17 @@
-In variables.tf:
+extensions = {
+  oracle_health_config = {
+    name                 = "oracle-health-config"
+    publisher            = "Microsoft.Azure.Extensions"
+    type                 = "CustomScript"
+    type_handler_version = "2.1"
 
-variable "oracle_listener_port" {
-  description = "Oracle listener port used by all Oracle DB VMs in this environment"
-  type        = number
+    auto_upgrade_minor_version = true
+    automatic_upgrade_enabled  = false
 
-  validation {
-    condition = (
-      var.oracle_listener_port >= 1 &&
-      var.oracle_listener_port <= 65535
-    )
+    settings = jsonencode({
+      commandToExecute = "/opt/oracle-health/configure-health-agent.sh ${var.oracle_listener_port}"
+    })
 
-    error_message = "oracle_listener_port must be between 1 and 65535."
+    protected_settings = null
   }
 }
-
-variable "oracle_lb_frontend_ip" {
-  description = "Optional static private IP for the Oracle Internal Load Balancer"
-  type        = string
-  default     = null
-  nullable    = true
-}
-
-Then your environment tfvars become something like:
-
-# UAT
-oracle_listener_port = 1525
-
-and:
-
-# PROD
-oracle_listener_port = 1521
