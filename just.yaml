@@ -1,150 +1,86 @@
-I’d replace your current load_balancer.tf with this:
-
 # ==============================================================================
-# Oracle on Azure - Database Internal Load Balancer
+# Oracle on Azure - VM01
 # ==============================================================================
 
-resource "azurerm_lb" "oracle_db" {
-  name                = "lb-CloudFactory-${var.environment}-uaenorth-oracledb"
-  location            = var.location
-  resource_group_name = module.oracle_db_resource_group.rg_name
+module "oracle_binary_vm01" {
+  source = "./modules/virtual-machine-latest"
 
-  sku      = "Standard"
-  sku_tier = "Regional"
+  resource_group_name = module.oracle_vm_resource_group.rg_name
+  application_name    = "001"
+  environment         = var.environment
 
-  frontend_ip_configuration {
-    name = "fe-oracledb"
+  # Dedicated Oracle VM subnet - NEW design
+  subnet_id = module.base-infra.subnet_map[
+    "snet-oracle-vm-cibg-uaenorth-001"
+  ].id
 
-    subnet_id = module.base-infra.subnet_map[
-      "snet-lb-cl-factory-uaenorth-001"
-    ].id
+  key_vault_id = module.azure_key_vault.id
 
-    private_ip_address_allocation = "Dynamic"
+  vm = {
+    os_type = "linux"
   }
+
+  vm_size           = "Standard_E8s_v5"
+  availability_zone = "3"
+
+  source_image_id = "/subscriptions/1a233215-09f6-404f-8536-bc83100ba1fa/resourceGroups/rg-CloudFactory-dev-uaenorth-oracledb/providers/Microsoft.Compute/galleries/acgCloudFactoryydevuaenorthoracledb/images/RHEL-9.8-oracle-db/versions/3.0.0"
+
+  source_image_specialized = true
+
+  admin_username = "azureuser"
+  admin_password = var.oracle_db_vm_admin_password
+
+  managed_identities = {
+    system_assigned = false
+
+    user_assigned_resource_ids = [
+      azurerm_user_assigned_identity.oracle_binary_vm.id
+    ]
+  }
+
+  os_disk = {
+    caching              = "ReadWrite"
+    storage_account_type = "StandardSSD_LRS"
+    disk_size_gb         = null
+  }
+
+  # Separate Oracle data disk
+  data_disks = {
+    oracle_data = {
+      name                 = "oracle-data"
+      storage_account_type = "StandardSSD_LRS"
+      disk_size_gb         = 200
+      lun                  = 0
+      caching              = "ReadWrite"
+      tags                 = local.tags
+    }
+  }
+
+  # Pass environment-specific Oracle listener port
+  # to the health agent already baked into the image
+  extensions = {
+    oracle_health_config = {
+      name                 = "oracle-health-config"
+      publisher            = "Microsoft.Azure.Extensions"
+      type                 = "CustomScript"
+      type_handler_version = "2.1"
+
+      auto_upgrade_minor_version = true
+      automatic_upgrade_enabled  = false
+
+      settings = jsonencode({
+        commandToExecute = "/opt/oracle-health/configure-health-agent.sh ${var.oracle_listener_port}"
+      })
+
+      protected_settings = null
+    }
+  }
+
+  accelerated_networking_enabled = true
+  ip_forwarding_enabled          = false
+  enable_boot_diagnostics        = true
+  encryption_at_host_enabled     = false
+  patch_mode_linux               = "ImageDefault"
 
   tags = local.tags
 }
-
-
-# ==============================================================================
-# Oracle Database Backend Pool
-# ==============================================================================
-
-resource "azurerm_lb_backend_address_pool" "oracle_db" {
-  name            = "be-oracledb"
-  loadbalancer_id = azurerm_lb.oracle_db.id
-}
-
-
-# ==============================================================================
-# Oracle VM Backend NICs
-#
-# All Oracle VMs participating in this LB are registered here.
-# Add/remove VMs only from this map.
-# ==============================================================================
-
-locals {
-  oracle_db_backend_nics = {
-    vm01 = module.oracle_db_vm01.network_interface_id
-    vm02 = module.oracle_db_vm02.network_interface_id
-    vm03 = module.oracle_db_vm03.network_interface_id
-    vm04 = module.oracle_db_vm04.network_interface_id
-  }
-}
-
-
-# ==============================================================================
-# Attach Oracle VMs to LB Backend Pool
-# ==============================================================================
-
-resource "azurerm_network_interface_backend_address_pool_association" "oracle_db" {
-  for_each = local.oracle_db_backend_nics
-
-  network_interface_id    = each.value
-  ip_configuration_name   = "internal"
-  backend_address_pool_id = azurerm_lb_backend_address_pool.oracle_db.id
-}
-
-
-# ==============================================================================
-# Oracle Database Health Probe
-#
-# The Azure Load Balancer calls the custom Python health endpoint.
-#
-# LB -> VM:8080/health
-#
-# The Python health agent then checks Oracle internally using
-# var.oracle_listener_port.
-# ==============================================================================
-
-resource "azurerm_lb_probe" "oracle_db_health" {
-  name            = "hp-oracledb"
-  loadbalancer_id = azurerm_lb.oracle_db.id
-
-  protocol     = "Http"
-  port         = 8080
-  request_path = "/health"
-
-  interval_in_seconds = 5
-  number_of_probes    = 2
-}
-
-
-# ==============================================================================
-# Oracle Database Load Balancing Rule
-#
-# Oracle application traffic uses the environment-specific listener port.
-#
-# Example:
-# UAT  -> 1525
-# PROD -> 1521
-#
-# Frontend and backend ports always use the same value.
-# ==============================================================================
-
-resource "azurerm_lb_rule" "oracle_db" {
-  name            = "lbr-oracledb-${var.oracle_listener_port}"
-  loadbalancer_id = azurerm_lb.oracle_db.id
-
-  protocol = "Tcp"
-
-  frontend_port = var.oracle_listener_port
-  backend_port  = var.oracle_listener_port
-
-  frontend_ip_configuration_name = "fe-oracledb"
-
-  backend_address_pool_ids = [
-    azurerm_lb_backend_address_pool.oracle_db.id
-  ]
-
-  probe_id = azurerm_lb_probe.oracle_db_health.id
-
-  idle_timeout_in_minutes = 30
-
-  tcp_reset_enabled  = true
-  enable_floating_ip = false
-}
-
-Then in variables.tf, add:
-
-variable "oracle_listener_port" {
-  description = "Oracle listener port used by all Oracle database VMs in this environment"
-  type        = number
-
-  validation {
-    condition = (
-      var.oracle_listener_port >= 1 &&
-      var.oracle_listener_port <= 65535
-    )
-
-    error_message = "oracle_listener_port must be between 1 and 65535."
-  }
-}
-
-And in your tfvars/dev.tfvars, for example:
-
-oracle_listener_port = 1521
-
-If UAT uses another port:
-
-oracle_listener_port = 1525
