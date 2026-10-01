@@ -9,7 +9,7 @@ extensions = {
     automatic_upgrade_enabled  = false
 
     settings = jsonencode({
-      commandToExecute = "/bin/bash /opt/oracle-health/configure-health-agent.sh ${var.oracle_listener_port}"
+      commandToExecute = "/bin/bash -c 'echo \"ORACLE_PORT=${var.oracle_listener_port}\"'"
     })
 
     protected_settings = null
