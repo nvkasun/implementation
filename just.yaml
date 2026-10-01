@@ -1,86 +1,17 @@
-# ==============================================================================
-# Oracle on Azure - VM01
-# ==============================================================================
+extensions = {
+  oracle_health_config = {
+    name                 = "oracle-health-config"
+    publisher            = "Microsoft.Azure.Extensions"
+    type                 = "CustomScript"
+    type_handler_version = "2.1"
 
-module "oracle_binary_vm01" {
-  source = "./modules/virtual-machine-latest"
+    auto_upgrade_minor_version = true
+    automatic_upgrade_enabled  = false
 
-  resource_group_name = module.oracle_vm_resource_group.rg_name
-  application_name    = "001"
-  environment         = var.environment
+    settings = jsonencode({
+      commandToExecute = "/bin/bash /opt/oracle-health/configure-health-agent.sh ${var.oracle_listener_port}"
+    })
 
-  # Dedicated Oracle VM subnet - NEW design
-  subnet_id = module.base-infra.subnet_map[
-    "snet-oracle-vm-cibg-uaenorth-001"
-  ].id
-
-  key_vault_id = module.azure_key_vault.id
-
-  vm = {
-    os_type = "linux"
+    protected_settings = null
   }
-
-  vm_size           = "Standard_E8s_v5"
-  availability_zone = "3"
-
-  source_image_id = "/subscriptions/1a233215-09f6-404f-8536-bc83100ba1fa/resourceGroups/rg-CloudFactory-dev-uaenorth-oracledb/providers/Microsoft.Compute/galleries/acgCloudFactoryydevuaenorthoracledb/images/RHEL-9.8-oracle-db/versions/3.0.0"
-
-  source_image_specialized = true
-
-  admin_username = "azureuser"
-  admin_password = var.oracle_db_vm_admin_password
-
-  managed_identities = {
-    system_assigned = false
-
-    user_assigned_resource_ids = [
-      azurerm_user_assigned_identity.oracle_binary_vm.id
-    ]
-  }
-
-  os_disk = {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = null
-  }
-
-  # Separate Oracle data disk
-  data_disks = {
-    oracle_data = {
-      name                 = "oracle-data"
-      storage_account_type = "StandardSSD_LRS"
-      disk_size_gb         = 200
-      lun                  = 0
-      caching              = "ReadWrite"
-      tags                 = local.tags
-    }
-  }
-
-  # Pass environment-specific Oracle listener port
-  # to the health agent already baked into the image
-  extensions = {
-    oracle_health_config = {
-      name                 = "oracle-health-config"
-      publisher            = "Microsoft.Azure.Extensions"
-      type                 = "CustomScript"
-      type_handler_version = "2.1"
-
-      auto_upgrade_minor_version = true
-      automatic_upgrade_enabled  = false
-
-      settings = jsonencode({
-        commandToExecute = "/opt/oracle-health/configure-health-agent.sh ${var.oracle_listener_port}"
-      })
-
-      protected_settings = null
-    }
-  }
-
-  accelerated_networking_enabled = true
-  ip_forwarding_enabled          = false
-  enable_boot_diagnostics        = true
-  encryption_at_host_enabled     = false
-  patch_mode_linux               = "ImageDefault"
-
-  tags = local.tags
 }
