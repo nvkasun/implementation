@@ -1,1 +1,28 @@
-Following the successful implementation and validation of the source_image_id enhancement, and as part of aligning the Oracle VM deployment with the current business and operational requirements, the deployment model has been refined so that the specialized Azure Compute Gallery image contains only the OS disk, while the Oracle data disk is provisioned and attached separately through the Terraform VM module.
+## Title
+
+Specialized Azure Compute Gallery VM – CMK/DES handling required during VM creation with `source_image_id`
+
+## Background
+
+The recent `source_image_id` enhancement successfully enabled the VM module to consume Azure Compute Gallery image versions, including our specialized RHEL image use case.
+
+As part of aligning the Oracle VM deployment with the current business and operational requirements, the deployment model now uses:
+
+- A specialized Azure Compute Gallery image containing the OS disk only.
+- A separate managed data disk created and attached through the VM Terraform module.
+- Customer-Managed Key (CMK) encryption enforced for both OS and data disks.
+
+The environment has an Azure Policy requirement that CMK must be enforced at resource creation time.
+
+## Issue
+
+When provisioning a new Linux VM from the specialized Azure Compute Gallery image using `source_image_id`, the OS managed disk is successfully created from the gallery image with the module Disk Encryption Set (DES).
+
+The separately provisioned data disk is also created successfully with the same DES/CMK configuration.
+
+However, during creation of the specialized Linux VM, Azure Policy rejects the VM creation request with the following error:
+
+```text
+RequestDisallowedByPolicy
+
+Customer-Managed Keys (CMK) must be enforced at the time of resource creation.
