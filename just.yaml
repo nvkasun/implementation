@@ -1,28 +1,14 @@
-## Title
+Hi Rizwan, Maria,
 
-Specialized Azure Compute Gallery VM – CMK/DES handling required during VM creation with `source_image_id`
+Thank you for the update and support.
 
-## Background
+I have completed the validation using the latest branch shared by Rizwan. I was able to successfully provision a new VM from the specialized Azure Compute Gallery image using source_image_id, and the deployment completed without encountering the previous CMK policy issue.
 
-The recent `source_image_id` enhancement successfully enabled the VM module to consume Azure Compute Gallery image versions, including our specialized RHEL image use case.
+I also verified that the OS disk and the separately provisioned data disk are using the expected CMK/DES configuration.
 
-As part of aligning the Oracle VM deployment with the current business and operational requirements, the deployment model now uses:
+From our side, the latest changes are working as expected. Rizwan, could you please proceed with merging these changes into the main branch when convenient?
 
-- A specialized Azure Compute Gallery image containing the OS disk only.
-- A separate managed data disk created and attached through the VM Terraform module.
-- Customer-Managed Key (CMK) encryption enforced for both OS and data disks.
+Thanks again for your support and coordination.
 
-The environment has an Azure Policy requirement that CMK must be enforced at resource creation time.
-
-## Issue
-
-When provisioning a new Linux VM from the specialized Azure Compute Gallery image using `source_image_id`, the OS managed disk is successfully created from the gallery image with the module Disk Encryption Set (DES).
-
-The separately provisioned data disk is also created successfully with the same DES/CMK configuration.
-
-However, during creation of the specialized Linux VM, Azure Policy rejects the VM creation request with the following error:
-
-```text
-RequestDisallowedByPolicy
-
-Customer-Managed Keys (CMK) must be enforced at the time of resource creation.
+Kind Regards,
+Kasun
