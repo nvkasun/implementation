@@ -1,91 +1,57 @@
 # ============================================================
-# Oracle on Azure - Internal Load Balancer
+# Oracle on Azure - Binary Blob Storage
 # ============================================================
 
-resource "azurerm_lb" "oracle_db" {
+module "oracle_binary_storage" {
   count = var.oracle_vm_on_azure_enabled ? 1 : 0
 
-  name                = "lb-cibg-${var.environment}-uaenorth-oracledb"
-  location            = var.location
-  resource_group_name = module.oracle_vm_resource_group[0].rg_name
+  source = "git::https://github.com/AbuDhabiCommercialBank/maz-tf-module-storage.git?ref=main"
 
-  sku      = "Standard"
-  sku_tier = "Regional"
+  resource_group = module.oracle_vm_resource_group[0].rg_name
+  location       = var.location
+  environment    = var.environment
 
-  frontend_ip_configuration {
-    name = "fe-oracledb"
+  application_name = "oraclebinary"
 
-    subnet_id = module.base-infra.subnet_map[
-      "snet-oracle-vm-cibg-uaenorth-001"
-    ].id
+  # Storage account names must be globally unique.
+  # Validate the final name before deployment.
+  storage_account_name = "cibg${var.environment}orabin"
 
-    private_ip_address_allocation = "Dynamic"
-  }
+  storage_use = "orabin"
 
-  tags = local.tags
-}
+  account_kind = "StorageV2"
+  skuname      = "Standard_LRS"
 
+  public_network_access_enabled   = false
+  allow_nested_items_to_be_public = false
 
-resource "azurerm_lb_backend_address_pool" "oracle_db" {
-  count = var.oracle_vm_on_azure_enabled ? 1 : 0
-
-  name            = "be-oracledb"
-  loadbalancer_id = azurerm_lb.oracle_db[0].id
-}
-
-
-locals {
-  oracle_db_backend_nics = var.oracle_vm_on_azure_enabled ? {
-    vm01 = module.oracle_binary_vm01[0].network_interface_id
-    vm02 = module.oracle_binary_vm02[0].network_interface_id
-  } : {}
-}
-
-
-resource "azurerm_network_interface_backend_address_pool_association" "oracle_db" {
-  for_each = local.oracle_db_backend_nics
-
-  network_interface_id    = each.value
-  ip_configuration_name   = "internal"
-  backend_address_pool_id = azurerm_lb_backend_address_pool.oracle_db[0].id
-}
-
-
-resource "azurerm_lb_probe" "oracle_db_health" {
-  count = var.oracle_vm_on_azure_enabled ? 1 : 0
-
-  name            = "hp-oracledb"
-  loadbalancer_id = azurerm_lb.oracle_db[0].id
-
-  protocol     = "Http"
-  port         = 8080
-  request_path = "/health"
-
-  interval_in_seconds = 5
-  number_of_probes    = 2
-}
-
-
-resource "azurerm_lb_rule" "oracle_db" {
-  count = var.oracle_vm_on_azure_enabled ? 1 : 0
-
-  name            = "lbr-oracledb-${var.oracle_listener_port}"
-  loadbalancer_id = azurerm_lb.oracle_db[0].id
-
-  protocol = "Tcp"
-
-  frontend_port = var.oracle_listener_port
-  backend_port  = var.oracle_listener_port
-
-  frontend_ip_configuration_name = "fe-oracledb"
-
-  backend_address_pool_ids = [
-    azurerm_lb_backend_address_pool.oracle_db[0].id
+  containers_list = [
+    {
+      name        = "oracle-binaries"
+      access_type = "private"
+    }
   ]
 
-  probe_id = azurerm_lb_probe.oracle_db_health[0].id
+  privatelink_subnet = {
+    name = module.base-infra.subnet_map[
+      "snet-cloud-native-pe-cibg-uaenorth-001"
+    ].name
 
-  idle_timeout_in_minutes = 30
-  tcp_reset_enabled       = true
-  floating_ip_enabled     = false
+    vnet_name      = module.base-infra.vnet_name
+    resource_group = module.resource_group.rg_name
+  }
+
+  private_dns_zone_ids = [
+    data.azurerm_private_dns_zone.sa_dns_zone.id
+  ]
+
+  customer_managed_key = true
+  managed_identity_type = "UserAssigned"
+
+  azurerm_key_vault_key = "oracle-binary-storage-key"
+  kv_name                = basename(module.azure_key_vault.id)
+
+  kv_resource_group_name = module.resource_group.rg_name
+
+  tags = local.tags
 }
