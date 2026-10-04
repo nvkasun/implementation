@@ -1,11 +1,5 @@
-Now rerun the Oracle binary checks:
-sudo find /OraHome /u01 /opt -type f \( -name sqlplus -o -name lsnrctl \) -print
+Run this simpler one-liner instead:
+sudo -iu oracle bash -lc 'echo "USER=$USER"; echo "ORACLE_HOME=$ORACLE_HOME"; echo "PATH=$PATH"; command -v sqlplus || echo "sqlplus not in PATH"; command -v lsnrctl || echo "lsnrctl not in PATH"'
 
-Then also check the Oracle user's login environment:
-sudo -iu oracle bash -lc '
-echo "USER=$USER"
-echo "ORACLE_HOME=$ORACLE_HOME"
-echo "PATH=$PATH"
-command -v sqlplus || echo "sqlplus not in PATH"
-command -v lsnrctl || echo "lsnrctl not in PATH"
-'
+And let's also search the entire VM once:
+sudo find / -type f \( -name sqlplus -o -name lsnrctl \) 2>/dev/null
