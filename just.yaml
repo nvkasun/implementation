@@ -1,6 +1,37 @@
-sudo chown root:root /opt/oracle-health/configure-health-agent.sh
-sudo chmod 0755 /opt/oracle-health/configure-health-agent.sh
+sudo systemctl stop oracle-health.service || true
+sudo systemctl disable oracle-health.service || true
+sudo rm -f /etc/systemd/system/oracle-health.service
+sudo systemctl daemon-reload
+sudo systemctl reset-failed
 
-ls -l /opt/oracle-health/configure-health-agent.sh
+Then verify:
+sudo systemctl status oracle-health.service
 
-bash -n /opt/oracle-health/configure-health-agent.sh
+Expected:
+Unit oracle-health.service could not be found.
+
+Also check:
+sudo ss -lntp | grep ':8080'
+
+There should be no output.
+Then check what is currently inside:
+ls -la /opt/oracle-health/
+
+Ideally before image capture, keep only the reusable installer:
+/opt/oracle-health/configure-health-agent.sh
+
+If you also have an old generated:
+oracle_health.py
+
+from the previous installation, I’d remove that too, because your installer can recreate it later:
+sudo rm -f /opt/oracle-health/oracle_health.py
+
+Then final image-state check:
+ls -la /opt/oracle-health/
+
+sudo test -x /opt/oracle-health/configure-health-agent.sh \
+  && echo "Installer ready"
+
+sudo systemctl status oracle-health.service || true
+
+sudo ss -lntp | grep ':8080' || echo "No health endpoint running"
