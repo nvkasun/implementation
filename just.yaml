@@ -1,5 +1,28 @@
-Run this simpler one-liner instead:
-sudo -iu oracle bash -lc 'echo "USER=$USER"; echo "ORACLE_HOME=$ORACLE_HOME"; echo "PATH=$PATH"; command -v sqlplus || echo "sqlplus not in PATH"; command -v lsnrctl || echo "lsnrctl not in PATH"'
+1. Fix /dev/null:
+sudo chmod 666 /dev/null
+ls -l /dev/null
 
-And let's also search the entire VM once:
-sudo find / -type f \( -name sqlplus -o -name lsnrctl \) 2>/dev/null
+You want:
+crw-rw-rw- ... /dev/null
+
+2. Replace the current installer with the updated health-agent script at:
+/opt/oracle-health/configure-health-agent.sh
+
+Then:
+sudo chown root:root /opt/oracle-health/configure-health-agent.sh
+sudo chmod 0755 /opt/oracle-health/configure-health-agent.sh
+bash -n /opt/oracle-health/configure-health-agent.sh
+
+3. Make sure you clean any old generated health-agent state before capturing the image:
+sudo systemctl stop oracle-health.service || true
+sudo systemctl disable oracle-health.service || true
+sudo rm -f /etc/systemd/system/oracle-health.service
+sudo rm -f /opt/oracle-health/oracle_health.py
+sudo rm -rf /opt/oracle-health/__pycache__
+sudo systemctl daemon-reload
+sudo systemctl reset-failed
+
+4. Verify the image source is clean:
+sudo systemctl status oracle-health.service || true
+sudo ss -lntp | grep ':8080' || echo "No health endpoint running"
+ls -la /opt/oracle-health/
