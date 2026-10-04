@@ -1,514 +1,860 @@
-name: Oracle DB on Azure Release
-
-run-name: >-
-  Oracle DB on Azure - ${{ inputs.mode }} -
-  ${{ inputs.environment }} -
-  Listener ${{ inputs.oracle_listener_port }} -
-  by ${{ github.actor }}
-
-on:
-  workflow_dispatch:
-    inputs:
-
-      environment:
-        description: "Target environment"
-        type: choice
-        required: true
-        options:
-          - tf-dev
-
-      mode:
-        description: "Run mode"
-        type: choice
-        required: true
-        default: plan
-        options:
-          - plan
-          - plan_and_apply
-
-      oracle_listener_port:
-        description: "Oracle DB listener port configured by DBA"
-        type: string
-        required: true
-        default: "1800"
-
-      terraform_version:
-        description: "Terraform version"
-        type: string
-        required: true
-        default: "1.6.3"
-
-
-permissions:
-  contents: read
-  id-token: write
-
-
+#!/usr/bin/env bash
+set -euo pipefail
 # ============================================================
-# CCOE APPROVAL
+# Oracle VM health-agent installer for reusable custom image
+# Tested design target:
+#   RHEL 9.x
+#   Python 3.9+
+#   Oracle Home : /OraHome/ora26ai_DB_Home
+#   Oracle SID  : DFCASHUAT1
+#   Service     : DFCASHUAT1
+#   Health URL  : http://0.0.0.0:8080/health
 # ============================================================
-
-jobs:
-
-  Approval-CCOE:
-    name: CCOE Approval
-    runs-on: ubuntu-latest
-    environment: approval-ccoe
-
-    steps:
-      - name: Approval CCOE
-        run: |
-          echo "CCOE approval completed."
-
-
-  # ==========================================================
-  # TERRAFORM INIT
-  #
-  # Purpose:
-  # - Validate Oracle listener port supplied by DBA
-  # - Obtain CICD GitHub App token
-  # - Checkout CIBG repository
-  # - Authenticate access to private Terraform modules
-  # - Download Terraform providers/modules
-  # - Upload .terraform for the self-hosted plan runner
-  # ==========================================================
-
-  terraform-init:
-    name: Terraform Init
-    needs:
-      - Approval-CCOE
-
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
-
-    env:
-      TFVARS_ENV: ${{ vars.TFVARS_ENV }}
-
-    steps:
-
-      # -------------------------------------------------------
-      # Validate listener port before doing any Terraform work.
-      #
-      # This range matches variables.tf:
-      # 1700 <= oracle_listener_port <= 1900
-      # -------------------------------------------------------
-
-      - name: Validate Oracle listener port
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ORACLE_PORT="${{ inputs.oracle_listener_port }}"
-
-          echo "Validating Oracle listener port..."
-
-          if ! [[ "${ORACLE_PORT}" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: Oracle listener port must be numeric."
-            exit 1
-          fi
-
-          if (( ORACLE_PORT < 1700 || ORACLE_PORT > 1900 )); then
-            echo "ERROR: Oracle listener port must be between 1700 and 1900."
-            exit 1
-          fi
-
-          echo "Oracle listener port accepted: ${ORACLE_PORT}"
-
-
-      - name: Create CICD Bot token
-        id: cicd-bot-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ vars.CICD_BOT_APP_ID || '981379' }}
-          private-key: ${{ secrets.CICD_BOT_APP_KEY }}
-          owner: ${{ github.repository_owner }}
-
-
-      - name: Checkout CIBG repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ steps.cicd-bot-token.outputs.token }}
-          persist-credentials: false
-
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ inputs.terraform_version }}
-          terraform_wrapper: false
-
-
-      - name: Terraform Init - Download Providers and Private Modules
-        working-directory: terraform
-
-        env:
-          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
-
-        run: |
-          set -euo pipefail
-
-          echo "::add-mask::$GH_TOKEN"
-
-          #
-          # Authenticate private Terraform module Git downloads
-          # using the CICD GitHub App token.
-          #
-
-          export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf"
-          export GIT_CONFIG_VALUE_0="https://github.com/"
-
-          terraform init -backend=false
-
-          terraform validate
-
-          tar -czf terraform_modules.tar.gz .terraform
-
-          if [ -f .terraform.lock.hcl ]; then
-            tar -czf terraform_lock.tar.gz .terraform.lock.hcl
-          fi
-
-
-      - name: Upload Terraform Modules
-        uses: actions/upload-artifact@v4
-        with:
-          name: oracle-terraform-modules
-          path: terraform/terraform_modules.tar.gz
-          retention-days: 1
-
-
-      - name: Upload Terraform Lock
-        uses: actions/upload-artifact@v4
-        with:
-          name: oracle-terraform-lock
-          path: terraform/terraform_lock.tar.gz
-          retention-days: 1
-          if-no-files-found: ignore
-
-
-  # ==========================================================
-  # TERRAFORM PLAN
-  #
-  # Oracle DB listener port is supplied dynamically by the
-  # workflow user based on the port configured by DBA.
-  #
-  # Example:
-  # workflow input = 1850
-  #
-  # var.oracle_listener_port = 1850
-  # ==========================================================
-
-  terraform-plan:
-    name: Terraform Plan
-    needs:
-      - terraform-init
-
-    runs-on: self-hosted
-    environment: ${{ inputs.environment }}
-
-    env:
-      TFVARS_ENV: ${{ vars.TFVARS_ENV }}
-
-      AZURE_IDENTITY: ${{ vars.AZURE_IDENTITY }}
-      AZURE_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION }}
-      AZURE_TENANT: ${{ vars.AZURE_TENANT }}
-
-      ARM_CLIENT_ID: ${{ vars.AZURE_IDENTITY }}
-      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION }}
-      ARM_TENANT_ID: ${{ vars.AZURE_TENANT }}
-      ARM_USE_OIDC: "true"
-
-      ORACLE_LISTENER_PORT: ${{ inputs.oracle_listener_port }}
-
-    steps:
-
-      - name: Create CICD Bot token
-        id: cicd-bot-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ vars.CICD_BOT_APP_ID || '981379' }}
-          private-key: ${{ secrets.CICD_BOT_APP_KEY }}
-          owner: ${{ github.repository_owner }}
-
-
-      - name: Checkout CIBG repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ steps.cicd-bot-token.outputs.token }}
-          persist-credentials: false
-
-
-      - name: Download Terraform Modules
-        uses: actions/download-artifact@v4
-        with:
-          name: oracle-terraform-modules
-          path: terraform
-
-
-      - name: Download Terraform Lock
-        uses: actions/download-artifact@v4
-        with:
-          name: oracle-terraform-lock
-          path: terraform
-
-
-      - name: Extract Terraform Modules
-        working-directory: terraform
-        run: |
-          set -euo pipefail
-
-          tar -xzf terraform_modules.tar.gz
-
-          if [ -f terraform_lock.tar.gz ]; then
-            tar -xzf terraform_lock.tar.gz
-          fi
-
-          rm -f terraform_modules.tar.gz terraform_lock.tar.gz
-
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ inputs.terraform_version }}
-          terraform_wrapper: false
-
-
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ env.AZURE_IDENTITY }}
-          tenant-id: ${{ env.AZURE_TENANT }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION }}
-
-
-      - name: Terraform Init
-        working-directory: terraform
-
-        env:
-          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
-
-        run: |
-          set -euo pipefail
-
-          echo "::add-mask::$GH_TOKEN"
-
-          export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf"
-          export GIT_CONFIG_VALUE_0="https://github.com/"
-
-          terraform init \
-            -plugin-dir="$PWD/.terraform/providers" \
-            -backend-config="config/${TFVARS_ENV}.config"
-
-
-      # -------------------------------------------------------
-      # Terraform CLI -var has higher precedence than tfvars.
-      #
-      # Therefore:
-      #
-      # dev.tfvars:
-      # oracle_listener_port = 1800
-      #
-      # Workflow:
-      # oracle_listener_port = 1850
-      #
-      # Effective Terraform value:
-      # var.oracle_listener_port = 1850
-      # -------------------------------------------------------
-
-      - name: Terraform Plan - Oracle DB on Azure
-        working-directory: terraform
-
-        env:
-          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
-
-        run: |
-          set -euo pipefail
-
-          echo "::add-mask::$GH_TOKEN"
-
-          export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf"
-          export GIT_CONFIG_VALUE_0="https://github.com/"
-
-          echo "======================================================"
-          echo "Planning Oracle DB on Azure"
-          echo "Environment          : ${TFVARS_ENV}"
-          echo "Oracle listener port : ${ORACLE_LISTENER_PORT}"
-          echo "======================================================"
-
-          terraform plan \
-            -no-color \
-            -input=false \
-            --target=module.base-infra \
-            --target=module.oracle_vm_resource_group \
-            --target=azurerm_user_assigned_identity.oracle_binary_vm \
-            --target=module.oracle_binary_vm01 \
-            --target=module.oracle_binary_vm02 \
-            --target=azurerm_lb.oracle_db \
-            --target=azurerm_lb_backend_address_pool.oracle_db \
-            --target=azurerm_network_interface_backend_address_pool_association.oracle_db \
-            --target=azurerm_lb_probe.oracle_db_health \
-            --target=azurerm_lb_rule.oracle_db \
-            --target=module.oracle_binary_storage \
-            --target=azurerm_role_assignment.oracle_binary_blob_access \
-            --target=azurerm_private_dns_zone_virtual_network_link.oracle_binary_storage \
-            -var-file="tfvars/${TFVARS_ENV}.tfvars" \
-            -var="oracle_listener_port=${ORACLE_LISTENER_PORT}" \
-            -out=oracle-plan.tfout
-
-
-      - name: Show Terraform Plan
-        working-directory: terraform
-        run: |
-          terraform show -no-color oracle-plan.tfout
-
-
-      - name: Upload Oracle Terraform Plan
-        uses: actions/upload-artifact@v4
-        with:
-          name: oracle-terraform-plan
-          path: terraform/oracle-plan.tfout
-          retention-days: 1
-
-
-  # ==========================================================
-  # TERRAFORM APPLY
-  #
-  # Runs only when mode = plan_and_apply.
-  #
-  # IMPORTANT:
-  # We DO NOT need to pass oracle_listener_port again here.
-  #
-  # oracle-plan.tfout already contains the exact resolved
-  # Terraform value selected during terraform plan.
-  # ==========================================================
-
-  terraform-apply:
-    name: Terraform Apply
-
-    if: ${{ inputs.mode == 'plan_and_apply' }}
-
-    needs:
-      - terraform-plan
-
-    runs-on: self-hosted
-    environment: ${{ inputs.environment }}
-
-    env:
-      TFVARS_ENV: ${{ vars.TFVARS_ENV }}
-
-      AZURE_IDENTITY: ${{ vars.AZURE_IDENTITY }}
-      AZURE_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION }}
-      AZURE_TENANT: ${{ vars.AZURE_TENANT }}
-
-      ARM_CLIENT_ID: ${{ vars.AZURE_IDENTITY }}
-      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION }}
-      ARM_TENANT_ID: ${{ vars.AZURE_TENANT }}
-      ARM_USE_OIDC: "true"
-
-      ORACLE_LISTENER_PORT: ${{ inputs.oracle_listener_port }}
-
-    steps:
-
-      - name: Create CICD Bot token
-        id: cicd-bot-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ vars.CICD_BOT_APP_ID || '981379' }}
-          private-key: ${{ secrets.CICD_BOT_APP_KEY }}
-          owner: ${{ github.repository_owner }}
-
-
-      - name: Checkout CIBG repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ steps.cicd-bot-token.outputs.token }}
-          persist-credentials: false
-
-
-      - name: Download Terraform Modules
-        uses: actions/download-artifact@v4
-        with:
-          name: oracle-terraform-modules
-          path: terraform
-
-
-      - name: Download Terraform Lock
-        uses: actions/download-artifact@v4
-        with:
-          name: oracle-terraform-lock
-          path: terraform
-
-
-      - name: Download Oracle Terraform Plan
-        uses: actions/download-artifact@v4
-        with:
-          name: oracle-terraform-plan
-          path: terraform
-
-
-      - name: Extract Terraform Modules
-        working-directory: terraform
-        run: |
-          set -euo pipefail
-
-          tar -xzf terraform_modules.tar.gz
-
-          if [ -f terraform_lock.tar.gz ]; then
-            tar -xzf terraform_lock.tar.gz
-          fi
-
-          rm -f terraform_modules.tar.gz terraform_lock.tar.gz
-
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ inputs.terraform_version }}
-          terraform_wrapper: false
-
-
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ env.AZURE_IDENTITY }}
-          tenant-id: ${{ env.AZURE_TENANT }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION }}
-
-
-      - name: Terraform Init
-        working-directory: terraform
-
-        env:
-          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
-
-        run: |
-          set -euo pipefail
-
-          echo "::add-mask::$GH_TOKEN"
-
-          export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf"
-          export GIT_CONFIG_VALUE_0="https://github.com/"
-
-          terraform init \
-            -plugin-dir="$PWD/.terraform/providers" \
-            -backend-config="config/${TFVARS_ENV}.config"
-
-
-      - name: Terraform Apply - Oracle DB on Azure
-        working-directory: terraform
-        run: |
-          set -euo pipefail
-
-          echo "======================================================"
-          echo "Applying approved Oracle DB on Azure Terraform plan"
-          echo "Environment          : ${TFVARS_ENV}"
-          echo "Oracle listener port : ${ORACLE_LISTENER_PORT}"
-          echo "======================================================"
-
-          terraform apply \
-            -input=false \
-            -auto-approve \
-            oracle-plan.tfout
+ORACLE_HOME="${ORACLE_HOME:-/OraHome/ora26ai_DB_Home}"
+ORACLE_SID="${ORACLE_SID:-DFCASHUAT1}"
+TARGET_PDB="${TARGET_PDB:-}"
+TARGET_SERVICE="${TARGET_SERVICE:-DFCASHUAT1}"
+HEALTH_HOST="${HEALTH_HOST:-0.0.0.0}"
+HEALTH_PORT="${HEALTH_PORT:-8080}"
+ORACLE_PORT="${ORACLE_PORT:-1521}"
+# Validate the Oracle listener port supplied at deployment time.
+# Terraform/GitHub Actions passes this as ORACLE_PORT=<DBA-provided-port>.
+if ! [[ "${ORACLE_PORT}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: ORACLE_PORT must be numeric. Received: ${ORACLE_PORT}"
+  exit 1
+fi
+if (( ORACLE_PORT < 1700 || ORACLE_PORT > 1900 )); then
+  echo "ERROR: ORACLE_PORT must be between 1700 and 1900. Received: ${ORACLE_PORT}"
+  exit 1
+fi
+echo "==> Oracle listener port received: ${ORACLE_PORT}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
+SUCCESS_THRESHOLD="${SUCCESS_THRESHOLD:-2}"
+FAILURE_THRESHOLD="${FAILURE_THRESHOLD:-3}"
+SQL_TIMEOUT="${SQL_TIMEOUT:-8}"
+COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-8}"
+MAX_ACTIVE_SESSIONS="${MAX_ACTIVE_SESSIONS:-}"
+MAX_SESSION_UTILIZATION_PERCENT="${MAX_SESSION_UTILIZATION_PERCENT:-}"
+MAX_BLOCKING_SESSIONS="${MAX_BLOCKING_SESSIONS:-}"
+LB_PROBE_IP="${LB_PROBE_IP:-168.63.129.16/32}"
+INSTALL_DIR="/opt/oracle-health"
+AGENT="${INSTALL_DIR}/oracle_health.py"
+SERVICE="/etc/systemd/system/oracle-health.service"
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "ERROR: Run this script with sudo/root."
+  echo "Example: sudo bash $0"
+  exit 1
+fi
+echo "==> Pre-flight checks"
+id oracle >/dev/null 2>&1 || {
+  echo "ERROR: OS user 'oracle' does not exist."
+  exit 1
+}
+getent group dba >/dev/null 2>&1 || {
+  echo "ERROR: OS group 'dba' does not exist."
+  exit 1
+}
+/usr/bin/python3 --version
+for f in \
+  "${ORACLE_HOME}/bin/sqlplus" \
+  "${ORACLE_HOME}/bin/lsnrctl"
+do
+  if [[ ! -x "${f}" ]]; then
+    echo "ERROR: Required Oracle executable not found/executable: ${f}"
+    exit 1
+  fi
+done
+[[ -d /OraHome ]] || {
+  echo "ERROR: /OraHome does not exist."
+  exit 1
+}
+[[ -d /OraData ]] || {
+  echo "ERROR: /OraData does not exist."
+  exit 1
+}
+echo "==> Creating ${INSTALL_DIR}"
+install -d -o oracle -g dba -m 0750 "${INSTALL_DIR}"
+echo "==> Writing health agent"
+cat > "${AGENT}" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import re
+import socket
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+HEALTH_HOST = os.environ.get("HEALTH_HOST", "0.0.0.0")
+HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
+ORACLE_HOME = os.environ.get("ORACLE_HOME", "").strip()
+ORACLE_SID = os.environ.get("ORACLE_SID", "").strip()
+ORACLE_PORT = int(os.environ.get("ORACLE_PORT", "1521"))
+TARGET_PDB = os.environ.get("TARGET_PDB", "").strip()
+TARGET_SERVICE = os.environ.get("TARGET_SERVICE", "").strip()
+MAX_ACTIVE_SESSIONS = os.environ.get("MAX_ACTIVE_SESSIONS", "").strip()
+MAX_SESSION_UTILIZATION_PERCENT = os.environ.get(
+    "MAX_SESSION_UTILIZATION_PERCENT", ""
+).strip()
+MAX_BLOCKING_SESSIONS = os.environ.get("MAX_BLOCKING_SESSIONS", "").strip()
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "5"))
+SUCCESS_THRESHOLD = int(os.environ.get("SUCCESS_THRESHOLD", "2"))
+FAILURE_THRESHOLD = int(os.environ.get("FAILURE_THRESHOLD", "3"))
+SQL_TIMEOUT = int(os.environ.get("SQL_TIMEOUT", "8"))
+COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "8"))
+SQLPLUS = os.path.join(ORACLE_HOME, "bin", "sqlplus")
+LSNRCTL = os.path.join(ORACLE_HOME, "bin", "lsnrctl")
+state_lock = threading.Lock()
+state = {
+    "healthy": False,
+    "status": "STARTING",
+    "oracle_sid": ORACLE_SID or None,
+    "database_name": None,
+    "database_role": None,
+    "cdb": None,
+    "target_pdb": None,
+    "target_service": None,
+    "pdb_open_mode": None,
+    "pdb_restricted": None,
+    "sql_query": False,
+    "listener_running": False,
+    "listener_name": None,
+    "listener_port": None,
+    "listener_reachable": False,
+    "service_registered": False,
+    "service_ready": False,
+    "active_sessions": None,
+    "total_user_sessions": None,
+    "blocked_sessions": None,
+    "blocking_sessions": None,
+    "session_current_utilization": None,
+    "session_limit": None,
+    "session_utilization_percent": None,
+    "consecutive_successes": 0,
+    "consecutive_failures": 0,
+    "last_check": None,
+    "last_error": None,
+}
+def oracle_environment():
+    env = os.environ.copy()
+    env["ORACLE_HOME"] = ORACLE_HOME
+    env["ORACLE_SID"] = ORACLE_SID
+    env["PATH"] = ORACLE_HOME + "/bin:" + env.get("PATH", "")
+    env["LD_LIBRARY_PATH"] = (
+        ORACLE_HOME + "/lib:" + env.get("LD_LIBRARY_PATH", "")
+    )
+    return env
+def run_process(command, input_data=None, timeout=COMMAND_TIMEOUT):
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if input_data is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=oracle_environment(),
+        text=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(input=input_data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        raise RuntimeError(
+            "Command timed out: %s; stdout=%s; stderr=%s"
+            % (" ".join(command), stdout.strip(), stderr.strip())
+        )
+    return proc.returncode, stdout, stderr
+def validate_runtime():
+    if not ORACLE_HOME:
+        raise RuntimeError("ORACLE_HOME is not configured")
+    if not ORACLE_SID:
+        raise RuntimeError("ORACLE_SID is not configured")
+    if not os.path.isfile(SQLPLUS) or not os.access(SQLPLUS, os.X_OK):
+        raise RuntimeError("SQLPlus is not executable at %s" % SQLPLUS)
+    if not os.path.isfile(LSNRCTL) or not os.access(LSNRCTL, os.X_OK):
+        raise RuntimeError("LSNRCTL is not executable at %s" % LSNRCTL)
+def run_sql(sql):
+    return_code, stdout, stderr = run_process(
+        [SQLPLUS, "-s", "/ as sysdba"],
+        input_data=sql,
+        timeout=SQL_TIMEOUT,
+    )
+    if return_code != 0:
+        raise RuntimeError(
+            "SQLPlus failed: %s"
+            % (stderr.strip() or stdout.strip() or "exit code %s" % return_code)
+        )
+    return stdout
+def collect_database_inventory():
+    sql = r"""
+WHENEVER SQLERROR EXIT 2
+WHENEVER OSERROR EXIT 3
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF TRIMSPOOL ON
+SELECT 'CHECK=1' FROM dual;
+SELECT 'DB_NAME=' || TRIM(name) FROM v$database;
+SELECT 'DB_OPEN_MODE=' || TRIM(open_mode) FROM v$database;
+SELECT 'DATABASE_ROLE=' || TRIM(database_role) FROM v$database;
+SELECT 'CDB=' || TRIM(cdb) FROM v$database;
+SELECT
+    'PDB=' ||
+    TRIM(name) || '|' ||
+    con_id || '|' ||
+    TRIM(open_mode) || '|' ||
+    TRIM(restricted)
+FROM v$pdbs
+WHERE UPPER(name) <> 'PDB$SEED'
+ORDER BY con_id;
+SELECT
+    'SERVICE=' ||
+    TRIM(name) || '|' ||
+    TRIM(NVL(network_name, '')) || '|' ||
+    con_id
+FROM v$services
+WHERE name NOT IN ('SYS$BACKGROUND', 'SYS$USERS')
+ORDER BY con_id, name;
+SELECT
+    'SESSIONS=' ||
+    con_id || '|' ||
+    SUM(CASE WHEN type = 'USER' THEN 1 ELSE 0 END) || '|' ||
+    SUM(CASE WHEN type = 'USER' AND status = 'ACTIVE' THEN 1 ELSE 0 END) || '|' ||
+    SUM(CASE WHEN type = 'USER' AND blocking_session IS NOT NULL THEN 1 ELSE 0 END)
+FROM v$session
+GROUP BY con_id
+ORDER BY con_id;
+SELECT
+    'BLOCKERS=' ||
+    w.con_id || '|' ||
+    COUNT(DISTINCT b.sid)
+FROM v$session w
+JOIN v$session b
+  ON b.sid = w.blocking_session
+WHERE w.type = 'USER'
+  AND w.blocking_session IS NOT NULL
+GROUP BY w.con_id
+ORDER BY w.con_id;
+SELECT
+    'SESSION_RESOURCE=' ||
+    current_utilization || '|' ||
+    limit_value
+FROM v$resource_limit
+WHERE resource_name = 'sessions';
+EXIT;
+"""
+    output = run_sql(sql)
+    inventory = {
+        "database_name": None,
+        "database_open_mode": None,
+        "database_role": None,
+        "cdb": None,
+        "pdbs": [],
+        "services": {},
+        "sessions": {},
+        "blockers": {},
+        "session_current_utilization": None,
+        "session_limit": None,
+        "session_utilization_percent": None,
+    }
+    check_ok = False
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "CHECK=1":
+            check_ok = True
+        elif line.startswith("DB_NAME="):
+            inventory["database_name"] = line.split("=", 1)[1].strip()
+        elif line.startswith("DB_OPEN_MODE="):
+            inventory["database_open_mode"] = line.split("=", 1)[1].strip()
+        elif line.startswith("DATABASE_ROLE="):
+            inventory["database_role"] = line.split("=", 1)[1].strip()
+        elif line.startswith("CDB="):
+            inventory["cdb"] = line.split("=", 1)[1].strip().upper()
+        elif line.startswith("PDB="):
+            parts = line.split("=", 1)[1].split("|")
+            if len(parts) == 4:
+                inventory["pdbs"].append({
+                    "name": parts[0].strip(),
+                    "con_id": int(parts[1]),
+                    "open_mode": parts[2].strip(),
+                    "restricted": parts[3].strip().upper(),
+                })
+        elif line.startswith("SERVICE="):
+            parts = line.split("=", 1)[1].split("|")
+            if len(parts) == 3:
+                con_id = int(parts[2])
+                inventory["services"].setdefault(con_id, []).append({
+                    "name": parts[0].strip(),
+                    "network_name": parts[1].strip(),
+                })
+        elif line.startswith("SESSIONS="):
+            parts = line.split("=", 1)[1].split("|")
+            if len(parts) == 4:
+                inventory["sessions"][int(parts[0])] = {
+                    "total": int(parts[1]),
+                    "active": int(parts[2]),
+                    "blocked": int(parts[3]),
+                }
+        elif line.startswith("BLOCKERS="):
+            parts = line.split("=", 1)[1].split("|")
+            if len(parts) == 2:
+                inventory["blockers"][int(parts[0])] = int(parts[1])
+        elif line.startswith("SESSION_RESOURCE="):
+            parts = line.split("=", 1)[1].split("|")
+            if len(parts) == 2:
+                try:
+                    current_value = int(float(parts[0]))
+                    limit_value = int(float(parts[1]))
+                    inventory["session_current_utilization"] = current_value
+                    inventory["session_limit"] = limit_value
+                    if limit_value > 0:
+                        inventory["session_utilization_percent"] = round(
+                            (current_value / float(limit_value)) * 100.0, 2
+                        )
+                except ValueError:
+                    pass
+    if not check_ok:
+        raise RuntimeError("Oracle validation query did not return CHECK=1")
+    if not inventory["database_name"]:
+        raise RuntimeError("Unable to determine Oracle database name")
+    return inventory
+def choose_target_database(inventory):
+    if inventory["database_open_mode"] != "READ WRITE":
+        raise RuntimeError(
+            "Database OPEN_MODE is %s"
+            % (inventory["database_open_mode"] or "UNKNOWN")
+        )
+    # Non-CDB: validate the root database itself.
+    if inventory["cdb"] != "YES":
+        return {
+            "name": inventory["database_name"],
+            "con_id": 0,
+            "open_mode": inventory["database_open_mode"],
+            "restricted": "NO",
+            "is_pdb": False,
+        }
+    application_pdbs = inventory["pdbs"]
+    # Explicit PDB always wins.
+    if TARGET_PDB:
+        matches = [
+            pdb for pdb in application_pdbs
+            if pdb["name"].upper() == TARGET_PDB.upper()
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Configured TARGET_PDB '%s' was not found" % TARGET_PDB
+            )
+        target = matches[0]
+        if target["open_mode"] != "READ WRITE":
+            raise RuntimeError(
+                "Target PDB '%s' OPEN_MODE is %s"
+                % (target["name"], target["open_mode"])
+            )
+        if target["restricted"] == "YES":
+            raise RuntimeError(
+                "Target PDB '%s' is in Restricted mode" % target["name"]
+            )
+        target = dict(target)
+        target["is_pdb"] = True
+        return target
+    # VM4 currently has no application PDB. In that case health-check CDB$ROOT.
+    if len(application_pdbs) == 0:
+        return {
+            "name": "CDB$ROOT",
+            "con_id": 1,
+            "open_mode": inventory["database_open_mode"],
+            "restricted": "NO",
+            "is_pdb": False,
+        }
+    # Preserve the old agent's safe behavior when multiple application PDBs exist.
+    if len(application_pdbs) > 1:
+        raise RuntimeError(
+            "Multiple application PDBs discovered: %s. Set TARGET_PDB explicitly."
+            % ", ".join(pdb["name"] for pdb in application_pdbs)
+        )
+    target = dict(application_pdbs[0])
+    if target["open_mode"] != "READ WRITE":
+        raise RuntimeError(
+            "Target PDB '%s' OPEN_MODE is %s"
+            % (target["name"], target["open_mode"])
+        )
+    if target["restricted"] == "YES":
+        raise RuntimeError(
+            "Target PDB '%s' is in Restricted mode" % target["name"]
+        )
+    target["is_pdb"] = True
+    return target
+def choose_target_service(inventory, target):
+    services = inventory["services"].get(target["con_id"], [])
+    if not services:
+        raise RuntimeError(
+            "No Oracle service was discovered for '%s'" % target["name"]
+        )
+    if TARGET_SERVICE:
+        matches = []
+        for service in services:
+            for value in (service["name"], service["network_name"]):
+                if value and value.upper() == TARGET_SERVICE.upper():
+                    matches.append(service)
+                    break
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Configured TARGET_SERVICE '%s' was not uniquely found for '%s'"
+                % (TARGET_SERVICE, target["name"])
+            )
+        return matches[0]
+    exact_matches = []
+    for service in services:
+        for value in (service["name"], service["network_name"]):
+            if value and value.upper() == target["name"].upper():
+                exact_matches.append(service)
+                break
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(services) == 1:
+        return services[0]
+    raise RuntimeError(
+        "Multiple Oracle services discovered for '%s': %s. Set TARGET_SERVICE."
+        % (
+            target["name"],
+            ", ".join(
+                service["network_name"] or service["name"]
+                for service in services
+            ),
+        )
+    )
+def service_display_name(service):
+    return service["network_name"] or service["name"]
+def service_match_names(service):
+    names = []
+    for value in (service["name"], service["network_name"]):
+        value = value.strip()
+        if value and value.upper() not in [name.upper() for name in names]:
+            names.append(value)
+    return names
+def check_target_sql(target):
+    alter_container = ""
+    if target["is_pdb"]:
+        safe_name = target["name"].replace('"', '""')
+        alter_container = 'ALTER SESSION SET CONTAINER = "%s";' % safe_name
+    sql = r"""
+WHENEVER SQLERROR EXIT 2
+WHENEVER OSERROR EXIT 3
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF TRIMSPOOL ON
+%s
+SELECT 'TARGET_CHECK=1' || COUNT(*) FROM dual;
+SELECT 'TARGET_CONTAINER=' || SYS_CONTEXT('USERENV', 'CON_NAME') FROM dual;
+EXIT;
+""" % alter_container
+    output = run_sql(sql)
+    if "TARGET_CHECK=1" not in output:
+        raise RuntimeError("SQL validation against target database failed")
+    return True
+def get_default_listener_status():
+    return_code, stdout, stderr = run_process(
+        [LSNRCTL, "status"],
+        timeout=COMMAND_TIMEOUT,
+    )
+    if return_code != 0:
+        raise RuntimeError(
+            "Oracle listener status failed: %s"
+            % (stderr.strip() or stdout.strip() or "exit code %s" % return_code)
+        )
+    return stdout
+def discover_listener_name(status_output):
+    match = re.search(
+        r"^Alias\s+(.+?)\s*$",
+        status_output,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if not match:
+        raise RuntimeError("Unable to determine Oracle listener name")
+    return match.group(1).strip()
+def get_listener_services(listener_name):
+    return_code, stdout, stderr = run_process(
+        [LSNRCTL, "services", listener_name],
+        timeout=COMMAND_TIMEOUT,
+    )
+    if return_code != 0:
+        raise RuntimeError(
+            "Oracle listener services query failed: %s"
+            % (stderr.strip() or stdout.strip() or "exit code %s" % return_code)
+        )
+    return stdout
+def discover_listener_port(status_output):
+    matches = re.findall(
+        r"\(PROTOCOL=tcp\)[^\n]*?\(PORT=(\d+)\)",
+        status_output,
+        re.IGNORECASE,
+    )
+    if not matches:
+        # Fallback for slightly different LSNRCTL formatting.
+        matches = re.findall(r"\(PORT=(\d+)\)", status_output, re.IGNORECASE)
+    if not matches:
+        raise RuntimeError("Unable to determine Oracle listener TCP port")
+    ports = []
+    for value in matches:
+        port = int(value)
+        if port not in ports:
+            ports.append(port)
+    if len(ports) != 1:
+        raise RuntimeError(
+            "Multiple Oracle listener TCP ports discovered: %s"
+            % ", ".join(str(port) for port in ports)
+        )
+    return ports[0]
+def check_listener_tcp(port):
+    hosts = [
+        "127.0.0.1",
+        socket.gethostname(),
+        socket.getfqdn(),
+    ]
+    checked = []
+    for host in hosts:
+        if not host or host in checked:
+            continue
+        checked.append(host)
+        try:
+            sock = socket.create_connection((host, port), 2)
+            sock.close()
+            return True
+        except OSError:
+            pass
+    return False
+def check_service_registration(services_output, service_names):
+    for service_name in service_names:
+        pattern = (
+            r'Service\s+"%s".*?'
+            r'(?=Service\s+"|\Z)'
+        ) % re.escape(service_name)
+        match = re.search(
+            pattern,
+            services_output,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            continue
+        service_block = match.group(0)
+        ready = re.search(
+            r"\bstatus\s+READY\b",
+            service_block,
+            re.IGNORECASE,
+        ) is not None
+        return True, ready
+    return False, False
+def inspect_listener(target_service):
+    status_output = get_default_listener_status()
+    listener_name = discover_listener_name(status_output)
+    listener_port = discover_listener_port(status_output)
+    # The actual Oracle listener must match the port supplied by Terraform.
+    # If DBA configured a different port than the deployment input, return
+    # unhealthy so Azure Load Balancer does not route DB traffic to this VM.
+    if listener_port != ORACLE_PORT:
+        raise RuntimeError(
+            "Oracle listener port mismatch: expected %s, discovered %s"
+            % (ORACLE_PORT, listener_port)
+        )
+    listener_reachable = check_listener_tcp(listener_port)
+    services_output = get_listener_services(listener_name)
+    service_names = service_match_names(target_service)
+    registered, ready = check_service_registration(
+        services_output,
+        service_names,
+    )
+    return {
+        "listener_running": True,
+        "listener_name": listener_name,
+        "listener_port": listener_port,
+        "listener_reachable": listener_reachable,
+        "service_registered": registered,
+        "service_ready": ready,
+    }
+def parse_optional_int(name, value):
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise RuntimeError("%s must be an integer" % name)
+    if parsed < 0:
+        raise RuntimeError("%s cannot be negative" % name)
+    return parsed
+def parse_optional_float(name, value):
+    if not value:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise RuntimeError("%s must be numeric" % name)
+    if parsed < 0:
+        raise RuntimeError("%s cannot be negative" % name)
+    return parsed
+def evaluate_thresholds(result):
+    errors = []
+    max_active = parse_optional_int(
+        "MAX_ACTIVE_SESSIONS",
+        MAX_ACTIVE_SESSIONS,
+    )
+    max_blocking = parse_optional_int(
+        "MAX_BLOCKING_SESSIONS",
+        MAX_BLOCKING_SESSIONS,
+    )
+    max_utilization = parse_optional_float(
+        "MAX_SESSION_UTILIZATION_PERCENT",
+        MAX_SESSION_UTILIZATION_PERCENT,
+    )
+    if (
+        max_active is not None
+        and result["active_sessions"] is not None
+        and result["active_sessions"] > max_active
+    ):
+        errors.append(
+            "Active sessions %s exceeded configured maximum %s"
+            % (result["active_sessions"], max_active)
+        )
+    if (
+        max_blocking is not None
+        and result["blocking_sessions"] is not None
+        and result["blocking_sessions"] > max_blocking
+    ):
+        errors.append(
+            "Blocking sessions %s exceeded configured maximum %s"
+            % (result["blocking_sessions"], max_blocking)
+        )
+    if (
+        max_utilization is not None
+        and result["session_utilization_percent"] is not None
+        and result["session_utilization_percent"] >= max_utilization
+    ):
+        errors.append(
+            "Session utilization %.2f%% reached configured maximum %.2f%%"
+            % (result["session_utilization_percent"], max_utilization)
+        )
+    return errors
+def new_result():
+    return {
+        "oracle_sid": ORACLE_SID or None,
+        "database_name": None,
+        "database_role": None,
+        "cdb": None,
+        "target_pdb": None,
+        "target_service": None,
+        "pdb_open_mode": None,
+        "pdb_restricted": None,
+        "sql_query": False,
+        "listener_running": False,
+        "listener_name": None,
+        "listener_port": None,
+        "listener_reachable": False,
+        "service_registered": False,
+        "service_ready": False,
+        "active_sessions": None,
+        "total_user_sessions": None,
+        "blocked_sessions": None,
+        "blocking_sessions": None,
+        "session_current_utilization": None,
+        "session_limit": None,
+        "session_utilization_percent": None,
+    }
+def perform_health_check():
+    result = new_result()
+    errors = []
+    validate_runtime()
+    inventory = collect_database_inventory()
+    result["database_name"] = inventory["database_name"]
+    result["database_role"] = inventory["database_role"]
+    result["cdb"] = inventory["cdb"]
+    target = choose_target_database(inventory)
+    target_service = choose_target_service(inventory, target)
+    result["target_pdb"] = target["name"]
+    result["target_service"] = service_display_name(target_service)
+    result["pdb_open_mode"] = target["open_mode"]
+    result["pdb_restricted"] = target["restricted"]
+    result["sql_query"] = check_target_sql(target)
+    sessions = inventory["sessions"].get(
+        target["con_id"],
+        {"total": 0, "active": 0, "blocked": 0},
+    )
+    result["total_user_sessions"] = sessions["total"]
+    result["active_sessions"] = sessions["active"]
+    result["blocked_sessions"] = sessions["blocked"]
+    result["blocking_sessions"] = inventory["blockers"].get(
+        target["con_id"],
+        0,
+    )
+    result["session_current_utilization"] = inventory[
+        "session_current_utilization"
+    ]
+    result["session_limit"] = inventory["session_limit"]
+    result["session_utilization_percent"] = inventory[
+        "session_utilization_percent"
+    ]
+    try:
+        result.update(inspect_listener(target_service))
+    except Exception as error:
+        errors.append(str(error))
+    if not result["listener_running"]:
+        errors.append("Oracle listener is not running")
+    if not result["listener_reachable"]:
+        errors.append("Oracle listener TCP endpoint is not reachable")
+    if not result["service_registered"]:
+        errors.append(
+            "Target Oracle service '%s' is not registered"
+            % result["target_service"]
+        )
+    elif not result["service_ready"]:
+        errors.append(
+            "Target Oracle service '%s' is not READY"
+            % result["target_service"]
+        )
+    if not result["sql_query"]:
+        errors.append("SQL query against target database failed")
+    errors.extend(evaluate_thresholds(result))
+    return len(errors) == 0, result, errors
+def monitor_database():
+    while True:
+        result = new_result()
+        candidate_healthy = False
+        errors = []
+        try:
+            candidate_healthy, result, errors = perform_health_check()
+        except Exception as error:
+            candidate_healthy = False
+            errors = [str(error)]
+        with state_lock:
+            for key, value in result.items():
+                state[key] = value
+            state["last_check"] = int(time.time())
+            state["last_error"] = "; ".join(errors) if errors else None
+            if candidate_healthy:
+                state["consecutive_successes"] += 1
+                state["consecutive_failures"] = 0
+                if state["consecutive_successes"] >= SUCCESS_THRESHOLD:
+                    state["healthy"] = True
+                    state["status"] = "HEALTHY"
+                else:
+                    state["healthy"] = False
+                    state["status"] = "STARTING"
+            else:
+                state["consecutive_successes"] = 0
+                state["consecutive_failures"] += 1
+                if state["consecutive_failures"] >= FAILURE_THRESHOLD:
+                    state["healthy"] = False
+                    state["status"] = "UNHEALTHY"
+        time.sleep(CHECK_INTERVAL)
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+        with state_lock:
+            response = dict(state)
+        body = json.dumps(response, sort_keys=True).encode("utf-8")
+        status_code = 200 if response["healthy"] else 503
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, fmt, *args):
+        return
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+if __name__ == "__main__":
+    monitor_thread = threading.Thread(target=monitor_database, daemon=True)
+    monitor_thread.start()
+    server = ReusableThreadingHTTPServer(
+        (HEALTH_HOST, HEALTH_PORT),
+        HealthHandler,
+    )
+    server.serve_forever()
+PY
+chown oracle:dba "${AGENT}"
+chmod 0750 "${AGENT}"
+echo "==> Validating Python syntax"
+sudo -u oracle /usr/bin/python3 -m py_compile "${AGENT}"
+echo "==> Writing systemd unit"
+cat > "${SERVICE}" <<EOF
+[Unit]
+Description=Oracle Database Health Agent
+After=network-online.target oracle-hostname-fix.service oracle-database.service
+Wants=network-online.target
+RequiresMountsFor=/OraHome /OraData
+[Service]
+Type=simple
+User=oracle
+Group=dba
+Environment="HEALTH_HOST=${HEALTH_HOST}"
+Environment="HEALTH_PORT=${HEALTH_PORT}"
+Environment="ORACLE_HOME=${ORACLE_HOME}"
+Environment="ORACLE_SID=${ORACLE_SID}"
+Environment="ORACLE_PORT=${ORACLE_PORT}"
+Environment="TARGET_PDB=${TARGET_PDB}"
+Environment="TARGET_SERVICE=${TARGET_SERVICE}"
+Environment="CHECK_INTERVAL=${CHECK_INTERVAL}"
+Environment="SUCCESS_THRESHOLD=${SUCCESS_THRESHOLD}"
+Environment="FAILURE_THRESHOLD=${FAILURE_THRESHOLD}"
+Environment="SQL_TIMEOUT=${SQL_TIMEOUT}"
+Environment="COMMAND_TIMEOUT=${COMMAND_TIMEOUT}"
+Environment="MAX_ACTIVE_SESSIONS=${MAX_ACTIVE_SESSIONS}"
+Environment="MAX_SESSION_UTILIZATION_PERCENT=${MAX_SESSION_UTILIZATION_PERCENT}"
+Environment="MAX_BLOCKING_SESSIONS=${MAX_BLOCKING_SESSIONS}"
+Environment="PATH=${ORACLE_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
+Environment="LD_LIBRARY_PATH=${ORACLE_HOME}/lib"
+ExecStart=/usr/bin/python3 ${AGENT}
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 0644 "${SERVICE}"
+echo "==> Validating systemd unit"
+systemctl daemon-reload
+systemd-analyze verify "${SERVICE}"
+echo "==> Configuring firewalld"
+if systemctl is-active --quiet firewalld; then
+  if ! firewall-cmd --permanent --zone=public --query-port="${ORACLE_PORT}/tcp" >/dev/null; then
+    firewall-cmd --permanent --zone=public --add-port="${ORACLE_PORT}/tcp"
+  fi
+  LB_RULE="rule family=\"ipv4\" source address=\"${LB_PROBE_IP}\" port port=\"${HEALTH_PORT}\" protocol=\"tcp\" accept"
+  if ! firewall-cmd --permanent --zone=public --query-rich-rule="${LB_RULE}" >/dev/null; then
+    firewall-cmd --permanent --zone=public --add-rich-rule="${LB_RULE}"
+  fi
+  firewall-cmd --reload
+else
+  echo "WARNING: firewalld is not active; no host-firewall rules were changed."
+fi
+echo "==> Enabling and starting oracle-health.service"
+systemctl enable oracle-health.service
+systemctl restart oracle-health.service
+echo "==> Service status"
+systemctl --no-pager --full status oracle-health.service || true
+echo
+echo "==> Waiting for health agent to complete initial checks..."
+sleep "$((CHECK_INTERVAL * SUCCESS_THRESHOLD + 3))"
+echo
+echo "==> Local health check"
+if command -v curl >/dev/null 2>&1; then
+  curl -i --max-time 10 "http://127.0.0.1:${HEALTH_PORT}/health" || true
+else
+  /usr/bin/python3 - <<PY2
+import urllib.request
+url = "http://127.0.0.1:${HEALTH_PORT}/health"
+try:
+    response = urllib.request.urlopen(url, timeout=10)
+    print("HTTP", response.status)
+    print(response.read().decode())
+except Exception as exc:
+    print("Health request failed:", exc)
+PY2
+fi
+echo
+echo "==> Final firewall state"
+if systemctl is-active --quiet firewalld; then
+  firewall-cmd --zone=public --list-all
+fi
+echo
+echo "Installation complete."
+echo "Health URL: http://127.0.0.1:${HEALTH_PORT}/health"
+echo "Service:    systemctl status oracle-health.service --no-pager"
+echo "Logs:       journalctl -u oracle-health.service -n 100 --no-pager"
