@@ -1,24 +1,11 @@
-irst, let's verify the new 5.0.0 image
-SSH to either newly created VM and run:
-sudo find /OraHome /u01 /opt -type f -name sqlplus 2>/dev/null
+Now rerun the Oracle binary checks:
+sudo find /OraHome /u01 /opt -type f \( -name sqlplus -o -name lsnrctl \) -print
 
-Also:
-sudo find /OraHome /u01 /opt -type f -name lsnrctl 2>/dev/null
-
-And:
-sudo -u oracle bash -c 'echo $ORACLE_HOME; command -v sqlplus; command -v lsnrctl'
-
-This will tell us whether:
-/OraHome/ora26ai_DB_Home
-
-is simply the wrong ORACLE_HOME, or whether the image intentionally doesn't contain a complete Oracle home yet.
-But even if that path is wrong, I would fix the script design rather than merely changing one hard-coded path.
-What needs to change in configure-health-agent.sh
-The installer currently appears to have a pre-flight test similar to:
-if [[ ! -x "${ORACLE_HOME}/bin/sqlplus" ]]; then
-    echo "ERROR: Required Oracle executable not found/executable: ${ORACLE_HOME}/bin/sqlplus"
-    exit 1
-fi
-
-That exit 1 is what causes Azure to report:
-VMExtensionProvisioningError
+Then also check the Oracle user's login environment:
+sudo -iu oracle bash -lc '
+echo "USER=$USER"
+echo "ORACLE_HOME=$ORACLE_HOME"
+echo "PATH=$PATH"
+command -v sqlplus || echo "sqlplus not in PATH"
+command -v lsnrctl || echo "lsnrctl not in PATH"
+'
