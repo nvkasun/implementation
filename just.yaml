@@ -1,13 +1,13 @@
 # ============================================================
-# Oracle on Azure - Resource Group
+# Oracle on Azure - Managed Identity
 # ============================================================
 
-module "oracle_vm_resource_group" {
+resource "azurerm_user_assigned_identity" "oracle_binary_vm" {
   count = var.oracle_vm_on_azure_enabled ? 1 : 0
 
-  source = "../azure-terraform/modules/resource-groups"
+  name                = "id-oracle-binary-vm-${var.environment}-uan"
+  resource_group_name = module.oracle_vm_resource_group[0].rg_name
+  location            = var.location
 
-  rg_name  = var.oracle_vm_resource_group_name
-  location = var.location
-  tags     = local.tags
+  tags = local.tags
 }
