@@ -1,172 +1,91 @@
 # ============================================================
-# Oracle on Azure - VM01
+# Oracle on Azure - Internal Load Balancer
 # ============================================================
 
-module "oracle_binary_vm01" {
+resource "azurerm_lb" "oracle_db" {
   count = var.oracle_vm_on_azure_enabled ? 1 : 0
 
-  source = "./modules/virtual-machine-latest"
-
+  name                = "lb-cibg-${var.environment}-uaenorth-oracledb"
+  location            = var.location
   resource_group_name = module.oracle_vm_resource_group[0].rg_name
-  application_name    = "001"
-  environment         = var.environment
 
-  subnet_id = module.base-infra.subnet_map[
-    "snet-oracle-vm-cibg-uaenorth-001"
-  ].id
+  sku      = "Standard"
+  sku_tier = "Regional"
 
-  key_vault_id = module.azure_key_vault.id
+  frontend_ip_configuration {
+    name = "fe-oracledb"
 
-  vm = {
-    os_type = "linux"
+    subnet_id = module.base-infra.subnet_map[
+      "snet-oracle-vm-cibg-uaenorth-001"
+    ].id
+
+    private_ip_address_allocation = "Dynamic"
   }
-
-  vm_size           = "Standard_E8s_v5"
-  availability_zone = "1"
-
-  # Specialized image hosted in Cloud Factory subscription
-  source_image_id = "/subscriptions/1a233215-09f6-404f-8536-bc83100ba1fa/resourceGroups/rg-CloudFactory-dev-uaenorth-oracledb/providers/Microsoft.Compute/galleries/acgCloudFactorydevuaenorthoracledb/images/RHEL-9.8-oracle-db/versions/3.0.0"
-
-  source_image_specialized = true
-
-  admin_username = "azureuser"
-  admin_password = var.oracle_db_vm_admin_password
-
-  managed_identities = {
-    system_assigned = false
-
-    user_assigned_resource_ids = [
-      azurerm_user_assigned_identity.oracle_binary_vm[0].id
-    ]
-  }
-
-  os_disk = {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = null
-  }
-
-  data_disks = {
-    oracle_data = {
-      name                 = "oracle-data"
-      storage_account_type = "StandardSSD_LRS"
-      disk_size_gb         = 50
-      lun                  = 0
-      caching              = "ReadWrite"
-      tags                 = local.tags
-    }
-  }
-
-  extensions = {
-    oracle_health_config = {
-      name                 = "oracle-health-config"
-      publisher            = "Microsoft.Azure.Extensions"
-      type                 = "CustomScript"
-      type_handler_version = "2.1"
-
-      auto_upgrade_minor_version = true
-      automatic_upgrade_enabled  = false
-
-      settings = jsonencode({
-        commandToExecute = "/bin/bash -c 'echo \"ORACLE_PORT=${var.oracle_listener_port}\"'"
-      })
-
-      protected_settings = null
-    }
-  }
-
-  accelerated_networking_enabled = true
-  ip_forwarding_enabled          = false
-  enable_boot_diagnostics        = true
-  encryption_at_host_enabled     = false
-  patch_mode_linux               = "ImageDefault"
 
   tags = local.tags
 }
 
 
-# ============================================================
-# Oracle on Azure - VM02
-# ============================================================
-
-module "oracle_binary_vm02" {
+resource "azurerm_lb_backend_address_pool" "oracle_db" {
   count = var.oracle_vm_on_azure_enabled ? 1 : 0
 
-  source = "./modules/virtual-machine-latest"
+  name            = "be-oracledb"
+  loadbalancer_id = azurerm_lb.oracle_db[0].id
+}
 
-  resource_group_name = module.oracle_vm_resource_group[0].rg_name
-  application_name    = "002"
-  environment         = var.environment
 
-  subnet_id = module.base-infra.subnet_map[
-    "snet-oracle-vm-cibg-uaenorth-001"
-  ].id
+locals {
+  oracle_db_backend_nics = var.oracle_vm_on_azure_enabled ? {
+    vm01 = module.oracle_binary_vm01[0].network_interface_id
+    vm02 = module.oracle_binary_vm02[0].network_interface_id
+  } : {}
+}
 
-  key_vault_id = module.azure_key_vault.id
 
-  vm = {
-    os_type = "linux"
-  }
+resource "azurerm_network_interface_backend_address_pool_association" "oracle_db" {
+  for_each = local.oracle_db_backend_nics
 
-  vm_size           = "Standard_E8s_v5"
-  availability_zone = "2"
+  network_interface_id    = each.value
+  ip_configuration_name   = "internal"
+  backend_address_pool_id = azurerm_lb_backend_address_pool.oracle_db[0].id
+}
 
-  # Same Cloud Factory specialized gallery image
-  source_image_id = "/subscriptions/1a233215-09f6-404f-8536-bc83100ba1fa/resourceGroups/rg-CloudFactory-dev-uaenorth-oracledb/providers/Microsoft.Compute/galleries/acgCloudFactorydevuaenorthoracledb/images/RHEL-9.8-oracle-db/versions/3.0.0"
 
-  source_image_specialized = true
+resource "azurerm_lb_probe" "oracle_db_health" {
+  count = var.oracle_vm_on_azure_enabled ? 1 : 0
 
-  admin_username = "azureuser"
-  admin_password = var.oracle_db_vm_admin_password
+  name            = "hp-oracledb"
+  loadbalancer_id = azurerm_lb.oracle_db[0].id
 
-  managed_identities = {
-    system_assigned = false
+  protocol     = "Http"
+  port         = 8080
+  request_path = "/health"
 
-    user_assigned_resource_ids = [
-      azurerm_user_assigned_identity.oracle_binary_vm[0].id
-    ]
-  }
+  interval_in_seconds = 5
+  number_of_probes    = 2
+}
 
-  os_disk = {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = null
-  }
 
-  data_disks = {
-    oracle_data = {
-      name                 = "oracle-data"
-      storage_account_type = "StandardSSD_LRS"
-      disk_size_gb         = 50
-      lun                  = 0
-      caching              = "ReadWrite"
-      tags                 = local.tags
-    }
-  }
+resource "azurerm_lb_rule" "oracle_db" {
+  count = var.oracle_vm_on_azure_enabled ? 1 : 0
 
-  extensions = {
-    oracle_health_config = {
-      name                 = "oracle-health-config"
-      publisher            = "Microsoft.Azure.Extensions"
-      type                 = "CustomScript"
-      type_handler_version = "2.1"
+  name            = "lbr-oracledb-${var.oracle_listener_port}"
+  loadbalancer_id = azurerm_lb.oracle_db[0].id
 
-      auto_upgrade_minor_version = true
-      automatic_upgrade_enabled  = false
+  protocol = "Tcp"
 
-      settings = jsonencode({
-        commandToExecute = "/bin/bash -c 'echo \"ORACLE_PORT=${var.oracle_listener_port}\"'"
-      })
+  frontend_port = var.oracle_listener_port
+  backend_port  = var.oracle_listener_port
 
-      protected_settings = null
-    }
-  }
+  frontend_ip_configuration_name = "fe-oracledb"
 
-  accelerated_networking_enabled = true
-  ip_forwarding_enabled          = false
-  enable_boot_diagnostics        = true
-  encryption_at_host_enabled     = false
-  patch_mode_linux               = "ImageDefault"
+  backend_address_pool_ids = [
+    azurerm_lb_backend_address_pool.oracle_db[0].id
+  ]
 
-  tags = local.tags
+  probe_id = azurerm_lb_probe.oracle_db_health[0].id
+
+  idle_timeout_in_minutes = 30
+  tcp_reset_enabled       = true
+  floating_ip_enabled     = false
 }
