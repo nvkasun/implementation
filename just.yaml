@@ -1,37 +1,13 @@
 # ============================================================
-# Oracle on Azure
+# Oracle on Azure - Resource Group
 # ============================================================
 
-variable "oracle_vm_on_azure_enabled" {
-  description = "Enable Oracle VM on Azure resources"
-  type        = bool
-  default     = false
-}
+module "oracle_vm_resource_group" {
+  count = var.oracle_vm_on_azure_enabled ? 1 : 0
 
-variable "oracle_vm_resource_group_name" {
-  description = "Dedicated resource group name for Oracle VM resources"
-  type        = string
-  default     = null
-}
+  source = "../azure-terraform/modules/resource-groups"
 
-variable "oracle_listener_port" {
-  description = "Oracle listener port used by all Oracle DB VMs in this environment"
-  type        = number
-  default     = 1800
-
-  validation {
-    condition = (
-      var.oracle_listener_port >= 1700 &&
-      var.oracle_listener_port <= 1900
-    )
-
-    error_message = "oracle_listener_port must be between 1700 and 1900."
-  }
-}
-
-variable "oracle_db_vm_admin_password" {
-  description = "Administrator password for the Oracle DB virtual machines"
-  type        = string
-  sensitive   = true
-  default     = null
+  rg_name  = var.oracle_vm_resource_group_name
+  location = var.location
+  tags     = local.tags
 }
