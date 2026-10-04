@@ -1,20 +1,26 @@
-# ============================================================
-# Oracle on Azure - Blob Storage Private DNS VNet Link
-# ============================================================
+elif [[ "${{ github.event.inputs.MODULE }}" == "oracle_db_on_azure" ]]; then
+  echo "Planning Oracle DB on Azure infrastructure with dependent resources..."
 
-resource "azurerm_private_dns_zone_virtual_network_link" "oracle_binary_storage" {
-  count = var.oracle_vm_on_azure_enabled ? 1 : 0
+  terraform init \
+    -plugin-dir="$PWD/.terraform/providers" \
+    -backend-config="config/${{ env.TFVARS_ENV }}.config"
 
-  provider = azurerm.connectivity
+  terraform refresh \
+    -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars"
 
-  name = "oracle-binary-storage-${var.environment}-vnl"
-
-  resource_group_name  = data.azurerm_private_dns_zone.sa_dns_zone.resource_group_name
-  private_dns_zone_name = data.azurerm_private_dns_zone.sa_dns_zone.name
-
-  virtual_network_id = module.base-infra.vnet_id
-
-  registration_enabled = false
-
-  tags = local.tags
-}
+  terraform plan \
+    --target=module.base-infra \
+    --target=module.oracle_vm_resource_group \
+    --target=azurerm_user_assigned_identity.oracle_binary_vm \
+    --target=module.oracle_binary_vm01 \
+    --target=module.oracle_binary_vm02 \
+    --target=azurerm_lb.oracle_db \
+    --target=azurerm_lb_backend_address_pool.oracle_db \
+    --target=azurerm_network_interface_backend_address_pool_association.oracle_db \
+    --target=azurerm_lb_probe.oracle_db_health \
+    --target=azurerm_lb_rule.oracle_db \
+    --target=module.oracle_binary_storage \
+    --target=azurerm_role_assignment.oracle_binary_blob_access \
+    --target=azurerm_private_dns_zone_virtual_network_link.oracle_binary_storage \
+    -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars" \
+    -out=plan.tfout
