@@ -1,7 +1,37 @@
-Ganesh, I have provided the correct IP subnet range for the CIBG Dev environment, so there shouldn’t be any confusion on that.
+# ============================================================
+# Oracle on Azure
+# ============================================================
 
-However, based on the screenshot you shared, it looks like you are trying to connect to the test VM that we created in the Cloud Factory account for the POC activities. That VM is in a completely different subnet and is not accessible from the Maktabi VDR.
+variable "oracle_vm_on_azure_enabled" {
+  description = "Enable Oracle VM on Azure resources"
+  type        = bool
+  default     = false
+}
 
-As agreed, once the firewall implementation is completed, we will deploy the latest VM inside the CIBG subnet (10.114.83.0/26). After that, you should be able to SSH to the VM from the Maktabi VDR.
+variable "oracle_vm_resource_group_name" {
+  description = "Dedicated resource group name for Oracle VM resources"
+  type        = string
+  default     = null
+}
 
-So, the current connectivity test against the Cloud Factory VM is not applicable to the CIBG setup.
+variable "oracle_listener_port" {
+  description = "Oracle listener port used by all Oracle DB VMs in this environment"
+  type        = number
+  default     = 1800
+
+  validation {
+    condition = (
+      var.oracle_listener_port >= 1700 &&
+      var.oracle_listener_port <= 1900
+    )
+
+    error_message = "oracle_listener_port must be between 1700 and 1900."
+  }
+}
+
+variable "oracle_db_vm_admin_password" {
+  description = "Administrator password for the Oracle DB virtual machines"
+  type        = string
+  sensitive   = true
+  default     = null
+}
