@@ -13,11 +13,8 @@ module "oracle_binary_storage" {
 
   application_name = "oraclebinary"
 
-  # Storage account names must be globally unique.
-  # Validate the final name before deployment.
   storage_account_name = "cibg${var.environment}orabin"
-
-  storage_use = "orabin"
+  storage_use          = "orabin"
 
   account_kind = "StorageV2"
   skuname      = "Standard_LRS"
@@ -41,17 +38,30 @@ module "oracle_binary_storage" {
     resource_group = module.resource_group.rg_name
   }
 
-  private_dns_zone_ids = [
-    data.azurerm_private_dns_zone.sa_dns_zone.id
-  ]
+  private_dns_zone_ids = data.azurerm_private_dns_zone.sa_dns_zone.id
 
   customer_managed_key = true
+
   managed_identity_type = "UserAssigned"
 
   azurerm_key_vault_key = "oracle-binary-storage-key"
   kv_name                = basename(module.azure_key_vault.id)
-
   kv_resource_group_name = module.resource_group.rg_name
 
   tags = local.tags
+}
+
+
+# ============================================================
+# Oracle VM Managed Identity - Blob Access
+# ============================================================
+
+resource "azurerm_role_assignment" "oracle_binary_blob_access" {
+  count = var.oracle_vm_on_azure_enabled ? 1 : 0
+
+  scope = module.oracle_binary_storage[0].storage_account_id
+
+  role_definition_name = "Storage Blob Data Contributor"
+
+  principal_id = azurerm_user_assigned_identity.oracle_binary_vm[0].principal_id
 }
