@@ -1,135 +1,514 @@
-{
-  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.0.0.0",
+name: Oracle DB on Azure Release
 
-  "parameters": {
-    "galleryName": {
-      "type": "string",
-      "defaultValue": "acgCloudFactorydevuaenorthoracledb",
-      "metadata": {
-        "description": "Existing Azure Compute Gallery name."
-      }
-    },
+run-name: >-
+  Oracle DB on Azure - ${{ inputs.mode }} -
+  ${{ inputs.environment }} -
+  Listener ${{ inputs.oracle_listener_port }} -
+  by ${{ github.actor }}
 
-    "imageDefinitionName": {
-      "type": "string",
-      "defaultValue": "RHEL-9.8-oracle-db",
-      "metadata": {
-        "description": "Existing specialized image definition."
-      }
-    },
+on:
+  workflow_dispatch:
+    inputs:
 
-    "imageVersion": {
-      "type": "string",
-      "defaultValue": "4.0.1",
-      "metadata": {
-        "description": "New Azure Compute Gallery image version."
-      }
-    },
+      environment:
+        description: "Target environment"
+        type: choice
+        required: true
+        options:
+          - tf-dev
 
-    "location": {
-      "type": "string",
-      "defaultValue": "uaenorth",
-      "metadata": {
-        "description": "Azure region containing the source OS disk, gallery and DES."
-      }
-    },
+      mode:
+        description: "Run mode"
+        type: choice
+        required: true
+        default: plan
+        options:
+          - plan
+          - plan_and_apply
 
-    "osDiskResourceId": {
-      "type": "string",
-      "defaultValue": "/subscriptions/1a233215-09f6-404f-8536-bc83100ba1fa/resourceGroups/rg-CloudFactory-dev-uaenorth-oracledb/providers/Microsoft.Compute/disks/vm-006-dev-uan-56ozvj-osdisk",
-      "metadata": {
-        "description": "Resource ID of VM6 OS disk only."
-      }
-    },
+      oracle_listener_port:
+        description: "Oracle DB listener port configured by DBA"
+        type: string
+        required: true
+        default: "1800"
 
-    "diskEncryptionSetResourceId": {
-      "type": "string",
-      "defaultValue": "/subscriptions/1a233215-09f6-404f-8536-bc83100ba1fa/resourceGroups/rg-CloudFactory-dev-uaenorth-oracledb/providers/Microsoft.Compute/diskEncryptionSets/vm-006-dev-uan-56ozvj-des",
-      "metadata": {
-        "description": "Disk Encryption Set used to CMK-encrypt the gallery OS disk image."
-      }
-    }
-  },
+      terraform_version:
+        description: "Terraform version"
+        type: string
+        required: true
+        default: "1.6.3"
 
-  "variables": {
-    "commonTags": {
-      "ApplicationName": "CloudFactory",
-      "BusinessCriticality": "Low",
-      "BusinessUnit": "TechnologyPlatform",
-      "BusinessUnitOwner": "TechnologyPlatform",
-      "CostCenter": "219",
-      "DataClassification": "General",
-      "DeployedBy": "Manual",
-      "Environment": "dev",
-      "RequestReference": "P015763"
-    }
-  },
 
-  "resources": [
-    {
-      "type": "Microsoft.Compute/galleries/images/versions",
-      "apiVersion": "2024-03-03",
+permissions:
+  contents: read
+  id-token: write
 
-      "name": "[format('{0}/{1}/{2}', parameters('galleryName'), parameters('imageDefinitionName'), parameters('imageVersion'))]",
 
-      "location": "[parameters('location')]",
+# ============================================================
+# CCOE APPROVAL
+# ============================================================
 
-      "tags": "[variables('commonTags')]",
+jobs:
 
-      "properties": {
-        "publishingProfile": {
-          "excludeFromLatest": false,
-          "replicaCount": 1,
-          "replicationMode": "Full",
-          "storageAccountType": "Standard_LRS",
+  Approval-CCOE:
+    name: CCOE Approval
+    runs-on: ubuntu-latest
+    environment: approval-ccoe
 
-          "targetRegions": [
-            {
-              "name": "[parameters('location')]",
-              "regionalReplicaCount": 1,
-              "storageAccountType": "Standard_LRS",
-              "excludeFromLatest": false,
+    steps:
+      - name: Approval CCOE
+        run: |
+          echo "CCOE approval completed."
 
-              "encryption": {
-                "osDiskImage": {
-                  "diskEncryptionSetId": "[parameters('diskEncryptionSetResourceId')]"
-                }
-              }
-            }
-          ]
-        },
 
-        "storageProfile": {
-          "osDiskImage": {
-            "source": {
-              "id": "[parameters('osDiskResourceId')]"
-            }
-          }
-        },
+  # ==========================================================
+  # TERRAFORM INIT
+  #
+  # Purpose:
+  # - Validate Oracle listener port supplied by DBA
+  # - Obtain CICD GitHub App token
+  # - Checkout CIBG repository
+  # - Authenticate access to private Terraform modules
+  # - Download Terraform providers/modules
+  # - Upload .terraform for the self-hosted plan runner
+  # ==========================================================
 
-        "safetyProfile": {
-          "allowDeletionOfReplicatedLocations": false,
-          "blockDeletionBeforeEndOfLife": false
-        }
-      }
-    }
-  ],
+  terraform-init:
+    name: Terraform Init
+    needs:
+      - Approval-CCOE
 
-  "outputs": {
-    "imageVersionId": {
-      "type": "string",
-      "value": "[resourceId('Microsoft.Compute/galleries/images/versions', parameters('galleryName'), parameters('imageDefinitionName'), parameters('imageVersion'))]"
-    },
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
 
-    "sourceOsDiskId": {
-      "type": "string",
-      "value": "[parameters('osDiskResourceId')]"
-    },
+    env:
+      TFVARS_ENV: ${{ vars.TFVARS_ENV }}
 
-    "diskEncryptionSetId": {
-      "type": "string",
-      "value": "[parameters('diskEncryptionSetResourceId')]"
-    }
-  }
-}
+    steps:
+
+      # -------------------------------------------------------
+      # Validate listener port before doing any Terraform work.
+      #
+      # This range matches variables.tf:
+      # 1700 <= oracle_listener_port <= 1900
+      # -------------------------------------------------------
+
+      - name: Validate Oracle listener port
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ORACLE_PORT="${{ inputs.oracle_listener_port }}"
+
+          echo "Validating Oracle listener port..."
+
+          if ! [[ "${ORACLE_PORT}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Oracle listener port must be numeric."
+            exit 1
+          fi
+
+          if (( ORACLE_PORT < 1700 || ORACLE_PORT > 1900 )); then
+            echo "ERROR: Oracle listener port must be between 1700 and 1900."
+            exit 1
+          fi
+
+          echo "Oracle listener port accepted: ${ORACLE_PORT}"
+
+
+      - name: Create CICD Bot token
+        id: cicd-bot-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CICD_BOT_APP_ID || '981379' }}
+          private-key: ${{ secrets.CICD_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+
+
+      - name: Checkout CIBG repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.cicd-bot-token.outputs.token }}
+          persist-credentials: false
+
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+
+      - name: Terraform Init - Download Providers and Private Modules
+        working-directory: terraform
+
+        env:
+          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
+
+        run: |
+          set -euo pipefail
+
+          echo "::add-mask::$GH_TOKEN"
+
+          #
+          # Authenticate private Terraform module Git downloads
+          # using the CICD GitHub App token.
+          #
+
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+
+          terraform init -backend=false
+
+          terraform validate
+
+          tar -czf terraform_modules.tar.gz .terraform
+
+          if [ -f .terraform.lock.hcl ]; then
+            tar -czf terraform_lock.tar.gz .terraform.lock.hcl
+          fi
+
+
+      - name: Upload Terraform Modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-terraform-modules
+          path: terraform/terraform_modules.tar.gz
+          retention-days: 1
+
+
+      - name: Upload Terraform Lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-terraform-lock
+          path: terraform/terraform_lock.tar.gz
+          retention-days: 1
+          if-no-files-found: ignore
+
+
+  # ==========================================================
+  # TERRAFORM PLAN
+  #
+  # Oracle DB listener port is supplied dynamically by the
+  # workflow user based on the port configured by DBA.
+  #
+  # Example:
+  # workflow input = 1850
+  #
+  # var.oracle_listener_port = 1850
+  # ==========================================================
+
+  terraform-plan:
+    name: Terraform Plan
+    needs:
+      - terraform-init
+
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+
+    env:
+      TFVARS_ENV: ${{ vars.TFVARS_ENV }}
+
+      AZURE_IDENTITY: ${{ vars.AZURE_IDENTITY }}
+      AZURE_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION }}
+      AZURE_TENANT: ${{ vars.AZURE_TENANT }}
+
+      ARM_CLIENT_ID: ${{ vars.AZURE_IDENTITY }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT }}
+      ARM_USE_OIDC: "true"
+
+      ORACLE_LISTENER_PORT: ${{ inputs.oracle_listener_port }}
+
+    steps:
+
+      - name: Create CICD Bot token
+        id: cicd-bot-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CICD_BOT_APP_ID || '981379' }}
+          private-key: ${{ secrets.CICD_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+
+
+      - name: Checkout CIBG repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.cicd-bot-token.outputs.token }}
+          persist-credentials: false
+
+
+      - name: Download Terraform Modules
+        uses: actions/download-artifact@v4
+        with:
+          name: oracle-terraform-modules
+          path: terraform
+
+
+      - name: Download Terraform Lock
+        uses: actions/download-artifact@v4
+        with:
+          name: oracle-terraform-lock
+          path: terraform
+
+
+      - name: Extract Terraform Modules
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+
+          tar -xzf terraform_modules.tar.gz
+
+          if [ -f terraform_lock.tar.gz ]; then
+            tar -xzf terraform_lock.tar.gz
+          fi
+
+          rm -f terraform_modules.tar.gz terraform_lock.tar.gz
+
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_IDENTITY }}
+          tenant-id: ${{ env.AZURE_TENANT }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION }}
+
+
+      - name: Terraform Init
+        working-directory: terraform
+
+        env:
+          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
+
+        run: |
+          set -euo pipefail
+
+          echo "::add-mask::$GH_TOKEN"
+
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+
+          terraform init \
+            -plugin-dir="$PWD/.terraform/providers" \
+            -backend-config="config/${TFVARS_ENV}.config"
+
+
+      # -------------------------------------------------------
+      # Terraform CLI -var has higher precedence than tfvars.
+      #
+      # Therefore:
+      #
+      # dev.tfvars:
+      # oracle_listener_port = 1800
+      #
+      # Workflow:
+      # oracle_listener_port = 1850
+      #
+      # Effective Terraform value:
+      # var.oracle_listener_port = 1850
+      # -------------------------------------------------------
+
+      - name: Terraform Plan - Oracle DB on Azure
+        working-directory: terraform
+
+        env:
+          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
+
+        run: |
+          set -euo pipefail
+
+          echo "::add-mask::$GH_TOKEN"
+
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+
+          echo "======================================================"
+          echo "Planning Oracle DB on Azure"
+          echo "Environment          : ${TFVARS_ENV}"
+          echo "Oracle listener port : ${ORACLE_LISTENER_PORT}"
+          echo "======================================================"
+
+          terraform plan \
+            -no-color \
+            -input=false \
+            --target=module.base-infra \
+            --target=module.oracle_vm_resource_group \
+            --target=azurerm_user_assigned_identity.oracle_binary_vm \
+            --target=module.oracle_binary_vm01 \
+            --target=module.oracle_binary_vm02 \
+            --target=azurerm_lb.oracle_db \
+            --target=azurerm_lb_backend_address_pool.oracle_db \
+            --target=azurerm_network_interface_backend_address_pool_association.oracle_db \
+            --target=azurerm_lb_probe.oracle_db_health \
+            --target=azurerm_lb_rule.oracle_db \
+            --target=module.oracle_binary_storage \
+            --target=azurerm_role_assignment.oracle_binary_blob_access \
+            --target=azurerm_private_dns_zone_virtual_network_link.oracle_binary_storage \
+            -var-file="tfvars/${TFVARS_ENV}.tfvars" \
+            -var="oracle_listener_port=${ORACLE_LISTENER_PORT}" \
+            -out=oracle-plan.tfout
+
+
+      - name: Show Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform show -no-color oracle-plan.tfout
+
+
+      - name: Upload Oracle Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-terraform-plan
+          path: terraform/oracle-plan.tfout
+          retention-days: 1
+
+
+  # ==========================================================
+  # TERRAFORM APPLY
+  #
+  # Runs only when mode = plan_and_apply.
+  #
+  # IMPORTANT:
+  # We DO NOT need to pass oracle_listener_port again here.
+  #
+  # oracle-plan.tfout already contains the exact resolved
+  # Terraform value selected during terraform plan.
+  # ==========================================================
+
+  terraform-apply:
+    name: Terraform Apply
+
+    if: ${{ inputs.mode == 'plan_and_apply' }}
+
+    needs:
+      - terraform-plan
+
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+
+    env:
+      TFVARS_ENV: ${{ vars.TFVARS_ENV }}
+
+      AZURE_IDENTITY: ${{ vars.AZURE_IDENTITY }}
+      AZURE_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION }}
+      AZURE_TENANT: ${{ vars.AZURE_TENANT }}
+
+      ARM_CLIENT_ID: ${{ vars.AZURE_IDENTITY }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT }}
+      ARM_USE_OIDC: "true"
+
+      ORACLE_LISTENER_PORT: ${{ inputs.oracle_listener_port }}
+
+    steps:
+
+      - name: Create CICD Bot token
+        id: cicd-bot-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CICD_BOT_APP_ID || '981379' }}
+          private-key: ${{ secrets.CICD_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+
+
+      - name: Checkout CIBG repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.cicd-bot-token.outputs.token }}
+          persist-credentials: false
+
+
+      - name: Download Terraform Modules
+        uses: actions/download-artifact@v4
+        with:
+          name: oracle-terraform-modules
+          path: terraform
+
+
+      - name: Download Terraform Lock
+        uses: actions/download-artifact@v4
+        with:
+          name: oracle-terraform-lock
+          path: terraform
+
+
+      - name: Download Oracle Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: oracle-terraform-plan
+          path: terraform
+
+
+      - name: Extract Terraform Modules
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+
+          tar -xzf terraform_modules.tar.gz
+
+          if [ -f terraform_lock.tar.gz ]; then
+            tar -xzf terraform_lock.tar.gz
+          fi
+
+          rm -f terraform_modules.tar.gz terraform_lock.tar.gz
+
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_IDENTITY }}
+          tenant-id: ${{ env.AZURE_TENANT }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION }}
+
+
+      - name: Terraform Init
+        working-directory: terraform
+
+        env:
+          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
+
+        run: |
+          set -euo pipefail
+
+          echo "::add-mask::$GH_TOKEN"
+
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+
+          terraform init \
+            -plugin-dir="$PWD/.terraform/providers" \
+            -backend-config="config/${TFVARS_ENV}.config"
+
+
+      - name: Terraform Apply - Oracle DB on Azure
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+
+          echo "======================================================"
+          echo "Applying approved Oracle DB on Azure Terraform plan"
+          echo "Environment          : ${TFVARS_ENV}"
+          echo "Oracle listener port : ${ORACLE_LISTENER_PORT}"
+          echo "======================================================"
+
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            oracle-plan.tfout
