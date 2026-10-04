@@ -1,67 +1,20 @@
 # ============================================================
-# Oracle on Azure - Binary Blob Storage
+# Oracle on Azure - Blob Storage Private DNS VNet Link
 # ============================================================
 
-module "oracle_binary_storage" {
+resource "azurerm_private_dns_zone_virtual_network_link" "oracle_binary_storage" {
   count = var.oracle_vm_on_azure_enabled ? 1 : 0
 
-  source = "git::https://github.com/AbuDhabiCommercialBank/maz-tf-module-storage.git?ref=main"
+  provider = azurerm.connectivity
 
-  resource_group = module.oracle_vm_resource_group[0].rg_name
-  location       = var.location
-  environment    = var.environment
+  name = "oracle-binary-storage-${var.environment}-vnl"
 
-  application_name = "oraclebinary"
+  resource_group_name  = data.azurerm_private_dns_zone.sa_dns_zone.resource_group_name
+  private_dns_zone_name = data.azurerm_private_dns_zone.sa_dns_zone.name
 
-  storage_account_name = "cibg${var.environment}orabin"
-  storage_use          = "orabin"
+  virtual_network_id = module.base-infra.vnet_id
 
-  account_kind = "StorageV2"
-  skuname      = "Standard_LRS"
-
-  public_network_access_enabled   = false
-  allow_nested_items_to_be_public = false
-
-  containers_list = [
-    {
-      name        = "oracle-binaries"
-      access_type = "private"
-    }
-  ]
-
-  privatelink_subnet = {
-    name = module.base-infra.subnet_map[
-      "snet-cloud-native-pe-cibg-uaenorth-001"
-    ].name
-
-    vnet_name      = module.base-infra.vnet_name
-    resource_group = module.resource_group.rg_name
-  }
-
-  private_dns_zone_ids = data.azurerm_private_dns_zone.sa_dns_zone.id
-
-  customer_managed_key = true
-
-  managed_identity_type = "UserAssigned"
-
-  azurerm_key_vault_key = "oracle-binary-storage-key"
-  kv_name                = basename(module.azure_key_vault.id)
-  kv_resource_group_name = module.resource_group.rg_name
+  registration_enabled = false
 
   tags = local.tags
-}
-
-
-# ============================================================
-# Oracle VM Managed Identity - Blob Access
-# ============================================================
-
-resource "azurerm_role_assignment" "oracle_binary_blob_access" {
-  count = var.oracle_vm_on_azure_enabled ? 1 : 0
-
-  scope = module.oracle_binary_storage[0].storage_account_id
-
-  role_definition_name = "Storage Blob Data Contributor"
-
-  principal_id = azurerm_user_assigned_identity.oracle_binary_vm[0].principal_id
 }
