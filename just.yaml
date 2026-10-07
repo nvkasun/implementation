@@ -1,20 +1,36 @@
-settings = jsonencode({
-  commandToExecute = "printf 'ORACLE_PORT=%s\\nHEALTH_PORT=%s\\n' '${var.oracle_listener_port}' '${var.oracle_health_port}' > /etc/oracle-health.env"
-})
+extensions = {
+  oracle_health_config = {
+    name                 = "oracle-health-config"
+    publisher            = "Microsoft.Azure.Extensions"
+    type                 = "CustomScript"
+    type_handler_version = "2.1"
 
+    auto_upgrade_minor_version = true
+    automatic_upgrade_enabled  = false
 
-variable "oracle_health_port" {
-  description = "Port used by the Oracle Python health agent HTTP endpoint"
-  type        = number
-  default     = 8080
+    settings = jsonencode({
+      commandToExecute = "printf 'ORACLE_PORT=%s\\nHEALTH_PORT=%s\\n' '${var.oracle_listener_port}' '${var.oracle_health_port}' > /etc/oracle-health.env && /bin/bash /opt/oracle-health/configure-health-agent.sh"
+    })
+
+    protected_settings = null
+  }
 }
 
 
-And your LB probe should also use the same Terraform variable:
-resource "azurerm_lb_probe" "oracle_db_health" {
-  # ...
 
-  protocol     = "Http"
-  port         = var.oracle_health_port
-  request_path = "/health"
-}
+
+sudo ls -l /opt/oracle-health/configure-health-agent.sh
+
+After successful apply
+On each VM check:
+sudo cat /etc/oracle-health.env
+
+Expected:
+ORACLE_PORT=1701
+HEALTH_PORT=8080
+
+Then:
+sudo systemctl status oracle-health.service --no-pager
+
+And:
+curl -i http://127.0.0.1:8080/health
