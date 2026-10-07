@@ -1,43 +1,39 @@
-Don't change permissions, Oracle files, profiles, listener configs, or anything else. On CIBG VM2, run these:
-sudo -u oracle id
+First verify SQLPlus works once we provide the environment:
+sudo -u oracle env \
+ORACLE_HOME=/OraHome/ora26ai_DB_Home \
+ORACLE_SID=DFCASHDEV2 \
+PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin \
+LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib \
+/OraHome/ora26ai_DB_Home/bin/sqlplus -V
 
-Then:
-sudo -u oracle bash -c 'echo "HOME=$HOME"; echo "USER=$USER"; echo "TWO_TASK=${TWO_TASK:-<unset>}"; echo "LOCAL=${LOCAL:-<unset>}"'
-
-I especially want to know whether TWO_TASK or LOCAL is defined, because either could influence how SQLPlus tries to connect.
-Then check the binaries:
-sudo ls -l /OraHome/ora26ai_DB_Home/bin/sqlplus
-
-sudo ls -l /OraHome/ora26ai_DB_Home/bin/oracle
-
-And:
-sudo -u oracle /OraHome/ora26ai_DB_Home/bin/sqlplus -V
-
-All of those are read-only.
-Then let's test using the Oracle user's normal login environment
-This is important. Instead of constructing the entire environment ourselves, run:
-sudo -iu oracle
-
-Once you are at the oracle user's shell, run:
-echo $ORACLE_SID
-echo $ORACLE_HOME
-echo $PATH
-
-Don't export or modify anything yet.
-Then:
-sqlplus / as sysdba
-
-If that opens SQLPlus successfully and gives:
-Connected to:
-Oracle Database ...
-
-then run:
-SELECT name, open_mode, database_role, cdb FROM v$database;
+We want a clean version output. If that works, Oracle Home discovery is proven.
+Then check the exact Oracle executable metadata:
+sudo stat /OraHome/ora26ai_DB_Home/bin/oracle
 
 and:
-EXIT;
+sudo getcap /OraHome/ora26ai_DB_Home/bin/oracle 2>/dev/null
 
-This is probably the most valuable test right now.
-Why? Because the DBA may already have the correct Oracle runtime environment in the oracle user's login profile. If:
-sudo -iu oracle
-→ sqlplus / as sysdba
+Also:
+sudo namei -l /OraHome/ora26ai_DB_Home/bin/oracle
+
+These only inspect permissions; they change nothing.
+Then check the required libraries:
+sudo -u oracle env \
+ORACLE_HOME=/OraHome/ora26ai_DB_Home \
+LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib \
+ldd /OraHome/ora26ai_DB_Home/bin/oracle | grep -i "not found"
+
+Ideally this returns nothing.
+And finally, let's test the actual local connection with a simpler invocation—no nested printf or heredoc:
+sudo -u oracle env \
+ORACLE_HOME=/OraHome/ora26ai_DB_Home \
+ORACLE_SID=DFCASHDEV2 \
+PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin \
+LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib \
+/OraHome/ora26ai_DB_Home/bin/sqlplus "/ as sysdba"
+
+If you get a SQL> prompt, just run:
+SELECT name, open_mode, database_role, cdb FROM v$database;
+
+then:
+EXIT;
