@@ -1,29 +1,43 @@
-Next read-only checks on CIBG VM2
-Now run this first:
-sudo -u oracle bash -c '
-export ORACLE_HOME=/OraHome/ora26ai_DB_Home
-export ORACLE_SID=DFCASHDEV2
-export PATH=$ORACLE_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$ORACLE_HOME/lib
-$ORACLE_HOME/bin/lsnrctl status LISTENER_DFCASHDEV2
-'
+Don't change permissions, Oracle files, profiles, listener configs, or anything else. On CIBG VM2, run these:
+sudo -u oracle id
 
 Then:
-sudo -u oracle bash -c '
-export ORACLE_HOME=/OraHome/ora26ai_DB_Home
-export ORACLE_SID=DFCASHDEV2
-export PATH=$ORACLE_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$ORACLE_HOME/lib
-$ORACLE_HOME/bin/lsnrctl services LISTENER_DFCASHDEV2
-'
+sudo -u oracle bash -c 'echo "HOME=$HOME"; echo "USER=$USER"; echo "TWO_TASK=${TWO_TASK:-<unset>}"; echo "LOCAL=${LOCAL:-<unset>}"'
 
-These are read-only. They should give us the registered services and READY handlers that our Python service needs to validate.
-Then test local OS-authenticated SQL using the actual running SID:
-sudo -u oracle bash -c '
-export ORACLE_HOME=/OraHome/ora26ai_DB_Home
-export ORACLE_SID=DFCASHDEV2
-export PATH=$ORACLE_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$ORACLE_HOME/lib
-printf "SELECT name, open_mode, database_role, cdb FROM v\$database;\nEXIT;\n" |
-"$ORACLE_HOME/bin/sqlplus" -s "/ as sysdba"
-'
+I especially want to know whether TWO_TASK or LOCAL is defined, because either could influence how SQLPlus tries to connect.
+Then check the binaries:
+sudo ls -l /OraHome/ora26ai_DB_Home/bin/sqlplus
+
+sudo ls -l /OraHome/ora26ai_DB_Home/bin/oracle
+
+And:
+sudo -u oracle /OraHome/ora26ai_DB_Home/bin/sqlplus -V
+
+All of those are read-only.
+Then let's test using the Oracle user's normal login environment
+This is important. Instead of constructing the entire environment ourselves, run:
+sudo -iu oracle
+
+Once you are at the oracle user's shell, run:
+echo $ORACLE_SID
+echo $ORACLE_HOME
+echo $PATH
+
+Don't export or modify anything yet.
+Then:
+sqlplus / as sysdba
+
+If that opens SQLPlus successfully and gives:
+Connected to:
+Oracle Database ...
+
+then run:
+SELECT name, open_mode, database_role, cdb FROM v$database;
+
+and:
+EXIT;
+
+This is probably the most valuable test right now.
+Why? Because the DBA may already have the correct Oracle runtime environment in the oracle user's login profile. If:
+sudo -iu oracle
+→ sqlplus / as sysdba
