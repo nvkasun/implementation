@@ -1,2 +1,20 @@
-Ganesh, quick update — the custom Oracle health agent is now working successfully on the CIBG VMs and returning HTTP 200/HEALTHY. We are passing the Oracle listener port and health port from Terraform, and the agent is auto-discovering the running Oracle SID, Oracle Home, OS owner, listener name, PDB and registered service from the existing DB configuration.
-For UAT/PROD DB setup, if possible, please follow the same Oracle configuration pattern used on the current CIBG VM1/VM2 setup, especially the SID/oratab mapping, named listener and registered PDB service structure. This will allow the health agent to detect the correct DB/PDB service automatically without any hardcoded environment-specific values.
+settings = jsonencode({
+  commandToExecute = "printf 'ORACLE_PORT=%s\\nHEALTH_PORT=%s\\n' '${var.oracle_listener_port}' '${var.oracle_health_port}' > /etc/oracle-health.env"
+})
+
+
+variable "oracle_health_port" {
+  description = "Port used by the Oracle Python health agent HTTP endpoint"
+  type        = number
+  default     = 8080
+}
+
+
+And your LB probe should also use the same Terraform variable:
+resource "azurerm_lb_probe" "oracle_db_health" {
+  # ...
+
+  protocol     = "Http"
+  port         = var.oracle_health_port
+  request_path = "/health"
+}
