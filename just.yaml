@@ -1,13 +1,13 @@
-On VM2, run:
+Run this same read-only test again on VM1, but with the correct SID:
 sudo -u oraade env \
 ORACLE_HOME=/OraHome/ora26ai_DB_Home \
-ORACLE_SID=DFCASHDEV2 \
+ORACLE_SID=DFCASHDEV1 \
 PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin \
 LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib \
 /OraHome/ora26ai_DB_Home/bin/sqlplus "/ as sysdba"
 
-If you get a SQL> prompt, run:
+Then:
 SELECT name, open_mode, database_role, cdb FROM v$database;
 
-then:
+and:
 EXIT;
