@@ -1,50 +1,29 @@
-Yes bro — before we touch the script, testing the same discovery flow on CIBG VM2 is the right move, especially because the DBAs may already have completed the listener/DB configuration there.
-And we will use read-only commands only. Nothing below changes Oracle, listener configuration, files, firewall, services, or disks.
-One important thing from VM6 first: the SQL test did not succeed. ORA-12547: TNS:lost contact means we shouldn't assume local / as sysdba is working correctly there yet. We'll come back to that after comparing with CIBG.
-On CIBG VM2, run these in this order.
-1. Find the Oracle instance that is actually running
-ps -eo args | grep '[o]ra_pmon_'
+Next read-only checks on CIBG VM2
+Now run this first:
+sudo -u oracle bash -c '
+export ORACLE_HOME=/OraHome/ora26ai_DB_Home
+export ORACLE_SID=DFCASHDEV2
+export PATH=$ORACLE_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$ORACLE_HOME/lib
+$ORACLE_HOME/bin/lsnrctl status LISTENER_DFCASHDEV2
+'
 
-Send me the complete output.
-For example, if it gives:
-ora_pmon_DFCASHDEV2
+Then:
+sudo -u oracle bash -c '
+export ORACLE_HOME=/OraHome/ora26ai_DB_Home
+export ORACLE_SID=DFCASHDEV2
+export PATH=$ORACLE_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$ORACLE_HOME/lib
+$ORACLE_HOME/bin/lsnrctl services LISTENER_DFCASHDEV2
+'
 
-then we know:
-ORACLE_SID=DFCASHDEV2
-
-We should not use the first /etc/oratab entry, because your CIBG VM already has several SIDs configured.
-2. Confirm the Oracle Home mapping
-sudo cat /etc/oratab
-
-This is read-only.
-We'll match the SID discovered in step 1 with its corresponding Oracle Home, for example:
-DFCASHDEV2:/OraHome/ora26ai_DB_Home:N
-
-which tells us:
-ORACLE_HOME=/OraHome/ora26ai_DB_Home
-
-3. Check whether the listener process is actually running
-ps -ef | grep '[t]nslsnr'
-
-This one is particularly important.
-If CIBG is fully configured, I'm expecting something resembling:
-oracle ... /OraHome/ora26ai_DB_Home/bin/tnslsnr LISTENER ...
-
-Unlike VM6, where this command returned nothing.
-4. Find the existing listener config
-sudo find /OraHome -name listener.ora -type f 2>/dev/null
-
-Again, don't edit or cat anything yet.
-We just want to see whether CIBG has an actual:
-.../network/admin/listener.ora
-
-instead of only:
-.../network/admin/samples/listener.ora
-
-as we saw on VM6.
-5. Check listening TCP ports at OS level
-This is also completely read-only:
-sudo ss -lntp | grep -E 'tnslsnr|oracle'
-
-If the process-name filtering doesn't return anything, also run:
-sudo ss -lntp
+These are read-only. They should give us the registered services and READY handlers that our Python service needs to validate.
+Then test local OS-authenticated SQL using the actual running SID:
+sudo -u oracle bash -c '
+export ORACLE_HOME=/OraHome/ora26ai_DB_Home
+export ORACLE_SID=DFCASHDEV2
+export PATH=$ORACLE_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$ORACLE_HOME/lib
+printf "SELECT name, open_mode, database_role, cdb FROM v\$database;\nEXIT;\n" |
+"$ORACLE_HOME/bin/sqlplus" -s "/ as sysdba"
+'
