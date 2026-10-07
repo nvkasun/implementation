@@ -1,13 +1,10 @@
-ps -ef | grep '[t]nslsnr'
-
-Then:
 sudo -u oracle bash -c '
 export ORACLE_HOME=/OraHome/ora26ai_DB_Home
 export ORACLE_SID=DFCASHDEV1
 export PATH=$ORACLE_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$ORACLE_HOME/lib
-$ORACLE_HOME/bin/lsnrctl status
+$ORACLE_HOME/bin/sqlplus -s "/ as sysdba" <<EOF
+SELECT name, open_mode, database_role, cdb FROM v\$database;
+EXIT;
+EOF
 '
-
-And also:
-sudo find /OraHome -name listener.ora -type f 2>/dev/null
