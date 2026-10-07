@@ -1,368 +1,70 @@
-name: Oracle DB on Azure Release
+Current implementation uses the Linux oracle OS user with dba group access, and the health agent connects locally to the Oracle instance using sqlplus / as sysdba. With this approach, we do not need to maintain a DB username/password inside the health service. If we use a dedicated DB user instead, we would need to change the authentication method and also introduce a secure credential storage mechanism, such as Key Vault, Oracle Wallet, or another approved secret-management method. We would also need to grant that DB user the required monitoring privileges. For this reason, the current implementation is based on the local Oracle OS user and OS authentication.    Pasted markdown
+The health agent currently executes the following SQL checks:
+SELECT 'CHECK=1' FROM dual;
 
-run-name: 'Oracle DB on Azure Release: `${{ inputs.MODULE }}` to `${{ inputs.environment }}` - Listener `${{ inputs.oracle_listener_port }}` by `${{ github.actor }}`'
+SELECT name FROM v$database;
+SELECT open_mode FROM v$database;
+SELECT database_role FROM v$database;
+SELECT cdb FROM v$database;
 
-on:
-  workflow_dispatch:
-    inputs:
-      MODULE:
-        description: "Select module to deploy"
-        type: choice
-        required: true
-        options:
-          - oracle_db_on_azure
-      moduleVersion:
-        description: "Terraform configuration branch/version"
-        type: choice
-        required: true
-        options:
-          - main
-      environment:
-        description: "Target environment"
-        type: choice
-        required: true
-        options:
-          - tf-dev
-          - tf-uat
-          - tf-preprod
-          - tf-prod
-      oracle_listener_port:
-        description: "Oracle DB listener port configured by DBA"
-        type: string
-        required: true
+These are used to confirm SQL connectivity, identify the database, check whether it is READ WRITE, determine the database role, and identify whether the database is running as CDB or non-CDB.    Pasted markdown
+SELECT
+    name,
+    con_id,
+    open_mode,
+    restricted
+FROM v$pdbs
+WHERE UPPER(name) <> 'PDB$SEED'
+ORDER BY con_id;
 
-permissions:
-  packages: write
-  id-token: write
+This is used to discover the available application PDBs and validate that the target PDB is open in READ WRITE mode and is not running in restricted mode.    Pasted markdown
+SELECT
+    name,
+    network_name,
+    con_id
+FROM v$services
+WHERE name NOT IN ('SYS$BACKGROUND', 'SYS$USERS')
+ORDER BY con_id, name;
 
-jobs:
-  Approval-CCOE:
-    if: inputs.environment == 'tf-dev' || inputs.environment == 'tf-uat' || inputs.environment == 'tf-prod' || inputs.environment == 'tf-preprod'
-    runs-on: ubuntu-latest
-    environment: approval-ccoe
-    steps:
-      - name: Approval CCOE
-        if: needs.Approval-CCOE-CICOPS.result == 'failure'
-        run: echo 'Approvals not satisfied!' && exit 1
+This is used to identify the Oracle service/network service associated with the selected database or PDB.    Pasted markdown
+SELECT
+    con_id,
+    SUM(CASE WHEN type = 'USER' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN type = 'USER' AND status = 'ACTIVE' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN type = 'USER'
+             AND blocking_session IS NOT NULL THEN 1 ELSE 0 END)
+FROM v$session
+GROUP BY con_id;
 
-  terraform-init:
-    runs-on: ubuntu-latest
-    env:
-      MODULE: ${{ inputs.MODULE }}
-      ENVIRONMENT: ${{ inputs.environment }}
-      TERRAFORM_REPOSITORY_CLONE_PATH: ${{ vars.TERRAFORM_REPOSITORY_CLONE_PATH }}
-      TERRAFORM_REPOSITORY: ${{ vars.TERRAFORM_REPOSITORY }}
-    steps:
-      - name: Validate Oracle listener port
-        run: |
-          set -euo pipefail
-          ORACLE_PORT="${{ inputs.oracle_listener_port }}"
-          echo "Validating Oracle listener port: ${ORACLE_PORT}"
-          if ! [[ "${ORACLE_PORT}" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: Oracle listener port must be numeric."
-            exit 1
-          fi
-          if (( ORACLE_PORT < 1700 || ORACLE_PORT > 1900 )); then
-            echo "ERROR: Oracle listener port must be between 1700 and 1900."
-            exit 1
-          fi
-          echo "Oracle listener port validation successful."
+This is used to collect total user sessions, active sessions, and blocked sessions.    Pasted markdown
+SELECT
+    w.con_id,
+    COUNT(DISTINCT b.sid)
+FROM v$session w
+JOIN v$session b
+    ON b.sid = w.blocking_session
+WHERE w.type = 'USER'
+  AND w.blocking_session IS NOT NULL
+GROUP BY w.con_id;
 
-      - name: CICD Bot token
-        id: cicd-bot-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ vars.CICD_BOT_APP_ID || '981379' }}
-          private-key: ${{ secrets.CICD_BOT_APP_KEY }}
-          owner: ${{ github.repository_owner }}
+This identifies the number of blocking sessions for the selected container.    Pasted markdown
+SELECT
+    current_utilization,
+    limit_value
+FROM v$resource_limit
+WHERE resource_name = 'sessions';
 
-      - name: CICD Bot setup
-        run: |
-          user_id=`gh api "/users/${{ steps.cicd-bot-token.outputs.app-slug }}[bot]" --jq .id`
-          git config --global user.name "${{ steps.cicd-bot-token.outputs.app-slug }}[bot]"
-          git config --global user.email "$user_id+${{ steps.cicd-bot-token.outputs.app-slug }}[bot]@users.noreply.github.com"
-          echo "GH_TOKEN=$GH_TOKEN" >> $GITHUB_ENV
-        env:
-          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
+This is used to calculate the current session utilization against the configured Oracle session limit.    Pasted markdown
+For the final target validation, the agent also runs:
+SELECT 'TARGET_CHECK=1' || COUNT(*) FROM dual;
 
-      - name: Checkout GitOps repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ steps.cicd-bot-token.outputs.token }}
+SELECT
+    'TARGET_CONTAINER=' ||
+    SYS_CONTEXT('USERENV', 'CON_NAME')
+FROM dual;
 
-      - name: Checkout application repository
-        id: checkout-application-repository
-        uses: actions/checkout@v4
-        with:
-          path: ${{ env.TERRAFORM_REPOSITORY_CLONE_PATH }}
-          repository: ${{ env.TERRAFORM_REPOSITORY }}
-          ref: ${{ inputs.moduleVersion }}
-          token: ${{ steps.cicd-bot-token.outputs.token }}
+If the selected target is a PDB, the agent first switches to the target container using:
+ALTER SESSION SET CONTAINER = "<PDB_NAME>";
 
-      - name: Download Terraform
-        run: |
-          curl -Lo /tmp/terraform.zip https://releases.hashicorp.com/terraform/1.6.3/terraform_1.6.3_linux_$(dpkg --print-architecture).zip >/dev/null 2>&1
-          sudo apt-get install unzip
-          sudo unzip /tmp/terraform.zip -d /tmp && sudo mv /tmp/terraform /usr/local/bin/ && \
-          sudo chmod +x /usr/local/bin/terraform
-          ls -latr
-          terraform --version
-
-      - name: terraform init
-        env:
-          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
-        run: |
-          echo "::add-mask::$GH_TOKEN"
-          export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf"
-          export GIT_CONFIG_VALUE_0="https://github.com/"
-          cd terraform
-          terraform init -backend=false
-          terraform validate
-          tar -czf terraform_modules.tar.gz .terraform
-          tar -czf terraform_lock.tar.gz .terraform.lock.hcl
-
-      - name: Upload Artifact for terraform modules
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform_modules
-          path: terraform/terraform_modules.tar.gz
-          retention-days: 1
-
-      - name: Upload Artifact for terraform lock
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform_lock
-          path: terraform/terraform_lock.tar.gz
-          retention-days: 1
-
-  terraform-plan:
-    runs-on: self-hosted
-    needs: terraform-init
-    environment: ${{ github.event.inputs.environment }}
-    env:
-      MODULE: ${{ inputs.MODULE }}
-      TFVARS_ENV: ${{ vars.TFVARS_ENV }}
-      AZURE_IDENTITY: ${{ vars.AZURE_IDENTITY }}
-      AZURE_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION }}
-      AZURE_TENANT: ${{ vars.AZURE_TENANT }}
-      TERRAFORM_REPOSITORY_CLONE_PATH: ${{ vars.TERRAFORM_REPOSITORY_CLONE_PATH }}
-      TERRAFORM_REPOSITORY: ${{ vars.TERRAFORM_REPOSITORY }}
-      ORACLE_LISTENER_PORT: ${{ inputs.oracle_listener_port }}
-    steps:
-      - name: CICD Bot token
-        id: cicd-bot-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ vars.CICD_BOT_APP_ID || '981379' }}
-          private-key: ${{ secrets.CICD_BOT_APP_KEY }}
-          owner: ${{ github.repository_owner }}
-
-      - name: CICD Bot setup
-        run: |
-          user_id=`gh api "/users/${{ steps.cicd-bot-token.outputs.app-slug }}[bot]" --jq .id`
-          git config --global user.name "${{ steps.cicd-bot-token.outputs.app-slug }}[bot]"
-          git config --global user.email "$user_id+${{ steps.cicd-bot-token.outputs.app-slug }}[bot]@users.noreply.github.com"
-          echo "GH_TOKEN=$GH_TOKEN" >> $GITHUB_ENV
-        env:
-          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
-
-      - name: Checkout GitOps repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ steps.cicd-bot-token.outputs.token }}
-
-      - name: Checkout application repository
-        id: checkout-application-repository
-        uses: actions/checkout@v4
-        with:
-          path: ${{ env.TERRAFORM_REPOSITORY_CLONE_PATH }}
-          repository: ${{ env.TERRAFORM_REPOSITORY }}
-          ref: ${{ inputs.moduleVersion }}
-          token: ${{ steps.cicd-bot-token.outputs.token }}
-
-      - name: Download terraform modules
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform_modules
-          path: terraform
-
-      - name: Download terraform lock
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform_lock
-          path: terraform
-
-      - name: terraform extract modules
-        run: |
-          cd terraform
-          tar -xzf terraform_lock.tar.gz .terraform.lock.hcl
-          tar -xzf terraform_modules.tar.gz
-
-      - name: Log in with Azure
-        uses: azure/login@v2
-        with:
-          client-id: ${{ env.AZURE_IDENTITY }}
-          tenant-id: ${{ env.AZURE_TENANT }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION }}
-
-      - name: terraform plan
-        env:
-          TF_LOG: DEBUG
-          TF_LOG_PATH: ./terraform-debug.log
-        run: |
-          export APPSETTING_WEBSITE_SITE_NAME='azcli-workaround'
-          export ARM_USE_MSI=true
-          export ARM_SUBSCRIPTION_ID=${{ env.AZURE_SUBSCRIPTION }}
-          export ARM_TENANT_ID=${{ env.AZURE_TENANT }}
-          export ARM_CLIENT_ID=${{ env.AZURE_IDENTITY }}
-          cd terraform
-
-          if [[ "${{ inputs.MODULE }}" == "oracle_db_on_azure" ]]; then
-            echo "Planning Oracle DB on Azure infrastructure"
-            echo "Environment          : ${{ env.TFVARS_ENV }}"
-            echo "Oracle listener port : ${ORACLE_LISTENER_PORT}"
-
-            terraform init \
-              -plugin-dir="$PWD/.terraform/providers" \
-              -backend-config="config/${{ env.TFVARS_ENV }}.config"
-
-            terraform refresh \
-              -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars" \
-              -var="oracle_listener_port=${ORACLE_LISTENER_PORT}"
-
-            terraform plan \
-              --target=module.base-infra \
-              --target=module.oracle_vm_resource_group \
-              --target=azurerm_user_assigned_identity.oracle_binary_vm \
-              --target=module.oracle_binary_vm01 \
-              --target=module.oracle_binary_vm02 \
-              --target=azurerm_lb.oracle_db \
-              --target=azurerm_lb_backend_address_pool.oracle_db \
-              --target=azurerm_network_interface_backend_address_pool_association.oracle_db \
-              --target=azurerm_lb_probe.oracle_db_health \
-              --target=azurerm_lb_rule.oracle_db \
-              --target=module.oracle_binary_storage \
-              --target=azurerm_role_assignment.oracle_binary_blob_access \
-              -var-file="tfvars/${{ env.TFVARS_ENV }}.tfvars" \
-              -var="oracle_listener_port=${ORACLE_LISTENER_PORT}" \
-              -out=plan.tfout
-          else
-            echo "ERROR: Unsupported module: ${{ inputs.MODULE }}"
-            exit 1
-          fi
-
-      - name: Upload terraform debug
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform_debug
-          path: |
-            terraform/terraform_plan.log
-            terraform/terraform-debug.log
-            terraform/terraform.tfstate
-          retention-days: 1
-
-      - name: Upload terraform plan
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform_plan
-          path: terraform/plan.tfout
-          retention-days: 1
-
-  terraform-apply:
-    runs-on: self-hosted
-    needs: [terraform-plan, Approval-CCOE]
-    environment: ${{ github.event.inputs.environment }}
-    env:
-      MODULE: ${{ inputs.MODULE }}
-      TFVARS_ENV: ${{ vars.TFVARS_ENV }}
-      AZURE_IDENTITY: ${{ vars.AZURE_IDENTITY }}
-      AZURE_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION }}
-      AZURE_TENANT: ${{ vars.AZURE_TENANT }}
-      TERRAFORM_REPOSITORY_CLONE_PATH: ${{ vars.TERRAFORM_REPOSITORY_CLONE_PATH }}
-      TERRAFORM_REPOSITORY: ${{ vars.TERRAFORM_REPOSITORY }}
-      ORACLE_LISTENER_PORT: ${{ inputs.oracle_listener_port }}
-    steps:
-      - name: CICD Bot token
-        id: cicd-bot-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ vars.CICD_BOT_APP_ID || '981379' }}
-          private-key: ${{ secrets.CICD_BOT_APP_KEY }}
-          owner: ${{ github.repository_owner }}
-
-      - name: CICD Bot setup
-        run: |
-          user_id=`gh api "/users/${{ steps.cicd-bot-token.outputs.app-slug }}[bot]" --jq .id`
-          git config --global user.name "${{ steps.cicd-bot-token.outputs.app-slug }}[bot]"
-          git config --global user.email "$user_id+${{ steps.cicd-bot-token.outputs.app-slug }}[bot]@users.noreply.github.com"
-          echo "GH_TOKEN=$GH_TOKEN" >> $GITHUB_ENV
-        env:
-          GH_TOKEN: ${{ steps.cicd-bot-token.outputs.token }}
-
-      - name: Checkout GitOps repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ steps.cicd-bot-token.outputs.token }}
-
-      - name: Checkout application repository
-        id: checkout-application-repository
-        uses: actions/checkout@v4
-        with:
-          path: ${{ env.TERRAFORM_REPOSITORY_CLONE_PATH }}
-          repository: ${{ env.TERRAFORM_REPOSITORY }}
-          ref: ${{ inputs.moduleVersion }}
-          token: ${{ steps.cicd-bot-token.outputs.token }}
-
-      - name: Download terraform modules
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform_modules
-          path: terraform
-
-      - name: Download terraform lock
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform_lock
-          path: terraform
-
-      - name: Download terraform plan
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform_plan
-          path: terraform
-
-      - name: terraform extract modules
-        run: |
-          cd terraform
-          tar -xzf terraform_lock.tar.gz .terraform.lock.hcl
-          tar -xzf terraform_modules.tar.gz
-          ls -latr
-
-      - name: Log in with Azure
-        uses: azure/login@v2
-        with:
-          client-id: ${{ env.AZURE_IDENTITY }}
-          tenant-id: ${{ env.AZURE_TENANT }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION }}
-
-      - name: terraform apply
-        run: |
-          export APPSETTING_WEBSITE_SITE_NAME='azcli-workaround'
-          export ARM_USE_MSI=true
-          export ARM_SUBSCRIPTION_ID=${{ env.AZURE_SUBSCRIPTION }}
-          export ARM_TENANT_ID=${{ env.AZURE_TENANT }}
-          export ARM_CLIENT_ID=${{ env.AZURE_IDENTITY }}
-          cd terraform
-
-          echo "Applying Oracle DB on Azure Terraform plan"
-          echo "Environment          : ${{ env.TFVARS_ENV }}"
-          echo "Oracle listener port : ${ORACLE_LISTENER_PORT}"
-
-          terraform init \
-            -plugin-dir="$PWD/.terraform/providers" \
-            -backend-config="config/${{ env.TFVARS_ENV }}.config"
-
-          terraform apply \
-            -auto-approve \
-            plan.tfout
+This confirms that SQL can actually be executed against the intended target database/PDB, not only against the root instance.    Pasted markdown
+Apart from the SQL checks, the service also validates the Oracle listener using lsnrctl status and lsnrctl services, confirms the actual listener port matches the port passed from Terraform, checks local TCP connectivity to that listener port, and verifies that the expected Oracle service is registered and in READY status.    Pasted markdown
