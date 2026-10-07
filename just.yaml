@@ -1,6 +1,25 @@
-Then validate:
-sudo systemctl status oracle-health.service --no-pager
+Before changing the code, check whether the listener is still running
+Run these right now on VM2:
+ps -ef | grep '[t]nslsnr'
 
-sudo journalctl -u oracle-health.service -n 100 --no-pager
+then:
+sudo ss -lntp | grep 1701
 
-curl -i http://127.0.0.1:8080/health
+then run the same command that worked before:
+sudo -u oraade env \
+ORACLE_HOME=/OraHome/ora26ai_DB_Home \
+ORACLE_SID=DFCASHDEV2 \
+PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin \
+LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib \
+/OraHome/ora26ai_DB_Home/bin/lsnrctl status LISTENER_DFCASHDEV2
+
+
+Very useful exact comparison test
+First get the health service PID:
+systemctl show oracle-health.service -p MainPID
+
+Then show what environment the service actually has:
+sudo systemctl show oracle-health.service --property=Environment
+
+Also:
+sudo systemctl cat oracle-health.service
