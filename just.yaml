@@ -1,29 +1,13 @@
-This is the most valuable next check. On CIBG VM2 run:
-ps -ef | grep '[o]ra_pmon_DFCASHDEV2'
+On VM2, run:
+sudo -u oraade env \
+ORACLE_HOME=/OraHome/ora26ai_DB_Home \
+ORACLE_SID=DFCASHDEV2 \
+PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin \
+LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib \
+/OraHome/ora26ai_DB_Home/bin/sqlplus "/ as sysdba"
 
-This time I want the username column, not only the process arguments.
-Then:
-PMON_PID=$(pgrep -f 'ora_pmon_DFCASHDEV2' | head -1)
-echo "$PMON_PID"
-sudo readlink -f /proc/$PMON_PID/exe
+If you get a SQL> prompt, run:
+SELECT name, open_mode, database_role, cdb FROM v$database;
 
-And:
-sudo ls -l /proc/$PMON_PID/exe
-
-This tells us which Oracle executable the already-running DFCASHDEV2 instance is actually using.
-Also run:
-sudo ls -l /OraHome/ora26ai_DB_Home/bin/oracle
-sudo ls -Z /OraHome/ora26ai_DB_Home/bin/oracle
-
-and:
-getenforce
-
-If getenforce says:
-Enforcing
-
-then the unlabeled_t context becomes particularly interesting. But again, do not run chcon, restorecon, chmod, chown, or disable SELinux. We only inspect.
-One more very useful comparison
-If you have CIBG VM1 and the DBA configured it similarly, run these same read-only commands there:
-sudo stat /OraHome/ora26ai_DB_Home/bin/oracle
-sudo ls -Z /OraHome/ora26ai_DB_Home/bin/oracle
-ps -ef | grep '[o]ra_pmon_'
+then:
+EXIT;
