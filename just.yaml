@@ -1,2 +1,17 @@
-Since we are continuing with the OS authentication model, could you please confirm the following values for the target DB environment: Oracle SID, Oracle listener port, Oracle service name, target PDB name if applicable, Oracle Home path, and confirmation that the oracle OS user is available with dba group membership.  
-Also please confirm whether we should enforce any health thresholds for active sessions, session utilization, or blocking sessions. If no thresholds are required, we will leave those checks informational only.
+extensions = {
+  oracle_health_config = {
+    name                 = "oracle-health-config"
+    publisher            = "Microsoft.Azure.Extensions"
+    type                 = "CustomScript"
+    type_handler_version = "2.1"
+
+    auto_upgrade_minor_version = true
+    automatic_upgrade_enabled  = false
+
+    settings = jsonencode({
+      commandToExecute = "printf 'ORACLE_PORT=%s\\n' '${var.oracle_listener_port}' > /etc/oracle-health.env"
+    })
+
+    protected_settings = null
+  }
+}
