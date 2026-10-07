@@ -1,13 +1,8 @@
-Run this same read-only test again on VM1, but with the correct SID:
-sudo -u oraade env \
-ORACLE_HOME=/OraHome/ora26ai_DB_Home \
-ORACLE_SID=DFCASHDEV1 \
-PATH=/OraHome/ora26ai_DB_Home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin \
-LD_LIBRARY_PATH=/OraHome/ora26ai_DB_Home/lib \
-/OraHome/ora26ai_DB_Home/bin/sqlplus "/ as sysdba"
+For CIBG VM1 and VM2, manually create/update the env file first:
+sudo tee /etc/oracle-health.env >/dev/null <<'EOF'
+ORACLE_PORT=1701
+HEALTH_PORT=8080
+EOF
 
-Then:
-SELECT name, open_mode, database_role, cdb FROM v$database;
-
-and:
-EXIT;
+Then verify:
+sudo cat /etc/oracle-health.env
