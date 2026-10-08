@@ -1,6 +1,16 @@
-CIBG PROD – Oracle on Azure Prerequisites
-For the PROD network details, we can proceed with the next available subnet CIDR range as 10.117.131.64/26. Could you please raise the required firewall request for this subnet and share the related CRQ once available, so we can proceed with the PROD deployment activities.
-For the PROD Oracle listener port, Ganesh, could you please confirm the production-specific listener port that will be configured for the Oracle database. Once confirmed, I will align the Terraform deployment configuration and Load Balancer rule with the same port.
-Regarding custom image access, Paleri, please confirm the preferred approach for PROD. For the CIBG DEV deployment, we referenced the custom machine image directly from the existing Cloud Factory Azure Compute Gallery. We can follow the same model for PROD as well, which would allow us to proceed without introducing any additional image-migration activity.
-Alternatively, if we want to follow a more centralized PROD image-management approach, we can create a new Azure Compute Gallery in the Engineering subscription, provision a temporary VM there from the existing image, create an Engineering-owned custom image, and then reference that image for the CIBG PROD VM deployment. However, this option will require additional coordination and CCOE approvals and will take more time to complete. Please advise which approach you would prefer us to follow for PROD.
-For the Oracle data disk requirements, Ganesh, could you please confirm the required data disk size for the PROD Oracle VMs so that I can include the correct disk configuration in Terraform.
+Hi Udey and Paleri,
+
+Good day!
+
+I would like to request your approval for my planned annual leave from **9 November to 27 November 2026**, with an expected return to work on **Monday, 30 November 2026**.
+
+I have checked with Iconic HR and confirmed that I have sufficient annual leave balance available to cover the requested period.
+
+I will ensure that my ongoing activities are properly coordinated and any necessary handovers are completed in advance to avoid disruptions during my absence.
+
+I would appreciate your approval for the above leave period.
+
+Thank you for your understanding and support.
+
+Best regards,  
+Kasun
