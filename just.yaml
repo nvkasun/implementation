@@ -36,3 +36,18 @@ for i in range(1, REQUESTS + 1):
         )
 
     time.sleep(DELAY_SECONDS)
+
+
+
+
+
+    ------------
+    jdbc:oracle:thin:@//10.114.83.4:1701/dfcashdev
+
+    Health probe only:
+http://<backend-vm-ip>:8080/health
+
+
+
+if they use JDBC:
+jdbc:oracle:thin:@//10.114.83.4:1701/<actual-service-name>
