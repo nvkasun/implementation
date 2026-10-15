@@ -1,12 +1,97 @@
-Hi Paleri,
+cat > gg-migration-check.sh <<'EOF'
+#!/bin/bash
+set -u
 
-Thank you for your confirmation.
+ARGO_NS="argocd"
+GG_NS="goldengate-dev"
 
-Yes, I have already aligned with Sawan regarding my planned leave, and we have coordinated to ensure continuity of ongoing activities during my absence.
+PAIRS=(
+  "gg-mssql-repltest-01|gg-mssql-repltest-001"
+  "gg-oracle-repltest-01|gg-oracle-repltest-002"
+  "gg-postgresql-repltest-01|gg-postgresql-repltest-001"
+  "gg-postgresql-repltest-02|gg-postgresql-repltest-002"
+)
 
-I will also ensure any necessary handovers are completed before proceeding on leave.
+exists() {
+  local kind="$1" name="$2" ns="$3"
+  if kubectl get "$kind" "$name" -n "$ns" >/dev/null 2>&1; then
+    echo "EXISTS"
+  else
+    echo "ABSENT"
+  fi
+}
 
-Thank you for your support.
+echo "===== GG RUNTIME MIGRATION STATE ====="
 
-Best regards,  
-Kasun
+for pair in "${PAIRS[@]}"; do
+  OLD="${pair%%|*}"
+  NEW="${pair##*|}"
+
+  OLD_SUFFIX="${OLD#gg-}"
+  NEW_SUFFIX="${NEW#gg-}"
+
+  OLD_APP="goldengate-dev-${OLD_SUFFIX}"
+  NEW_APP="goldengate-dev-${NEW_SUFFIX}"
+
+  OLD_APPSET="${OLD_APP}-appset"
+  NEW_APPSET="${NEW_APP}-appset"
+
+  OLD_PVC="${OLD}-u02"
+
+  echo
+  echo "PAIR=$OLD -> $NEW"
+
+  echo "OLD_APPSET=$(exists applicationset "$OLD_APPSET" "$ARGO_NS")"
+  echo "OLD_APP=$(exists application "$OLD_APP" "$ARGO_NS")"
+  echo "OLD_STS=$(exists statefulset "$OLD" "$GG_NS")"
+
+  echo "NEW_APPSET=$(exists applicationset "$NEW_APPSET" "$ARGO_NS")"
+  echo "NEW_APP=$(exists application "$NEW_APP" "$ARGO_NS")"
+  echo "NEW_STS=$(exists statefulset "$NEW" "$GG_NS")"
+
+  if kubectl get application "$NEW_APP" -n "$ARGO_NS" >/dev/null 2>&1; then
+    kubectl get application "$NEW_APP" -n "$ARGO_NS" \
+      -o jsonpath='NEW_ARGO_SYNC={.status.sync.status}{" NEW_ARGO_HEALTH="}{.status.health.status}{"\n"}'
+  fi
+
+  if kubectl get statefulset "$NEW" -n "$GG_NS" >/dev/null 2>&1; then
+    kubectl get statefulset "$NEW" -n "$GG_NS" \
+      -o jsonpath='NEW_STS_READY={.status.readyReplicas}{"/"}{.status.replicas}{"\n"}'
+
+    kubectl get statefulset "$NEW" -n "$GG_NS" \
+      -o jsonpath='NEW_U02_CLAIM={.spec.template.spec.volumes[?(@.name=="u02")].persistentVolumeClaim.claimName}{"\n"}'
+  fi
+
+  if kubectl get statefulset "$OLD" -n "$GG_NS" >/dev/null 2>&1; then
+    kubectl get statefulset "$OLD" -n "$GG_NS" \
+      -o jsonpath='OLD_STS_READY={.status.readyReplicas}{"/"}{.status.replicas}{"\n"}'
+  fi
+
+  if kubectl get pvc "$OLD_PVC" -n "$GG_NS" >/dev/null 2>&1; then
+    PV="$(kubectl get pvc "$OLD_PVC" -n "$GG_NS" -o jsonpath='{.spec.volumeName}')"
+
+    kubectl get pvc "$OLD_PVC" -n "$GG_NS" \
+      -o jsonpath='PVC={.metadata.name}{" PVC_STATUS="}{.status.phase}{" PV="}{.spec.volumeName}{"\n"}'
+
+    kubectl get pv "$PV" \
+      -o jsonpath='PV_STATUS={.status.phase}{" RECLAIM="}{.spec.persistentVolumeReclaimPolicy}{" DRIVER="}{.spec.csi.driver}{" HANDLE="}{.spec.csi.volumeHandle}{"\n"}'
+  else
+    echo "PVC=$OLD_PVC ABSENT"
+  fi
+done
+
+echo
+echo "===== CURRENT GOLDENGATE ARGO APPS ====="
+kubectl get applications -n "$ARGO_NS" \
+  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' \
+  | grep -E 'NAME|goldengate-dev-.*repltest' || true
+
+echo
+echo "===== CURRENT GOLDENGATE STATEFULSETS ====="
+kubectl get statefulsets -n "$GG_NS" \
+  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,REPLICAS:.status.replicas' \
+  | grep -E 'NAME|repltest' || true
+EOF
+
+chmod +x gg-migration-check.sh
+./gg-migration-check.sh
