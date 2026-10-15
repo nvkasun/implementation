@@ -6853,7 +6853,7 @@ fi
 echo ""
 echo "--- DynamoDB CONFIG Identity Migration Correction: bounded legacy-content-preserving migration ---"
 
-# Structural proof: the exact four bounded old->new CONFIG identity mappings exist in envs/dev/dynamodb.tf, the migration-window variable defaults to pending (true), the read-only legacy data source and its fail-closed precondition contract exist, the item selection ternary correctly wires the bounded map/variable/data source together, and -- critically -- NO moved block was added for these four CONFIG for_each keys (a moved block here would be actively wrong: it would freeze the stale OLD physical key forever under ignore_changes=[item], never a valid fix for this resource, unlike envs/dev/efs.tf's module.goldengate_runtime_efs).
+# Structural proof: the exact four bounded old->new CONFIG identity mappings exist in envs/dev/dynamodb.tf, the explicit per-id migration-disposition sets (copy_required_ids/legacy_absent_ids) classify all four as LEGACY_CONFIG_ABSENT for today's live-proven DEV state (copy_required_ids empty), the read-only legacy data source and its fail-closed precondition contract exist (restricted to COPY_REQUIRED membership), the item selection ternary correctly wires the bounded map/disposition/data source together, and -- critically -- NO moved block was added for these four CONFIG for_each keys (a moved block here would be actively wrong: it would freeze the stale OLD physical key forever under ignore_changes=[item], never a valid fix for this resource, unlike envs/dev/efs.tf's module.goldengate_runtime_efs).
 if [ "$PYTHON_AVAILABLE" = "true" ]; then
   DYNAMODB_CONFIG_MIGRATION_CHECK="$(python3 -c '
 import re
@@ -6883,20 +6883,26 @@ check("2: no migration mapping exists for an unrelated/future runtime (exactly f
 
 check("3: new canonical deployment IDs gg-postgresql-repltest-001/gg-mssql-repltest-001/gg-oracle-repltest-002/gg-postgresql-repltest-002 are exactly the map keys", set(map_pairs.keys()) == set(REQUIRED_PAIRS.keys()))
 
-var_match = re.search(r"variable \"goldengate_config_migration_pending\" \{(.*?)\n\}", dynamodb_tf, re.S)
-check("goldengate_config_migration_pending variable exists", var_match is not None)
-var_body = var_match.group(1) if var_match else ""
-check("goldengate_config_migration_pending defaults to true (the real live migration has not run as of this correction)", re.search(r"default\s*=\s*true", var_body) is not None)
-check("goldengate_config_migration_pending is typed bool", re.search(r"type\s*=\s*bool", var_body) is not None)
+copy_required_match = re.search(r"goldengate_config_migration_copy_required_ids\s*=\s*toset\(\[(.*?)\]\)", dynamodb_tf, re.S)
+check("goldengate_config_migration_copy_required_ids local exists", copy_required_match is not None)
+copy_required_ids = set(re.findall(r"\"([^\"]+)\"", copy_required_match.group(1))) if copy_required_match else None
+check("current DEV migration disposition: copy_required_ids is EMPTY -- live Terraform evidence proved all four legacy CONFIG items absent, so none are copy-required", copy_required_ids == set())
+
+legacy_absent_match = re.search(r"goldengate_config_migration_legacy_absent_ids\s*=\s*toset\(\[(.*?)\]\)", dynamodb_tf, re.S)
+check("goldengate_config_migration_legacy_absent_ids local exists", legacy_absent_match is not None)
+legacy_absent_ids = set(re.findall(r"\"([^\"]+)\"", legacy_absent_match.group(1))) if legacy_absent_match else None
+check("current DEV migration disposition: legacy_absent_ids is EXACTLY the four bounded NEW ids -- matches the live-proven absence of all four legacy CONFIG items", legacy_absent_ids == set(REQUIRED_PAIRS.keys()))
+check("no coarse goldengate_config_migration_pending boolean/variable construct remains (a historical mention in an explanatory comment is fine -- the actual variable declaration and var.* references must be gone) -- disposition is per-id and explicit, never a single toggle applied uniformly to all four", "variable \"goldengate_config_migration_pending\"" not in dynamodb_tf and "var.goldengate_config_migration_pending" not in dynamodb_tf)
 
 data_match = re.search(r"data \"aws_dynamodb_table_item\" \"legacy_pipeline_config\" \{(.*?)\n\}\n\n#", dynamodb_tf, re.S)
 check("6: read-only legacy CONFIG data source exists", data_match is not None)
 data_body = data_match.group(1) if data_match else ""
-check("legacy CONFIG data source for_each is gated on goldengate_config_migration_pending, sourced from the bounded map only (never all deployments)", "var.goldengate_config_migration_pending ? local.goldengate_config_migration_source_ids : {}" in data_body)
+check("legacy CONFIG data source for_each is restricted to ids classified COPY_REQUIRED, sourced from the bounded map only (never all deployments, never the legacy_absent ids)", "if contains(local.goldengate_config_migration_copy_required_ids, new_id)" in data_body)
 check("legacy CONFIG data source reads by the OLD id (each.value), never the NEW id (each.key)", "S = each.value" in data_body and "pipeline   = { S = each.value }" in data_body.replace("\n", " ").replace("  ", " ") or "each.value" in data_body)
 check("legacy CONFIG data source targets the same gg-eks-pipeline table and CONFIG recordType", "table_name = \"gg-eks-pipeline\"" in data_body and "\"CONFIG\"" in data_body)
 check("11/12/13: fail-closed postcondition rejects a read-back item whose own pipeline.S does not exactly equal the mapped OLD id (missing/malformed/foreign identity)", "jsondecode(self.item).pipeline.S, null) == each.value" in data_body)
 check("13: fail-closed postcondition rejects a read-back item whose own recordType.S is not exactly \"CONFIG\"", "jsondecode(self.item).recordType.S, null) == \"CONFIG\"" in data_body)
+check("for the current DEV state (copy_required_ids empty), the legacy CONFIG data source for_each necessarily evaluates to zero instances -- no legacy_pipeline_config data read is performed for any of the four bounded ids", copy_required_ids == set())
 
 contract_match = re.search(r"resource \"terraform_data\" \"goldengate_config_migration_contract\" \{(.*?)\n\}\n", dynamodb_tf, re.S)
 check("fail-closed migration-contract precondition resource exists", contract_match is not None)
@@ -6904,12 +6910,14 @@ contract_body = contract_match.group(1) if contract_match else ""
 check("7/8: precondition rejects a NEW id mapped to itself", "new_id != old_id" in contract_body)
 check("9: precondition rejects a chained/duplicate old<->new identity (setintersection == 0)", "setintersection" in contract_body)
 check("2: precondition pins the map to exactly four entries, never a general onboarding mechanism", "length(local.goldengate_config_migration_source_ids) == 4" in contract_body)
+check("15: precondition rejects copy_required_ids and legacy_absent_ids overlapping", "setintersection(local.goldengate_config_migration_copy_required_ids, local.goldengate_config_migration_legacy_absent_ids)) == 0" in contract_body)
+check("16/17: precondition requires the union of copy_required_ids and legacy_absent_ids to equal exactly the four bounded source ids -- rejects an omitted or an unknown id in either set", "setunion(local.goldengate_config_migration_copy_required_ids, local.goldengate_config_migration_legacy_absent_ids) == toset(keys(local.goldengate_config_migration_source_ids))" in contract_body)
 
 pipeline_config_match = re.search(r"resource \"aws_dynamodb_table_item\" \"pipeline_config\" \{(.*?)\n\}\n\nmodule \"goldengate_alerts\"", dynamodb_tf, re.S)
 check("pipeline_config resource block located", pipeline_config_match is not None)
 pipeline_config_body = pipeline_config_match.group(1) if pipeline_config_match else ""
-check("4/10: item selection ternary is gated on BOTH goldengate_config_migration_pending AND contains(...) membership in the bounded map -- a future/unrelated deployment ID (never a map member) always takes the plain-default branch, regardless of the pending switch", "var.goldengate_config_migration_pending && contains(keys(local.goldengate_config_migration_source_ids), each.key)" in pipeline_config_body)
-check("2/4/5/6/9: the bounded (pending) branch never assigns the legacy data source item verbatim -- it decodes it, merges in an override, and re-encodes (jsondecode(...) -> merge(...) -> jsonencode(...)), never re-synthesizing a default body for a migrated id either", "jsonencode(merge(" in pipeline_config_body and "jsondecode(data.aws_dynamodb_table_item.legacy_pipeline_config[each.key].item)" in pipeline_config_body)
+check("4/10: item selection ternary is gated on contains(...) membership in goldengate_config_migration_copy_required_ids -- a LEGACY_CONFIG_ABSENT id and a future/unrelated deployment ID (neither a COPY_REQUIRED member) always take the plain-default branch", "contains(local.goldengate_config_migration_copy_required_ids, each.key)" in pipeline_config_body)
+check("2/4/5/6/9: the COPY_REQUIRED branch never assigns the legacy data source item verbatim -- it decodes it, merges in an override, and re-encodes (jsondecode(...) -> merge(...) -> jsonencode(...)), never re-synthesizing a default body for a migrated id either", "jsonencode(merge(" in pipeline_config_body and "jsondecode(data.aws_dynamodb_table_item.legacy_pipeline_config[each.key].item)" in pipeline_config_body)
 check("2/10: the merge override rewrites ONLY the physical pipeline key to the NEW canonical id (each.key) -- never the OLD id, never a hardcoded literal", re.search(r"pipeline\s*=\s*\{\s*S\s*=\s*each\.key\s*\}", pipeline_config_body) is not None)
 check("3: the merge override forces recordType back to exactly \"CONFIG\" defensively, on top of whatever the read-back item already validated to", re.search("recordType\\s*=\\s*\\{\\s*S\\s*=\\s*\"CONFIG\"\\s*\\}", pipeline_config_body) is not None)
 check("4/5/6/7/8/9: the override map passed to merge() names ONLY pipeline/recordType -- every other attribute in the decoded old item (manual tuning, unknown/future fields) passes through merge() untouched, never selected/reconstructed by a fixed field list", re.search(r"merge\(\s*jsondecode\([^)]*\),\s*\{\s*pipeline\s*=\s*\{\s*S\s*=\s*each\.key\s*\}\s*recordType\s*=\s*\{\s*S\s*=\s*\"CONFIG\"\s*\}\s*\}\s*\)", pipeline_config_body, re.S) is not None)
@@ -7285,7 +7293,7 @@ else
   skip "DYNAMODB-CONFIG-MIGRATION-PROOF: terraform not available"
 fi
 
-# Behavioral proof of the REAL committed envs/dev/dynamodb.tf itself (a local stub replaces the private, auth-gated aws-tf-module-dynamodb source only -- never the resource/data-source types under test, which are the real AWS provider): (c) terraform validate proves the new HCL is syntactically/referentially correct; (d) with goldengate_config_migration_pending=false, planning ANY deployment ID (including the four bounded ones) makes ZERO AWS calls at all (the legacy data source's own for_each becomes empty) and correctly falls back to the plain-default CONFIG body -- the safe post-migration steady state; (e) with the real default (pending=true, matching this correction's own committed default), planning correctly ATTEMPTS the four bounded read-only legacy lookups and fails closed with a live-credentials error naming the exact expected OLD physical key -- proving the mechanism cannot silently substitute defaults when live data is unavailable, and that this sandbox never fabricates or synthesizes their real content.
+# Behavioral proof of the REAL committed envs/dev/dynamodb.tf itself (a local stub replaces the private, auth-gated aws-tf-module-dynamodb source only -- never the resource/data-source types under test, which are the real AWS provider): (c) terraform validate proves the new HCL is syntactically/referentially correct; (d) with the REAL committed disposition (copy_required_ids empty, legacy_absent_ids holding all four bounded ids -- the live-proven current DEV state), planning gg-oracle-repltest-002 makes ZERO AWS calls at all (the legacy data source's own for_each is empty) and correctly falls back to the plain-default CONFIG body -- today's safe steady state; (e) in a SEPARATE sandbox copy with gg-oracle-repltest-002 moved into copy_required_ids (simulating a future, separately authorized migration that has independently proven an OLD item exists again), planning correctly ATTEMPTS the read-only legacy lookup and fails closed with a live-credentials error naming the exact expected OLD physical key -- proving the COPY_REQUIRED wiring still works correctly when actually used, and that this sandbox never fabricates or substitutes default content when live data is unavailable.
 if command -v terraform >/dev/null 2>&1; then
   DYNAMODB_REAL_PROOF_ROOT="$(mktemp -d)"
   mkdir -p "${DYNAMODB_REAL_PROOF_ROOT}/stub-dynamodb-module" "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev"
@@ -7364,30 +7372,50 @@ EOF
     fi
 
     set +e
-    (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev" && terraform plan -refresh=false -no-color -var="goldengate_config_migration_pending=false") >"${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_false.log" 2>&1
-    DYNAMODB_PENDING_FALSE_STATUS=$?
+    (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev" && terraform plan -refresh=false -no-color) >"${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log" 2>&1
+    DYNAMODB_PLAN_CURRENT_STATUS=$?
     set -e
-    if [ "$DYNAMODB_PENDING_FALSE_STATUS" -eq 0 ] \
-        && grep -qF 'aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-002"] will be created' "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_false.log" \
-        && grep -qF 'checkIntervalSeconds     = {' "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_false.log" \
-        && ! grep -q "data\.aws_dynamodb_table_item\.legacy_pipeline_config" "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_false.log"; then
-      pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (d): with goldengate_config_migration_pending=false, planning gg-oracle-repltest-002 makes ZERO AWS calls (the legacy data source's own for_each is empty) and correctly falls back to the plain-default CONFIG body -- the safe steady state once the real live migration is independently confirmed complete"
+    if [ "$DYNAMODB_PLAN_CURRENT_STATUS" -eq 0 ] \
+        && grep -qF 'aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-002"] will be created' "${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log" \
+        && grep -qF 'checkIntervalSeconds     = {' "${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log" \
+        && ! grep -q "data\.aws_dynamodb_table_item\.legacy_pipeline_config" "${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log"; then
+      pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (d): with the REAL committed disposition (copy_required_ids empty, legacy_absent_ids holding gg-oracle-repltest-002), planning it makes ZERO AWS calls (the legacy data source's own for_each is empty) and correctly falls back to the plain-default CONFIG body -- today's live-proven safe steady state"
     else
-      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (d): expected a zero-AWS-call plan with the plain-default CONFIG body when goldengate_config_migration_pending=false"
-      cat "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_false.log"
+      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (d): expected a zero-AWS-call plan with the plain-default CONFIG body for the real committed disposition"
+      cat "${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log"
     fi
 
-    set +e
-    (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev" && terraform plan -refresh=false -no-color) >"${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_true.log" 2>&1
-    DYNAMODB_PENDING_TRUE_STATUS=$?
-    set -e
-    if [ "$DYNAMODB_PENDING_TRUE_STATUS" -ne 0 ] \
-        && grep -qF 'reading DynamoDB Table Item (gg-eks-pipeline|gg-oracle-repltest-01|CONFIG)' "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_true.log" \
-        && ! grep -qF 'aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-002"] will be created' "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_true.log"; then
-      pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): with the real default (goldengate_config_migration_pending=true), planning correctly ATTEMPTS a read-only lookup of the exact expected legacy key (gg-eks-pipeline|gg-oracle-repltest-01|CONFIG) and fails closed (no live credentials in this sandbox) BEFORE ever proposing a pipeline_config CONFIG item action -- the mechanism never fabricates/substitutes default content when the real legacy item cannot be read, and no live AWS data was returned or exchanged"
+    # (e) A SEPARATE sandbox copy, with gg-oracle-repltest-002 moved from legacy_absent_ids into copy_required_ids -- simulating a future, separately authorized migration that has independently proven the OLD item exists again. Proves the COPY_REQUIRED wiring (never exercised by today's real disposition) still correctly attempts the legacy read and fails closed, rather than having silently bit-rotted now that it is unused by default.
+    cp -r "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev" "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired"
+    python3 - "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+text = text.replace(
+    "goldengate_config_migration_copy_required_ids = toset([])",
+    'goldengate_config_migration_copy_required_ids = toset(["gg-oracle-repltest-002"])',
+)
+text = text.replace('    "gg-oracle-repltest-002",\n', "")
+with open(path, "w") as f:
+    f.write(text)
+PYEOF
+    if ! grep -qF 'copy_required_ids = toset(["gg-oracle-repltest-002"])' "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf" \
+        || grep -qF '"gg-oracle-repltest-002"' <(sed -n '/legacy_absent_ids/,/\])/p' "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf"); then
+      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): the copy-required sandbox transform did not produce the expected disjoint disposition (gg-oracle-repltest-002 in copy_required_ids, removed from legacy_absent_ids) -- refusing to trust its plan result"
     else
-      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): expected a fail-closed plan attempting exactly the expected legacy key read, never proposing a pipeline_config action"
-      cat "${DYNAMODB_REAL_PROOF_ROOT}/plan_pending_true.log"
+      set +e
+      (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired" && terraform plan -refresh=false -no-color) >"${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log" 2>&1
+      DYNAMODB_PLAN_COPYREQUIRED_STATUS=$?
+      set -e
+      if [ "$DYNAMODB_PLAN_COPYREQUIRED_STATUS" -ne 0 ] \
+          && grep -qF 'reading DynamoDB Table Item (gg-eks-pipeline|gg-oracle-repltest-01|CONFIG)' "${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log" \
+          && ! grep -qF 'aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-002"] will be created' "${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log"; then
+        pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): with gg-oracle-repltest-002 classified COPY_REQUIRED, planning correctly ATTEMPTS a read-only lookup of the exact expected legacy key (gg-eks-pipeline|gg-oracle-repltest-01|CONFIG) and fails closed (no live credentials in this sandbox) BEFORE ever proposing a pipeline_config CONFIG item action -- the mechanism never fabricates/substitutes default content when the real legacy item cannot be read, and no live AWS data was returned or exchanged"
+      else
+        fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): expected a fail-closed plan attempting exactly the expected legacy key read, never proposing a pipeline_config action"
+        cat "${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log"
+      fi
     fi
   fi
   rm -rf "$DYNAMODB_REAL_PROOF_ROOT"
