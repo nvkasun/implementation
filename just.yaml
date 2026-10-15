@@ -1,52 +1,76 @@
-cat > argo-status-check.sh <<'EOF'
+cat > gg-ddb-migration-check.sh <<'EOF'
 #!/bin/bash
 set -u
 
-ARGO_NS="argocd"
+REGION="eu-west-1"
+TABLE="gg-eks-pipeline"
 
-APPS=(
-  "goldengate-dev-mssql-repltest-001"
-  "goldengate-dev-oracle-repltest-01"
-  "goldengate-dev-postgresql-repltest-01"
-  "goldengate-dev-postgresql-repltest-02"
+PAIRS=(
+  "gg-mssql-repltest-01|gg-mssql-repltest-001"
+  "gg-oracle-repltest-01|gg-oracle-repltest-002"
+  "gg-postgresql-repltest-01|gg-postgresql-repltest-001"
+  "gg-postgresql-repltest-02|gg-postgresql-repltest-002"
 )
 
-echo "===== GOLDENGATE ARGO CONDITIONS ====="
+check_item() {
+  local id="$1"
+  local err
+  err="$(mktemp)"
 
-for app in "${APPS[@]}"; do
-  echo
-  echo "APP=$app"
+  ITEM="$(
+    aws dynamodb get-item \
+      --region "$REGION" \
+      --table-name "$TABLE" \
+      --consistent-read \
+      --key "{\"pipeline\":{\"S\":\"${id}\"},\"recordType\":{\"S\":\"CONFIG\"}}" \
+      --output json 2>"$err"
+  )"
+  RC=$?
 
-  kubectl get application "$app" -n "$ARGO_NS" \
-    -o jsonpath='SYNC={.status.sync.status}{" HEALTH="}{.status.health.status}{" REVISION="}{.status.sync.revision}{"\n"}{range .status.conditions[*]}CONDITION={.type} MESSAGE={.message}{"\n"}{end}'
-done
+  if [ "$RC" -ne 0 ]; then
+    echo "ERROR"
+    echo "AWS_ERROR=$(tr '\n' ' ' < "$err")"
+    rm -f "$err"
+    return
+  fi
+
+  rm -f "$err"
+
+  PIPELINE="$(printf '%s' "$ITEM" | python3 -c '
+import json,sys
+x=json.load(sys.stdin)
+print(x.get("Item",{}).get("pipeline",{}).get("S",""))
+')"
+
+  if [ "$PIPELINE" = "$id" ]; then
+    echo "EXISTS"
+  else
+    echo "ABSENT"
+  fi
+}
+
+echo "===== AWS CALLER ====="
+aws sts get-caller-identity \
+  --query '{Account:Account,Arn:Arn}' \
+  --output json
 
 echo
-echo "===== ECR TOKEN SYNC ====="
+echo "===== DYNAMODB CONFIG MIGRATION ====="
 
-kubectl get cronjob argocd-ecr-token-sync -n "$ARGO_NS" \
-  -o jsonpath='LAST_SCHEDULE={.status.lastScheduleTime}{" LAST_SUCCESS="}{.status.lastSuccessfulTime}{"\n"}' 2>&1 || true
+for pair in "${PAIRS[@]}"; do
+  OLD="${pair%%|*}"
+  NEW="${pair##*|}"
 
-LATEST_JOB="$(
-  kubectl get jobs -n "$ARGO_NS" \
-    --sort-by=.metadata.creationTimestamp \
-    -o name 2>/dev/null \
-  | grep 'argocd-ecr-token-sync' \
-  | tail -1
-)"
+  echo
+  echo "PAIR=$OLD -> $NEW"
 
-if [ -n "$LATEST_JOB" ]; then
-  echo "LATEST_JOB=$LATEST_JOB"
+  OLD_RESULT="$(check_item "$OLD")"
+  NEW_RESULT="$(check_item "$NEW")"
 
-  kubectl get "$LATEST_JOB" -n "$ARGO_NS" \
-    -o jsonpath='SUCCEEDED={.status.succeeded}{" FAILED="}{.status.failed}{"\n"}'
-
-  kubectl logs "$LATEST_JOB" -n "$ARGO_NS" --tail=20 2>&1 \
-    | grep -Ei 'success|error|fail|forbidden|unauthorized|refreshed' || true
-else
-  echo "LATEST_JOB=NONE"
-fi
+  echo "OLD_CONFIG=$OLD_RESULT"
+  echo "NEW_CONFIG=$NEW_RESULT"
+done
 EOF
 
-chmod +x argo-status-check.sh
-./argo-status-check.sh
+chmod +x gg-ddb-migration-check.sh
+./gg-ddb-migration-check.sh
