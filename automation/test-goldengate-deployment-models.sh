@@ -17471,13 +17471,16 @@ class FakeProc:
 
 
 class Recorder:
-    """Records every subprocess argv actually issued -- proves a malformed/rejected state resulted in ZERO Kubernetes calls, not merely that an exception text was raised."""
+    """Records every subprocess argv actually issued -- proves a malformed/rejected state resulted in ZERO Kubernetes calls, not merely that an exception text was raised. The one exception is `kubectl get application <name> ...` -- the read-only poll _delete_argo_application_and_await_absence() issues via k8s_common.get_json() after a real patch+delete -- which must return a realistic NotFound response (never the generic empty-stdout success fake) so that poll correctly resolves the Application as absent instead of raising ClassifierInspectionError on unparseable empty JSON."""
 
     def __init__(self):
         self.calls = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
+        if len(argv) >= 4 and argv[:3] == ["kubectl", "get", "application"]:
+            app_name = argv[3]
+            return FakeProc(1, "", f'Error from server (NotFound): applications.argoproj.io "{app_name}" not found (NotFound)')
         return FakeProc(0, "")
 
 
