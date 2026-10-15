@@ -60,16 +60,14 @@ locals {
   }
 }
 
-# DynamoDB CONFIG Migration Disposition: per-mapped-id, explicit, auditable classification -- replaces the former coarse goldengate_config_migration_pending boolean. That boolean's own premise (all four bounded ids still have a legacy CONFIG item worth copying) was disproven live: a real environment-wide MAIN Deploy's Phase 2 Terraform PLAN read data.aws_dynamodb_table_item.legacy_pipeline_config for all four OLD keys against real AWS and got an authoritative empty result for every single one -- there is no legacy CONFIG payload to copy or preserve for any of the four current bounded migrations. COPY_REQUIRED names an id whose OLD item has been independently verified (via a real Terraform plan/apply against AWS, never assumed) to still exist and must be read-and-preserved; LEGACY_CONFIG_ABSENT names an id independently verified to have no OLD item, so its NEW CONFIG item is seeded from the exact same canonical default body every non-migrated/future deployment already uses below -- never a second, duplicated default. Membership here is the single source of truth -- never inferred from a boolean, never re-derived from a live read's own success/failure at plan time (that is precisely the assumption that just failed live). A future, separately authorized migration may move an id from LEGACY_CONFIG_ABSENT to COPY_REQUIRED (never the reverse, and never without first proving the OLD item has reappeared) -- this source-only correction performs no live data migration itself.
+# DynamoDB CONFIG Migration Disposition: per-mapped-id, explicit, auditable classification -- replaces the former coarse goldengate_config_migration_pending boolean. That boolean's own premise (all four bounded ids still have a legacy CONFIG item worth copying) was disproven live: a real environment-wide MAIN Deploy's Phase 2 Terraform PLAN read data.aws_dynamodb_table_item.legacy_pipeline_config for all four OLD keys against real AWS and got an authoritative empty result for every single one -- there is no legacy CONFIG payload to copy or preserve for any of the four current bounded migrations. COPY_REQUIRED names an id whose OLD item has been independently verified (via a real Terraform plan/apply against AWS, never assumed) to still exist and must be read-and-preserved; LEGACY_CONFIG_ABSENT names an id independently verified to have no OLD item, so its NEW CONFIG item is seeded from the exact same canonical default body every non-migrated/future deployment already uses below -- never a second, duplicated default. Membership here is the single source of truth -- never inferred from a boolean, never re-derived from a live read's own success/failure at plan time (that is precisely the assumption that just failed live). A future, separately authorized migration may move an id from LEGACY_CONFIG_ABSENT to COPY_REQUIRED (never the reverse, and never without first proving the OLD item has reappeared) -- this source-only correction performs no live data migration itself. legacy_absent_ids is DERIVED from source_ids/copy_required_ids below, never a second hand-maintained literal id list -- the bounded four canonical deployment IDs must be named in exactly ONE place (goldengate_config_migration_source_ids); repeating them in a second local would be the same unbounded-duplication risk this whole correction exists to avoid.
 locals {
   goldengate_config_migration_copy_required_ids = toset([])
 
-  goldengate_config_migration_legacy_absent_ids = toset([
-    "gg-postgresql-repltest-001",
-    "gg-mssql-repltest-001",
-    "gg-oracle-repltest-002",
-    "gg-postgresql-repltest-002",
-  ])
+  goldengate_config_migration_legacy_absent_ids = setsubtract(
+    toset(keys(local.goldengate_config_migration_source_ids)),
+    local.goldengate_config_migration_copy_required_ids
+  )
 }
 
 # Read-only lookup of each bounded pair's OLD physical CONFIG item -- never a mutation, never a second write path. Exists ONLY for the bounded NEW ids classified COPY_REQUIRED above; a LEGACY_CONFIG_ABSENT id (proven to have no OLD item) and a genuinely new deployment ID (never a member of goldengate_config_migration_source_ids at all) never attempt this read. The postconditions below fail closed (before this value is ever used to construct the NEW item) unless the item actually read back carries EXACTLY the expected OLD identity -- self is available here because postcondition (unlike precondition) runs after a data resource's own read, per Terraform's own precondition/postcondition contract, verified against the real provider via `terraform validate`.
@@ -124,6 +122,11 @@ resource "terraform_data" "goldengate_config_migration_contract" {
     precondition {
       condition     = setunion(local.goldengate_config_migration_copy_required_ids, local.goldengate_config_migration_legacy_absent_ids) == toset(keys(local.goldengate_config_migration_source_ids))
       error_message = "envs/dev/dynamodb.tf: the union of goldengate_config_migration_copy_required_ids and goldengate_config_migration_legacy_absent_ids must equal exactly the four bounded ids in goldengate_config_migration_source_ids -- every bounded id must carry a disposition, and neither set may name an id outside the bounded map."
+    }
+    precondition {
+      # Every NEW id named in the bounded historical migration map must still correspond to a real canonical runtime descriptor -- checked against goldengate_runtime_documents (envs/dev/goldengate_inventory.tf), the FULL folder-driven inventory discovered from pipelines/*/*/values.yaml, never goldengate_enabled_deployments: a descriptor temporarily disabled (deployment.enabled=false) still physically exists in the pipelines tree and must never falsely trip this guard. This never reconstructs an OLD identity from the current folder tree (OLD ids are not discoverable there, which is exactly why source_ids remains an explicit historical map) -- it only proves the NEW side of each pair still names a real, currently-present runtime.
+      condition     = length(setsubtract(toset(keys(local.goldengate_config_migration_source_ids)), toset(keys(local.goldengate_runtime_documents)))) == 0
+      error_message = "envs/dev/dynamodb.tf: goldengate_config_migration_source_ids names a NEW deployment ID with no matching canonical runtime descriptor under pipelines/*/*/values.yaml (checked against the full folder-driven inventory, including temporarily disabled descriptors) -- refusing to carry forward a historical migration bridge for a runtime that no longer exists in Git."
     }
   }
 }

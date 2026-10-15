@@ -6888,10 +6888,10 @@ check("goldengate_config_migration_copy_required_ids local exists", copy_require
 copy_required_ids = set(re.findall(r"\"([^\"]+)\"", copy_required_match.group(1))) if copy_required_match else None
 check("current DEV migration disposition: copy_required_ids is EMPTY -- live Terraform evidence proved all four legacy CONFIG items absent, so none are copy-required", copy_required_ids == set())
 
-legacy_absent_match = re.search(r"goldengate_config_migration_legacy_absent_ids\s*=\s*toset\(\[(.*?)\]\)", dynamodb_tf, re.S)
-check("goldengate_config_migration_legacy_absent_ids local exists", legacy_absent_match is not None)
-legacy_absent_ids = set(re.findall(r"\"([^\"]+)\"", legacy_absent_match.group(1))) if legacy_absent_match else None
-check("current DEV migration disposition: legacy_absent_ids is EXACTLY the four bounded NEW ids -- matches the live-proven absence of all four legacy CONFIG items", legacy_absent_ids == set(REQUIRED_PAIRS.keys()))
+legacy_absent_match = re.search(r"goldengate_config_migration_legacy_absent_ids\s*=\s*setsubtract\(\s*toset\(keys\(local\.goldengate_config_migration_source_ids\)\),\s*local\.goldengate_config_migration_copy_required_ids\s*\)", dynamodb_tf, re.S)
+check("3: goldengate_config_migration_legacy_absent_ids is DERIVED via setsubtract(keys(source_ids), copy_required_ids), never a second hand-maintained literal id list", legacy_absent_match is not None)
+check("3: no second literal four-id list exists for legacy_absent_ids (no toset([\"gg-postgresql-repltest-001\", ...]) assigned to it)", not re.search(r"goldengate_config_migration_legacy_absent_ids\s*=\s*toset\(\[", dynamodb_tf))
+# Semantic proof the derivation evaluates correctly for the current committed inputs (copy_required_ids == {}) is covered by DYNAMODB-CONFIG-MIGRATION-DERIVATION-PROOF below, which exercises the exact real setsubtract(...) expression offline against real/fabricated inputs -- never re-implemented via a second Python set computation here.
 check("no coarse goldengate_config_migration_pending boolean/variable construct remains (a historical mention in an explanatory comment is fine -- the actual variable declaration and var.* references must be gone) -- disposition is per-id and explicit, never a single toggle applied uniformly to all four", "variable \"goldengate_config_migration_pending\"" not in dynamodb_tf and "var.goldengate_config_migration_pending" not in dynamodb_tf)
 
 data_match = re.search(r"data \"aws_dynamodb_table_item\" \"legacy_pipeline_config\" \{(.*?)\n\}\n\n#", dynamodb_tf, re.S)
@@ -6912,6 +6912,7 @@ check("9: precondition rejects a chained/duplicate old<->new identity (setinters
 check("2: precondition pins the map to exactly four entries, never a general onboarding mechanism", "length(local.goldengate_config_migration_source_ids) == 4" in contract_body)
 check("15: precondition rejects copy_required_ids and legacy_absent_ids overlapping", "setintersection(local.goldengate_config_migration_copy_required_ids, local.goldengate_config_migration_legacy_absent_ids)) == 0" in contract_body)
 check("16/17: precondition requires the union of copy_required_ids and legacy_absent_ids to equal exactly the four bounded source ids -- rejects an omitted or an unknown id in either set", "setunion(local.goldengate_config_migration_copy_required_ids, local.goldengate_config_migration_legacy_absent_ids) == toset(keys(local.goldengate_config_migration_source_ids))" in contract_body)
+check("6/7: precondition requires every NEW migration-map key to exist in the FULL folder-driven goldengate_runtime_documents inventory -- rejects an unknown migration target before any mutation", "setsubtract(toset(keys(local.goldengate_config_migration_source_ids)), toset(keys(local.goldengate_runtime_documents)))) == 0" in contract_body)
 
 pipeline_config_match = re.search(r"resource \"aws_dynamodb_table_item\" \"pipeline_config\" \{(.*?)\n\}\n\nmodule \"goldengate_alerts\"", dynamodb_tf, re.S)
 check("pipeline_config resource block located", pipeline_config_match is not None)
@@ -7041,6 +7042,109 @@ EOF
   rm -rf "$TRANSFORM_PROOF_ROOT"
 else
   skip "DYNAMODB-CONFIG-MIGRATION-TRANSFORM-PROOF: terraform not available"
+fi
+
+# Derivation proof (offline, pure locals, zero providers/resources/data-sources, zero AWS calls): exercises the EXACT real setsubtract(toset(keys(source_ids)), copy_required_ids) expression envs/dev/dynamodb.tf uses for goldengate_config_migration_legacy_absent_ids, against a fabricated two-id source map -- proving (4) when copy_required_ids is empty, the derived legacy_absent_ids equals the full set of source_ids keys, and (5) when one id is moved into copy_required_ids, it is automatically excluded from the derived legacy_absent_ids while the other bounded id remains -- never a second, independently-maintained literal list that could silently drift out of sync.
+if command -v terraform >/dev/null 2>&1; then
+  DERIVATION_PROOF_ROOT="$(mktemp -d)"
+  cat > "${DERIVATION_PROOF_ROOT}/main.tf" <<'EOF'
+locals {
+  source_ids = {
+    "gg-a-new" = "gg-a-old"
+    "gg-b-new" = "gg-b-old"
+  }
+
+  # Exactly the real envs/dev/dynamodb.tf expression, applied twice against two fabricated copy_required_ids inputs.
+  copy_required_empty    = toset([])
+  legacy_absent_from_empty = setsubtract(toset(keys(local.source_ids)), local.copy_required_empty)
+
+  copy_required_one_id   = toset(["gg-a-new"])
+  legacy_absent_from_one  = setsubtract(toset(keys(local.source_ids)), local.copy_required_one_id)
+}
+
+output "legacy_absent_equals_all_keys_when_copy_required_empty" {
+  value = local.legacy_absent_from_empty == toset(keys(local.source_ids))
+}
+output "legacy_absent_excludes_the_moved_id" {
+  value = !contains(local.legacy_absent_from_one, "gg-a-new")
+}
+output "legacy_absent_retains_the_other_bounded_id" {
+  value = contains(local.legacy_absent_from_one, "gg-b-new")
+}
+EOF
+  set +e
+  (cd "$DERIVATION_PROOF_ROOT" && terraform init -backend=false) >"${DERIVATION_PROOF_ROOT}/init.log" 2>&1
+  DERIVATION_INIT_STATUS=$?
+  (cd "$DERIVATION_PROOF_ROOT" && terraform apply -auto-approve -no-color) >"${DERIVATION_PROOF_ROOT}/apply.log" 2>&1
+  DERIVATION_APPLY_STATUS=$?
+  set -e
+
+  if [ "$DERIVATION_INIT_STATUS" -ne 0 ] || [ "$DERIVATION_APPLY_STATUS" -ne 0 ]; then
+    skip "DYNAMODB-CONFIG-MIGRATION-DERIVATION-PROOF: could not evaluate the pure-locals derivation fixture (no providers/resources/data-sources involved -- likely an environment issue)"
+    cat "${DERIVATION_PROOF_ROOT}/init.log" "${DERIVATION_PROOF_ROOT}/apply.log" 2>/dev/null
+  else
+    DERIVATION_OUTPUTS="$(cd "$DERIVATION_PROOF_ROOT" && terraform output -json 2>&1)"
+    for output_name in legacy_absent_equals_all_keys_when_copy_required_empty legacy_absent_excludes_the_moved_id legacy_absent_retains_the_other_bounded_id; do
+      if echo "$DERIVATION_OUTPUTS" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('${output_name}', {}).get('value') is True else 1)" 2>/dev/null; then
+        pass "DYNAMODB-CONFIG-MIGRATION-DERIVATION-PROOF: ${output_name}"
+      else
+        fail "DYNAMODB-CONFIG-MIGRATION-DERIVATION-PROOF: ${output_name} did not evaluate true"
+        echo "$DERIVATION_OUTPUTS"
+      fi
+    done
+  fi
+  rm -rf "$DERIVATION_PROOF_ROOT"
+else
+  skip "DYNAMODB-CONFIG-MIGRATION-DERIVATION-PROOF: terraform not available"
+fi
+
+# Unknown-migration-target fail-closed proof (offline, zero providers/resources requiring credentials -- terraform_data has no provider at all, zero AWS calls of any kind): reproduces the EXACT real inventory-existence precondition (length(setsubtract(toset(keys(source_ids)), toset(keys(runtime_documents)))) == 0) against a fabricated source_ids map naming an id that does NOT exist in a fabricated runtime_documents inventory -- proving the precondition fails closed (non-zero plan exit, naming the precondition's own error message) BEFORE any resource action is ever proposed, exactly mirroring the real contract in envs/dev/dynamodb.tf.
+if command -v terraform >/dev/null 2>&1; then
+  UNKNOWN_TARGET_PROOF_ROOT="$(mktemp -d)"
+  cat > "${UNKNOWN_TARGET_PROOF_ROOT}/main.tf" <<'EOF'
+locals {
+  source_ids = {
+    "gg-unknown-new-id" = "gg-unknown-old-id"
+  }
+  runtime_documents = {
+    "gg-something-else-entirely" = {}
+  }
+}
+
+resource "terraform_data" "migration_contract" {
+  input = local.source_ids
+
+  lifecycle {
+    precondition {
+      condition     = length(setsubtract(toset(keys(local.source_ids)), toset(keys(local.runtime_documents)))) == 0
+      error_message = "unknown migration target: a source_ids key has no matching canonical runtime descriptor"
+    }
+  }
+}
+EOF
+  set +e
+  (cd "$UNKNOWN_TARGET_PROOF_ROOT" && terraform init -backend=false) >"${UNKNOWN_TARGET_PROOF_ROOT}/init.log" 2>&1
+  UNKNOWN_TARGET_INIT_STATUS=$?
+  set -e
+
+  if [ "$UNKNOWN_TARGET_INIT_STATUS" -ne 0 ]; then
+    skip "DYNAMODB-CONFIG-MIGRATION-UNKNOWN-TARGET-PROOF: could not evaluate the fail-closed fixture (no providers/resources requiring credentials involved -- likely an environment issue)"
+    cat "${UNKNOWN_TARGET_PROOF_ROOT}/init.log"
+  else
+    set +e
+    (cd "$UNKNOWN_TARGET_PROOF_ROOT" && terraform plan -no-color) >"${UNKNOWN_TARGET_PROOF_ROOT}/plan.log" 2>&1
+    UNKNOWN_TARGET_PLAN_STATUS=$?
+    set -e
+    if [ "$UNKNOWN_TARGET_PLAN_STATUS" -ne 0 ] && grep -qF "unknown migration target" "${UNKNOWN_TARGET_PROOF_ROOT}/plan.log"; then
+      pass "DYNAMODB-CONFIG-MIGRATION-UNKNOWN-TARGET-PROOF: 7: a source_ids key with no matching canonical runtime descriptor fails closed (non-zero plan exit, exact precondition error message), exactly mirroring the real inventory-existence precondition"
+    else
+      fail "DYNAMODB-CONFIG-MIGRATION-UNKNOWN-TARGET-PROOF: expected a fail-closed, non-zero plan naming the unknown migration target"
+      cat "${UNKNOWN_TARGET_PROOF_ROOT}/plan.log"
+    fi
+  fi
+  rm -rf "$UNKNOWN_TARGET_PROOF_ROOT"
+else
+  skip "DYNAMODB-CONFIG-MIGRATION-UNKNOWN-TARGET-PROOF: terraform not available"
 fi
 
 # Copy/delete semantics proof (offline, real aws_dynamodb_table_item resource type, fabricated prior state, zero AWS calls): proves the CREATE (new physical key, full tuned content preserved via the same transform) and DESTROY (old physical key) plan actions in a single terraform plan reference two genuinely DIFFERENT DynamoDB primary keys -- so destroying the OLD Terraform-managed instance can never delete the NEW one. Never claims safety merely because the Terraform resource ADDRESSES differ; proves the resulting physical KEY VALUES differ.
@@ -7345,9 +7449,18 @@ locals {
     env = "dev", application_name = "GoldenGate", business_criticality = "Low", business_unit = "TechnologyPlatform"
     business_unit_owner = "test", cost_center = "219", map_migrated = "test", data_classification = "General"
   }
-  goldengate_deployment_names = ["gg-oracle-repltest-002"]
+  # gg-oracle-repltest-002 is one of the four bounded (LEGACY_CONFIG_ABSENT) ids; gg-mysql-fixture-003 is a genuinely future/unrelated id, never a member of goldengate_config_migration_source_ids, added here specifically to prove it needs no edit to any migration list to get the normal default CONFIG body in the same plan.
+  goldengate_deployment_names = ["gg-mysql-fixture-003", "gg-oracle-repltest-002"]
   goldengate_enabled_deployments = {
     "gg-oracle-repltest-002" = { runtime = { deploymentType = "oracle" } }
+    "gg-mysql-fixture-003"   = { runtime = { deploymentType = "mysql" } }
+  }
+  # Stands in for the real goldengate_inventory.tf's full folder-driven goldengate_runtime_documents (envs/dev/dynamodb.tf's new inventory-existence precondition reads only its KEYS) -- must contain all four bounded migration-map ids so that precondition passes in this sandbox exactly as it does against the real pipelines/ tree; the one active test deployment (gg-oracle-repltest-002) is still driven solely by goldengate_deployment_names/goldengate_enabled_deployments above. gg-mysql-fixture-003 is deliberately NOT a member of this map either -- a genuinely new deployment's descriptor folder is not itself part of the historical migration bridge's own bookkeeping.
+  goldengate_runtime_documents = {
+    "gg-postgresql-repltest-001" = {}
+    "gg-mssql-repltest-001"      = {}
+    "gg-oracle-repltest-002"     = {}
+    "gg-postgresql-repltest-002" = {}
   }
 }
 EOF
@@ -7377,15 +7490,16 @@ EOF
     set -e
     if [ "$DYNAMODB_PLAN_CURRENT_STATUS" -eq 0 ] \
         && grep -qF 'aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-002"] will be created' "${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log" \
+        && grep -qF 'aws_dynamodb_table_item.pipeline_config["gg-mysql-fixture-003"] will be created' "${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log" \
         && grep -qF 'checkIntervalSeconds     = {' "${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log" \
         && ! grep -q "data\.aws_dynamodb_table_item\.legacy_pipeline_config" "${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log"; then
-      pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (d): with the REAL committed disposition (copy_required_ids empty, legacy_absent_ids holding gg-oracle-repltest-002), planning it makes ZERO AWS calls (the legacy data source's own for_each is empty) and correctly falls back to the plain-default CONFIG body -- today's live-proven safe steady state"
+      pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (d): with the REAL committed disposition (copy_required_ids empty, legacy_absent_ids holding gg-oracle-repltest-002), AND a second, genuinely future/unrelated deployment (gg-mysql-fixture-003, never a member of any migration list), planning BOTH in the same plan makes ZERO AWS calls (the legacy data source's own for_each is empty) and correctly falls back to the plain-default CONFIG body for both -- today's live-proven safe steady state, and proof that onboarding a new deployment never requires editing any migration list"
     else
-      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (d): expected a zero-AWS-call plan with the plain-default CONFIG body for the real committed disposition"
+      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (d): expected a zero-AWS-call plan with the plain-default CONFIG body for both the real committed disposition and a genuinely future unrelated deployment"
       cat "${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log"
     fi
 
-    # (e) A SEPARATE sandbox copy, with gg-oracle-repltest-002 moved from legacy_absent_ids into copy_required_ids -- simulating a future, separately authorized migration that has independently proven the OLD item exists again. Proves the COPY_REQUIRED wiring (never exercised by today's real disposition) still correctly attempts the legacy read and fails closed, rather than having silently bit-rotted now that it is unused by default.
+    # (e) A SEPARATE sandbox copy, with gg-oracle-repltest-002 moved into copy_required_ids -- simulating a future, separately authorized migration that has independently proven the OLD item exists again. Since legacy_absent_ids is DERIVED (setsubtract(keys(source_ids), copy_required_ids)), this single edit is sufficient -- legacy_absent_ids automatically excludes gg-oracle-repltest-002 with no second, independently-maintained list to also update. Proves the COPY_REQUIRED wiring (never exercised by today's real disposition) still correctly attempts the legacy read and fails closed, rather than having silently bit-rotted now that it is unused by default.
     cp -r "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev" "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired"
     python3 - "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf" <<'PYEOF'
 import sys
@@ -7396,13 +7510,11 @@ text = text.replace(
     "goldengate_config_migration_copy_required_ids = toset([])",
     'goldengate_config_migration_copy_required_ids = toset(["gg-oracle-repltest-002"])',
 )
-text = text.replace('    "gg-oracle-repltest-002",\n', "")
 with open(path, "w") as f:
     f.write(text)
 PYEOF
-    if ! grep -qF 'copy_required_ids = toset(["gg-oracle-repltest-002"])' "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf" \
-        || grep -qF '"gg-oracle-repltest-002"' <(sed -n '/legacy_absent_ids/,/\])/p' "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf"); then
-      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): the copy-required sandbox transform did not produce the expected disjoint disposition (gg-oracle-repltest-002 in copy_required_ids, removed from legacy_absent_ids) -- refusing to trust its plan result"
+    if ! grep -qF 'copy_required_ids = toset(["gg-oracle-repltest-002"])' "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf"; then
+      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): the copy-required sandbox transform did not move gg-oracle-repltest-002 into copy_required_ids -- refusing to trust its plan result"
     else
       set +e
       (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired" && terraform plan -refresh=false -no-color) >"${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log" 2>&1
