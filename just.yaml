@@ -1,76 +1,78 @@
-cat > gg-ddb-migration-check.sh <<'EOF'
+cat > gg-ddb-check-via-monitor.sh <<'EOF'
 #!/bin/bash
-set -u
+set -euo pipefail
 
-REGION="eu-west-1"
-TABLE="gg-eks-pipeline"
+NS="goldengate-monitoring"
 
-PAIRS=(
-  "gg-mssql-repltest-01|gg-mssql-repltest-001"
-  "gg-oracle-repltest-01|gg-oracle-repltest-002"
-  "gg-postgresql-repltest-01|gg-postgresql-repltest-001"
-  "gg-postgresql-repltest-02|gg-postgresql-repltest-002"
-)
+MONITOR_POD="$(
+  kubectl get pods -n "$NS" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{.status.containerStatuses[0].ready}{"\n"}{end}' \
+  | awk -F'|' '$1 ~ /^gg-monitor-/ && $2=="Running" && $3=="true" {print $1; exit}'
+)"
 
-check_item() {
-  local id="$1"
-  local err
-  err="$(mktemp)"
+if [ -z "$MONITOR_POD" ]; then
+  echo "ERROR=NO_READY_GG_MONITOR_POD"
+  exit 1
+fi
 
-  ITEM="$(
-    aws dynamodb get-item \
-      --region "$REGION" \
-      --table-name "$TABLE" \
-      --consistent-read \
-      --key "{\"pipeline\":{\"S\":\"${id}\"},\"recordType\":{\"S\":\"CONFIG\"}}" \
-      --output json 2>"$err"
-  )"
-  RC=$?
+echo "===== MONITOR EXECUTION IDENTITY ====="
+echo "POD=$MONITOR_POD"
 
-  if [ "$RC" -ne 0 ]; then
-    echo "ERROR"
-    echo "AWS_ERROR=$(tr '\n' ' ' < "$err")"
-    rm -f "$err"
-    return
-  fi
+kubectl exec -n "$NS" "$MONITOR_POD" -- python3 - <<'PY'
+import boto3
+import json
 
-  rm -f "$err"
+REGION = "eu-west-1"
+TABLE = "gg-eks-pipeline"
 
-  PIPELINE="$(printf '%s' "$ITEM" | python3 -c '
-import json,sys
-x=json.load(sys.stdin)
-print(x.get("Item",{}).get("pipeline",{}).get("S",""))
-')"
+pairs = [
+    ("gg-mssql-repltest-01",      "gg-mssql-repltest-001"),
+    ("gg-oracle-repltest-01",     "gg-oracle-repltest-002"),
+    ("gg-postgresql-repltest-01", "gg-postgresql-repltest-001"),
+    ("gg-postgresql-repltest-02", "gg-postgresql-repltest-002"),
+]
 
-  if [ "$PIPELINE" = "$id" ]; then
-    echo "EXISTS"
-  else
-    echo "ABSENT"
-  fi
-}
+sts = boto3.client("sts", region_name=REGION)
+ddb = boto3.client("dynamodb", region_name=REGION)
 
-echo "===== AWS CALLER ====="
-aws sts get-caller-identity \
-  --query '{Account:Account,Arn:Arn}' \
-  --output json
+identity = sts.get_caller_identity()
+print(f"AWS_ACCOUNT={identity['Account']}")
+print(f"AWS_ARN={identity['Arn']}")
 
-echo
-echo "===== DYNAMODB CONFIG MIGRATION ====="
+print()
+print("===== DYNAMODB CONFIG MIGRATION =====")
 
-for pair in "${PAIRS[@]}"; do
-  OLD="${pair%%|*}"
-  NEW="${pair##*|}"
+def get_item(deployment_id):
+    result = ddb.get_item(
+        TableName=TABLE,
+        ConsistentRead=True,
+        Key={
+            "pipeline": {"S": deployment_id},
+            "recordType": {"S": "CONFIG"},
+        },
+    )
+    return result.get("Item")
 
-  echo
-  echo "PAIR=$OLD -> $NEW"
+for old_id, new_id in pairs:
+    old_item = get_item(old_id)
+    new_item = get_item(new_id)
 
-  OLD_RESULT="$(check_item "$OLD")"
-  NEW_RESULT="$(check_item "$NEW")"
+    print()
+    print(f"PAIR={old_id} -> {new_id}")
+    print(f"OLD_CONFIG={'EXISTS' if old_item else 'ABSENT'}")
+    print(f"NEW_CONFIG={'EXISTS' if new_item else 'ABSENT'}")
 
-  echo "OLD_CONFIG=$OLD_RESULT"
-  echo "NEW_CONFIG=$NEW_RESULT"
-done
+    if new_item:
+        pipeline = new_item.get("pipeline", {}).get("S")
+        record_type = new_item.get("recordType", {}).get("S")
+
+        print(f"NEW_KEY_OK={str(pipeline == new_id).upper()}")
+        print(f"NEW_RECORDTYPE_OK={str(record_type == 'CONFIG').upper()}")
+
+        serialized = json.dumps(new_item, sort_keys=True)
+        print(f"OLD_ID_PRESENT_IN_NEW_ITEM={str(old_id in serialized).upper()}")
+PY
 EOF
 
-chmod +x gg-ddb-migration-check.sh
-./gg-ddb-migration-check.sh
+chmod +x gg-ddb-check-via-monitor.sh
+./gg-ddb-check-via-monitor.sh
