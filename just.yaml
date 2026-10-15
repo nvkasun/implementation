@@ -1,97 +1,52 @@
-cat > gg-migration-check.sh <<'EOF'
+cat > argo-status-check.sh <<'EOF'
 #!/bin/bash
 set -u
 
 ARGO_NS="argocd"
-GG_NS="goldengate-dev"
 
-PAIRS=(
-  "gg-mssql-repltest-01|gg-mssql-repltest-001"
-  "gg-oracle-repltest-01|gg-oracle-repltest-002"
-  "gg-postgresql-repltest-01|gg-postgresql-repltest-001"
-  "gg-postgresql-repltest-02|gg-postgresql-repltest-002"
+APPS=(
+  "goldengate-dev-mssql-repltest-001"
+  "goldengate-dev-oracle-repltest-01"
+  "goldengate-dev-postgresql-repltest-01"
+  "goldengate-dev-postgresql-repltest-02"
 )
 
-exists() {
-  local kind="$1" name="$2" ns="$3"
-  if kubectl get "$kind" "$name" -n "$ns" >/dev/null 2>&1; then
-    echo "EXISTS"
-  else
-    echo "ABSENT"
-  fi
-}
+echo "===== GOLDENGATE ARGO CONDITIONS ====="
 
-echo "===== GG RUNTIME MIGRATION STATE ====="
-
-for pair in "${PAIRS[@]}"; do
-  OLD="${pair%%|*}"
-  NEW="${pair##*|}"
-
-  OLD_SUFFIX="${OLD#gg-}"
-  NEW_SUFFIX="${NEW#gg-}"
-
-  OLD_APP="goldengate-dev-${OLD_SUFFIX}"
-  NEW_APP="goldengate-dev-${NEW_SUFFIX}"
-
-  OLD_APPSET="${OLD_APP}-appset"
-  NEW_APPSET="${NEW_APP}-appset"
-
-  OLD_PVC="${OLD}-u02"
-
+for app in "${APPS[@]}"; do
   echo
-  echo "PAIR=$OLD -> $NEW"
+  echo "APP=$app"
 
-  echo "OLD_APPSET=$(exists applicationset "$OLD_APPSET" "$ARGO_NS")"
-  echo "OLD_APP=$(exists application "$OLD_APP" "$ARGO_NS")"
-  echo "OLD_STS=$(exists statefulset "$OLD" "$GG_NS")"
-
-  echo "NEW_APPSET=$(exists applicationset "$NEW_APPSET" "$ARGO_NS")"
-  echo "NEW_APP=$(exists application "$NEW_APP" "$ARGO_NS")"
-  echo "NEW_STS=$(exists statefulset "$NEW" "$GG_NS")"
-
-  if kubectl get application "$NEW_APP" -n "$ARGO_NS" >/dev/null 2>&1; then
-    kubectl get application "$NEW_APP" -n "$ARGO_NS" \
-      -o jsonpath='NEW_ARGO_SYNC={.status.sync.status}{" NEW_ARGO_HEALTH="}{.status.health.status}{"\n"}'
-  fi
-
-  if kubectl get statefulset "$NEW" -n "$GG_NS" >/dev/null 2>&1; then
-    kubectl get statefulset "$NEW" -n "$GG_NS" \
-      -o jsonpath='NEW_STS_READY={.status.readyReplicas}{"/"}{.status.replicas}{"\n"}'
-
-    kubectl get statefulset "$NEW" -n "$GG_NS" \
-      -o jsonpath='NEW_U02_CLAIM={.spec.template.spec.volumes[?(@.name=="u02")].persistentVolumeClaim.claimName}{"\n"}'
-  fi
-
-  if kubectl get statefulset "$OLD" -n "$GG_NS" >/dev/null 2>&1; then
-    kubectl get statefulset "$OLD" -n "$GG_NS" \
-      -o jsonpath='OLD_STS_READY={.status.readyReplicas}{"/"}{.status.replicas}{"\n"}'
-  fi
-
-  if kubectl get pvc "$OLD_PVC" -n "$GG_NS" >/dev/null 2>&1; then
-    PV="$(kubectl get pvc "$OLD_PVC" -n "$GG_NS" -o jsonpath='{.spec.volumeName}')"
-
-    kubectl get pvc "$OLD_PVC" -n "$GG_NS" \
-      -o jsonpath='PVC={.metadata.name}{" PVC_STATUS="}{.status.phase}{" PV="}{.spec.volumeName}{"\n"}'
-
-    kubectl get pv "$PV" \
-      -o jsonpath='PV_STATUS={.status.phase}{" RECLAIM="}{.spec.persistentVolumeReclaimPolicy}{" DRIVER="}{.spec.csi.driver}{" HANDLE="}{.spec.csi.volumeHandle}{"\n"}'
-  else
-    echo "PVC=$OLD_PVC ABSENT"
-  fi
+  kubectl get application "$app" -n "$ARGO_NS" \
+    -o jsonpath='SYNC={.status.sync.status}{" HEALTH="}{.status.health.status}{" REVISION="}{.status.sync.revision}{"\n"}{range .status.conditions[*]}CONDITION={.type} MESSAGE={.message}{"\n"}{end}'
 done
 
 echo
-echo "===== CURRENT GOLDENGATE ARGO APPS ====="
-kubectl get applications -n "$ARGO_NS" \
-  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' \
-  | grep -E 'NAME|goldengate-dev-.*repltest' || true
+echo "===== ECR TOKEN SYNC ====="
 
-echo
-echo "===== CURRENT GOLDENGATE STATEFULSETS ====="
-kubectl get statefulsets -n "$GG_NS" \
-  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,REPLICAS:.status.replicas' \
-  | grep -E 'NAME|repltest' || true
+kubectl get cronjob argocd-ecr-token-sync -n "$ARGO_NS" \
+  -o jsonpath='LAST_SCHEDULE={.status.lastScheduleTime}{" LAST_SUCCESS="}{.status.lastSuccessfulTime}{"\n"}' 2>&1 || true
+
+LATEST_JOB="$(
+  kubectl get jobs -n "$ARGO_NS" \
+    --sort-by=.metadata.creationTimestamp \
+    -o name 2>/dev/null \
+  | grep 'argocd-ecr-token-sync' \
+  | tail -1
+)"
+
+if [ -n "$LATEST_JOB" ]; then
+  echo "LATEST_JOB=$LATEST_JOB"
+
+  kubectl get "$LATEST_JOB" -n "$ARGO_NS" \
+    -o jsonpath='SUCCEEDED={.status.succeeded}{" FAILED="}{.status.failed}{"\n"}'
+
+  kubectl logs "$LATEST_JOB" -n "$ARGO_NS" --tail=20 2>&1 \
+    | grep -Ei 'success|error|fail|forbidden|unauthorized|refreshed' || true
+else
+  echo "LATEST_JOB=NONE"
+fi
 EOF
 
-chmod +x gg-migration-check.sh
-./gg-migration-check.sh
+chmod +x argo-status-check.sh
+./argo-status-check.sh
