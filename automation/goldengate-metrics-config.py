@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
+
+# Same grammar as automation/goldengate-environment.py's own _REGION_RE -- duplicated, never imported, since this script is piped as standalone source into the pod and must not depend on a sibling module being present there.
+_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d\Z")
 
 
 def _parse_strict_bool_arg(raw, label):
@@ -36,7 +40,13 @@ def main():
     from boto3.dynamodb.conditions import Attr
     from botocore.exceptions import ClientError
 
-    region = os.environ.get("AWS_REGION", "eu-west-1")
+    # AWS_REGION is the pod's own canonical runtime contract (envs/<environment>/environment.yaml -> automation/goldengate-environment.py -> GitHub workflow environment -> Helm monitor values -> helm/goldengate-monitor/templates/deployment.yaml's .Values.aws.region -> this pod's AWS_REGION). A missing/malformed value means that wiring is broken and must fail closed here, before any AWS call -- never a silently-substituted DEV-region default, and never AWS_DEFAULT_REGION as a second, independently editable fallback source.
+    region = os.environ.get("AWS_REGION", "")
+    if not region:
+        sys.exit("FAIL: AWS_REGION is not set in this pod's environment.")
+    if not _REGION_RE.match(region):
+        sys.exit(f"FAIL: AWS_REGION={region!r} is not a safe AWS region token.")
+
     table_name = os.environ.get("DYNAMODB_TABLE")
     if not table_name:
         sys.exit("FAIL: DYNAMODB_TABLE is not set in this pod's environment.")

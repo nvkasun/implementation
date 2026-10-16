@@ -31,8 +31,8 @@ from moto import mock_aws  # noqa: E402
 import collector as core  # noqa: E402
 
 
-def make_table():
-    client = boto3.client("dynamodb", region_name="eu-west-1")
+def make_table(region="eu-west-1"):
+    client = boto3.client("dynamodb", region_name=region)
     client.create_table(
         TableName="gg-eks-pipeline",
         KeySchema=[{"AttributeName": "pipeline", "KeyType": "HASH"},
@@ -41,7 +41,7 @@ def make_table():
                               {"AttributeName": "recordType", "AttributeType": "S"}],
         BillingMode="PAY_PER_REQUEST",
     )
-    return boto3.resource("dynamodb", region_name="eu-west-1").Table("gg-eks-pipeline")
+    return boto3.resource("dynamodb", region_name=region).Table("gg-eks-pipeline")
 
 
 def load_helper_module():
@@ -52,17 +52,21 @@ def load_helper_module():
     return module
 
 
-def run_helper(argv):
-    """Runs the helper's main() with argv against AWS_REGION=eu-west-1 / DYNAMODB_TABLE=gg-eks-pipeline, capturing stdout+stderr; returns (exit_code, output_text)."""
+def run_helper(argv, region="eu-west-1"):
+    """Runs the helper's main() with argv against AWS_REGION=<region> (default eu-west-1) / DYNAMODB_TABLE=gg-eks-pipeline, capturing stdout+stderr; returns (exit_code, output_text). region=None removes AWS_REGION from the environment entirely (simulating the canonical pod wiring never having set it); any string value (including "") sets it explicitly, exactly as a real pod environment would carry it."""
     module = load_helper_module()
     buf = io.StringIO()
     old_argv = sys.argv
     sys.argv = ["goldengate-metrics-config.py"] + argv
-    env_patch = {"AWS_REGION": "eu-west-1", "DYNAMODB_TABLE": "gg-eks-pipeline"}
+    env_patch = {"DYNAMODB_TABLE": "gg-eks-pipeline"}
+    if region is not None:
+        env_patch["AWS_REGION"] = region
     try:
         # stdout and stderr share one buffer so assertions can check either a report() line or a fail-closed message.
         with mock.patch.dict(os.environ, env_patch, clear=False), \
              redirect_stdout(buf), redirect_stderr(buf):
+            if region is None:
+                os.environ.pop("AWS_REGION", None)
             try:
                 module.main()
                 code = 0
@@ -432,6 +436,80 @@ class MetricsConfigHelperTests(unittest.TestCase):
 
         self.assertNotEqual(code, 0)
         self.assertIn("ALL_NEW attributes show metricsEnabled", out)
+
+
+# Production-Base Correction 1: AWS_REGION must be the pod's own canonical runtime contract value, never a silently-substituted DEV-region default -- a missing/empty/malformed AWS_REGION is a broken canonical wiring and must fail closed BEFORE any boto3 DynamoDB resource is ever constructed.
+class RegionValidationTests(unittest.TestCase):
+    PIPELINE = "gg-oracle-payments-01"
+    TYPE = "oracle"
+
+    @staticmethod
+    def _seed(table, pipeline, deployment_type, metrics_enabled, alerts_enabled=False):
+        table.put_item(Item={
+            "pipeline": pipeline,
+            "recordType": "CONFIG",
+            "deploymentType": deployment_type,
+            "metricsEnabled": metrics_enabled,
+            "alertsEnabled": alerts_enabled,
+        })
+
+    @mock_aws
+    def test_A_valid_non_default_region_is_honored_through_the_existing_update_path(self):
+        # Deliberately NOT eu-west-1 (the former hardcoded fallback) -- proves the pod's own AWS_REGION is what actually drives boto3, not a value that happens to coincide with a removed default.
+        table = make_table(region="ap-south-1")
+        self._seed(table, self.PIPELINE, self.TYPE, metrics_enabled=False)
+
+        code, out = run_helper([self.PIPELINE, self.TYPE, "true", "true"], region="ap-south-1")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("action=updated", out)
+        item = table.get_item(Key={"pipeline": self.PIPELINE, "recordType": "CONFIG"})["Item"]
+        self.assertTrue(item["metricsEnabled"])
+
+    def test_B_missing_aws_region_fails_closed(self):
+        code, out = run_helper([self.PIPELINE, self.TYPE, "true", "false"], region=None)
+        self.assertNotEqual(code, 0)
+        self.assertIn("AWS_REGION is not set", out)
+
+    def test_C_empty_aws_region_fails_closed(self):
+        code, out = run_helper([self.PIPELINE, self.TYPE, "true", "false"], region="")
+        self.assertNotEqual(code, 0)
+        self.assertIn("AWS_REGION is not set", out)
+
+    def test_D_malformed_aws_region_fails_closed(self):
+        for bad_region in ("not-a-region", "Eu-West-1", "eu_west_1", "eu-west-99", "; rm -rf /"):
+            with self.subTest(bad_region=bad_region):
+                code, out = run_helper([self.PIPELINE, self.TYPE, "true", "false"], region=bad_region)
+                self.assertNotEqual(code, 0)
+                self.assertIn("is not a safe AWS region token", out)
+
+    def test_E_missing_region_failure_occurs_before_any_dynamodb_interaction(self):
+        with mock.patch("boto3.resource") as mock_resource:
+            code, out = run_helper([self.PIPELINE, self.TYPE, "true", "false"], region=None)
+        self.assertNotEqual(code, 0)
+        mock_resource.assert_not_called()
+
+    def test_E_empty_region_failure_occurs_before_any_dynamodb_interaction(self):
+        with mock.patch("boto3.resource") as mock_resource:
+            code, out = run_helper([self.PIPELINE, self.TYPE, "true", "false"], region="")
+        self.assertNotEqual(code, 0)
+        mock_resource.assert_not_called()
+
+    def test_E_malformed_region_failure_occurs_before_any_dynamodb_interaction(self):
+        with mock.patch("boto3.resource") as mock_resource:
+            code, out = run_helper([self.PIPELINE, self.TYPE, "true", "false"], region="not-a-region")
+        self.assertNotEqual(code, 0)
+        mock_resource.assert_not_called()
+
+    def test_F_no_literal_region_fallback_remains_in_production_source(self):
+        with open(HELPER_PATH) as f:
+            source = f.read()
+        self.assertNotIn('os.environ.get("AWS_REGION", "eu-west-1")', source)
+        self.assertNotIn("os.environ.get('AWS_REGION', 'eu-west-1')", source)
+        # AWS_DEFAULT_REGION must never be READ by this helper as a second, independently-editable fallback source (a mention in an explanatory comment, as directly above this check's own production-source neighbor, is fine).
+        self.assertNotIn('environ.get("AWS_DEFAULT_REGION"', source)
+        self.assertNotIn("environ[\"AWS_DEFAULT_REGION\"]", source)
+        self.assertNotIn("environ['AWS_DEFAULT_REGION']", source)
 
 
 # Static source-level invariants for automation/goldengate-metrics-config.py and the two inline CONFIG readers in 50-sub-monitor.yaml.
