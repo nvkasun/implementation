@@ -2700,6 +2700,161 @@ class ApplicationSetNamingDriftTests(unittest.TestCase):
             self.assertEqual(from_phase5, f"{phase5_runtime._canonical_argocd_app_name(ENVIRONMENT, deployment_id)}-appset")
 
 
+class ApplicationSetOwnershipDriftTests(unittest.TestCase):
+    """Phase 5 Runtime Application Self-Healing: proves the ApplicationSet/Application ownership-safety invariants deliberately mirrored between runtime_state.py (pre-reconciliation preflight) and runtime_acceptance.py (post-reconciliation strict acceptance) cannot silently diverge -- by calling both real functions directly against the same fabricated fixtures and comparing their actual return values, never by comparing source text. Covers (A) _check_child_owner_reference, byte-for-byte identical in both files, and (B) the overlapping ApplicationSet ownership-shape assertions inside _check_applicationset_ownership (runtime_state.py) / _check_applicationset (runtime_acceptance.py, patched only at its get_json() boundary so it receives the identical fabricated object). Deliberately never exercises Sync/Health status -- those are acceptance-only and must stay that way; the pre-existing recoverable-OWNED/MIGRATION_CANDIDATE/BROKEN regression tests in test_runtime_state.py and test_runtime_acceptance.py already prove that divergence is preserved and are untouched here."""
+
+    APPSET_NAME = "goldengate-dev-oracle-payments-01-appset"
+    APP_NAME = "goldengate-dev-oracle-payments-01"
+    APPSET_UID = "appset-uid-abc123"
+    ENVIRONMENT = "dev"
+    DEPLOYMENT_ID = "gg-oracle-payments-01"
+    RUNTIME_NAMESPACE = "goldengate-dev"
+    ARGOCD_NAMESPACE = "argocd"
+    EXPECTED_REPO_URL = f"oci://{ECR_REGISTRY}/helm/goldengate"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.runtime_state = phase5_runtime._load_runtime_state_module()
+        spec = importlib.util.spec_from_file_location("runtime_acceptance", REPO_ROOT / "automation" / "phases" / "phase5" / "runtime_acceptance.py")
+        cls.runtime_acceptance = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.runtime_acceptance)
+
+    # --- A: child ownerReference parity (both functions take identical already-fetched primitives, no I/O) ---
+
+    def _valid_owner_ref(self, **overrides):
+        ref = {"apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet", "name": self.APPSET_NAME, "uid": self.APPSET_UID, "controller": True}
+        ref.update(overrides)
+        return ref
+
+    def _check_both_owner_reference(self, owner_refs):
+        app_obj = {"metadata": {}} if owner_refs is None else {"metadata": {"ownerReferences": owner_refs}}
+        from_state = self.runtime_state._check_child_owner_reference(app_obj, self.APP_NAME, self.APPSET_NAME, self.APPSET_UID)
+        from_acceptance = self.runtime_acceptance._check_child_owner_reference(app_obj, self.APP_NAME, self.APPSET_NAME, self.APPSET_UID)
+        return from_state, from_acceptance
+
+    def test_A1_valid_controller_owner_reference_both_accept(self):
+        from_state, from_acceptance = self._check_both_owner_reference([self._valid_owner_ref()])
+        self.assertEqual(from_state, [])
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_A2_owner_references_missing_entirely_both_reject_identically(self):
+        from_state, from_acceptance = self._check_both_owner_reference(None)
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_A3_owner_references_empty_both_reject_identically(self):
+        from_state, from_acceptance = self._check_both_owner_reference([])
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_A4_controller_not_true_both_reject_identically(self):
+        from_state, from_acceptance = self._check_both_owner_reference([self._valid_owner_ref(controller=False)])
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_A5_wrong_api_version_both_reject_identically(self):
+        from_state, from_acceptance = self._check_both_owner_reference([self._valid_owner_ref(apiVersion="v1")])
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_A6_wrong_kind_both_reject_identically(self):
+        from_state, from_acceptance = self._check_both_owner_reference([self._valid_owner_ref(kind="Application")])
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_A7_wrong_appset_name_both_reject_identically(self):
+        from_state, from_acceptance = self._check_both_owner_reference([self._valid_owner_ref(name="some-other-appset")])
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_A8_wrong_uid_both_reject_identically(self):
+        from_state, from_acceptance = self._check_both_owner_reference([self._valid_owner_ref(uid="totally-different-uid")])
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_A9_two_controller_true_references_both_reject_identically(self):
+        from_state, from_acceptance = self._check_both_owner_reference([self._valid_owner_ref(), self._valid_owner_ref(uid="second-controller-uid")])
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_A10_unrelated_noncontroller_reference_plus_one_correct_controller_both_accept(self):
+        unrelated = {"apiVersion": "v1", "kind": "ConfigMap", "name": "unrelated", "uid": "unrelated-uid", "controller": False}
+        from_state, from_acceptance = self._check_both_owner_reference([unrelated, self._valid_owner_ref()])
+        self.assertEqual(from_state, [])
+        self.assertEqual(from_state, from_acceptance)
+
+    # --- B: ApplicationSet ownership-shape parity (runtime_acceptance patched only at its get_json() boundary) ---
+
+    def _valid_appset_obj(self, **label_overrides):
+        labels = {"goldengate.adcb/environment": self.ENVIRONMENT, "goldengate.adcb/deployment-id": self.DEPLOYMENT_ID}
+        labels.update(label_overrides)
+        return {
+            "metadata": {"labels": labels, "uid": self.APPSET_UID},
+            "spec": {"template": {"metadata": {"name": self.APP_NAME}, "spec": {
+                "destination": {"namespace": self.RUNTIME_NAMESPACE},
+                "source": {"repoURL": self.EXPECTED_REPO_URL},
+            }}},
+        }
+
+    def _check_both_appset_ownership(self, appset_obj):
+        from_state = self.runtime_state._check_applicationset_ownership(
+            appset_obj, self.APPSET_NAME, self.APP_NAME, self.ENVIRONMENT, self.DEPLOYMENT_ID, self.RUNTIME_NAMESPACE, self.EXPECTED_REPO_URL,
+        )
+        acceptance_reasons = []
+        with mock.patch.object(self.runtime_acceptance, "get_json", lambda run, *a, **kw: (True, appset_obj)):
+            returned_uid = self.runtime_acceptance._check_applicationset(
+                None, acceptance_reasons, self.ENVIRONMENT, self.DEPLOYMENT_ID, self.ARGOCD_NAMESPACE, self.RUNTIME_NAMESPACE, ECR_REGISTRY, self.APP_NAME,
+            )
+        return from_state, acceptance_reasons, returned_uid
+
+    def test_B1_valid_object_both_accept_and_acceptance_returns_actual_uid(self):
+        from_state, from_acceptance, returned_uid = self._check_both_appset_ownership(self._valid_appset_obj())
+        self.assertEqual(from_state, [])
+        self.assertEqual(from_state, from_acceptance)
+        self.assertEqual(returned_uid, self.APPSET_UID)
+
+    def test_B2_wrong_environment_label_both_reject_identically(self):
+        obj = self._valid_appset_obj(**{"goldengate.adcb/environment": "prod"})
+        from_state, from_acceptance, _ = self._check_both_appset_ownership(obj)
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_B3_wrong_deployment_id_label_both_reject_identically(self):
+        obj = self._valid_appset_obj(**{"goldengate.adcb/deployment-id": "gg-wrong-id"})
+        from_state, from_acceptance, _ = self._check_both_appset_ownership(obj)
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_B4_wrong_template_metadata_name_both_reject_identically(self):
+        obj = self._valid_appset_obj()
+        obj["spec"]["template"]["metadata"]["name"] = "goldengate-dev-some-other-app"
+        from_state, from_acceptance, _ = self._check_both_appset_ownership(obj)
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_B5_wrong_destination_namespace_both_reject_identically(self):
+        obj = self._valid_appset_obj()
+        obj["spec"]["template"]["spec"]["destination"]["namespace"] = "some-other-namespace"
+        from_state, from_acceptance, _ = self._check_both_appset_ownership(obj)
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_B6_wrong_source_repo_url_both_reject_identically(self):
+        obj = self._valid_appset_obj()
+        obj["spec"]["template"]["spec"]["source"]["repoURL"] = "oci://unrelated-registry/helm/other"
+        from_state, from_acceptance, _ = self._check_both_appset_ownership(obj)
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+
+    def test_B7_missing_uid_both_reject_and_acceptance_returns_falsy(self):
+        obj = self._valid_appset_obj()
+        obj["metadata"].pop("uid", None)
+        from_state, from_acceptance, returned_uid = self._check_both_appset_ownership(obj)
+        self.assertTrue(from_state)
+        self.assertEqual(from_state, from_acceptance)
+        self.assertFalse(returned_uid)
+
+
 class GeneratedChildApplicationEquivalenceTests(unittest.TestCase):
     """Phase 5 Runtime Application Self-Healing: the ApplicationSet's generated child must be semantically equal to today's standalone _build_runtime_application_manifest() contract -- proven here by direct field comparison of the two functions' own real output, never by a parallel reimplementation that could silently drift."""
 
