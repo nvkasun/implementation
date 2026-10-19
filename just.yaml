@@ -1,36 +1,34 @@
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "GoldenGateMonitorEcrAuthorization",
-      "Effect": "Allow",
-      "Action": [
-        "ecr:GetAuthorizationToken"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "GoldenGateMonitorEcrBuildAndPublish",
-      "Effect": "Allow",
-      "Action": [
-        "ecr:DescribeRepositories",
-        "ecr:DescribeImages",
-        "ecr:GetRepositoryPolicy",
-        "ecr:SetRepositoryPolicy",
-        "ecr:CreateRepository",
-        "ecr:TagResource",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:BatchGetImage",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:InitiateLayerUpload",
-        "ecr:UploadLayerPart",
-        "ecr:CompleteLayerUpload",
-        "ecr:PutImage"
-      ],
-      "Resource": [
-        "arn:aws:ecr:eu-west-1:229410149234:repository/goldengate-monitor",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-monitor"
-      ]
-    }
-  ]
-}
+Run these READ-ONLY commands from the VDR
+kubectl get applicationsets -n argocd
+kubectl get applications -n argocd
+
+kubectl get statefulsets -n goldengate-dev
+kubectl get pods -n goldengate-dev -o wide
+kubectl get pvc -n goldengate-dev
+
+kubectl get storageclass | grep -i gg
+kubectl get secretproviderclass -n goldengate-dev
+
+kubectl get pods -n goldengate-monitoring -o wide
+kubectl get deployments -n goldengate-monitoring
+
+Then specifically check the four canonical/legacy runtime names:
+kubectl get application -n argocd \
+  goldengate-dev-postgresql-repltest-001 \
+  goldengate-dev-mssql-repltest-001 \
+  goldengate-dev-oracle-repltest-002 \
+  goldengate-dev-postgresql-repltest-002
+
+and:
+kubectl get application -n argocd \
+  goldengate-dev-postgresql-repltest-01 \
+  goldengate-dev-mssql-repltest-01 \
+  goldengate-dev-oracle-repltest-01 \
+  goldengate-dev-postgresql-repltest-02
+
+NotFound for some of these is useful evidence; don’t treat it as a problem by itself.
+Also run:
+kubectl get applicationsets -n argocd -o wide
+kubectl get applications -n argocd -o wide
+kubectl get statefulsets -n goldengate-dev -o wide
+kubectl get pvc -n goldengate-dev -o wide
