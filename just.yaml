@@ -1,4 +1,30 @@
-kubectl describe pod \
-  secrets-store-csi-driver-provider-aws-wjkqc \
+#!/usr/bin/env bash
+set -u
+
+echo "===== NODES ====="
+kubectl get nodes \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,PODS:.status.allocatable.pods'
+
+echo
+echo "===== AWS SECRETS PROVIDER ====="
+kubectl get daemonset secrets-store-csi-driver-provider-aws \
   -n kube-system \
-  | sed -n '/Events:/,$p'
+  -o custom-columns='NAME:.metadata.name,DESIRED:.status.desiredNumberScheduled,CURRENT:.status.currentNumberScheduled,READY:.status.numberReady,AVAILABLE:.status.numberAvailable'
+
+kubectl get pods -n kube-system -o wide \
+  | grep 'secrets-store-csi-driver-provider-aws'
+
+echo
+echo "===== GOLDENGATE RUNTIMES ====="
+kubectl get pods -n goldengate-dev \
+  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,NODE:.spec.nodeName'
+
+echo
+echo "===== MONITOR ====="
+kubectl get pods -n goldengate-monitoring \
+  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,NODE:.spec.nodeName'
+
+echo
+echo "===== ARGO APPLICATIONS ====="
+kubectl get applications -n argocd \
+  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
