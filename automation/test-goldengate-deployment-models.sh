@@ -7397,7 +7397,7 @@ else
   skip "DYNAMODB-CONFIG-MIGRATION-PROOF: terraform not available"
 fi
 
-# Behavioral proof of the REAL committed envs/dev/dynamodb.tf itself (a local stub replaces the private, auth-gated aws-tf-module-dynamodb source only -- never the resource/data-source types under test, which are the real AWS provider): (c) terraform validate proves the new HCL is syntactically/referentially correct; (d) with the REAL committed disposition (copy_required_ids empty, legacy_absent_ids holding all four bounded ids -- the live-proven current DEV state), planning gg-oracle-repltest-002 makes ZERO AWS calls at all (the legacy data source's own for_each is empty) and correctly falls back to the plain-default CONFIG body -- today's safe steady state; (e) in a SEPARATE sandbox copy with gg-oracle-repltest-002 moved into copy_required_ids (simulating a future, separately authorized migration that has independently proven an OLD item exists again), planning correctly ATTEMPTS the read-only legacy lookup and fails closed with a live-credentials error naming the exact expected OLD physical key -- proving the COPY_REQUIRED wiring still works correctly when actually used, and that this sandbox never fabricates or substitutes default content when live data is unavailable.
+# Behavioral proof of the real envs/dev/dynamodb.tf: (c) validate, (d) today's disposition makes zero AWS calls, (e) COPY_REQUIRED fails closed against a localhost DynamoDB stub (never a real AWS endpoint).
 if command -v terraform >/dev/null 2>&1; then
   DYNAMODB_REAL_PROOF_ROOT="$(mktemp -d)"
   mkdir -p "${DYNAMODB_REAL_PROOF_ROOT}/stub-dynamodb-module" "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev"
@@ -7499,35 +7499,138 @@ EOF
       cat "${DYNAMODB_REAL_PROOF_ROOT}/plan_current.log"
     fi
 
-    # (e) A SEPARATE sandbox copy, with gg-oracle-repltest-002 moved into copy_required_ids -- simulating a future, separately authorized migration that has independently proven the OLD item exists again. Since legacy_absent_ids is DERIVED (setsubtract(keys(source_ids), copy_required_ids)), this single edit is sufficient -- legacy_absent_ids automatically excludes gg-oracle-repltest-002 with no second, independently-maintained list to also update. Proves the COPY_REQUIRED wiring (never exercised by today's real disposition) still correctly attempts the legacy read and fails closed, rather than having silently bit-rotted now that it is unused by default.
+    # (e) COPY_REQUIRED sandbox copy, against a localhost DynamoDB stub -- never a real AWS endpoint.
     cp -r "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev" "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired"
-    python3 - "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf" <<'PYEOF'
+
+    cat > "${DYNAMODB_REAL_PROOF_ROOT}/dynamodb_stub.py" <<'STUBEOF'
+# Loopback-only DynamoDB stub: captures the request, returns ResourceNotFoundException.
+import http.server, json, sys
+
+root = sys.argv[1]
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        capture = {
+            "target": self.headers.get("X-Amz-Target", ""),
+            "body": json.loads(body.decode()) if body else {},
+        }
+        with open(f"{root}/captured_request.json", "w") as f:
+            json.dump(capture, f)
+        payload = json.dumps({
+            "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+            "message": "Requested resource not found",
+        }).encode()
+        self.send_response(400)
+        self.send_header("Content-Type", "application/x-amz-json-1.0")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+with open(f"{root}/stub_port.txt", "w") as f:
+    f.write(str(server.server_address[1]))
+server.serve_forever()
+STUBEOF
+
+    python3 "${DYNAMODB_REAL_PROOF_ROOT}/dynamodb_stub.py" "${DYNAMODB_REAL_PROOF_ROOT}" &
+    DYNAMODB_STUB_PID=$!
+
+    DYNAMODB_STUB_PORT=""
+    for _ in $(seq 1 50); do
+      if [ -s "${DYNAMODB_REAL_PROOF_ROOT}/stub_port.txt" ]; then
+        DYNAMODB_STUB_PORT="$(cat "${DYNAMODB_REAL_PROOF_ROOT}/stub_port.txt")"
+        break
+      fi
+      sleep 0.1
+    done
+
+    if [ -z "$DYNAMODB_STUB_PORT" ]; then
+      skip "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): localhost DynamoDB stub did not start in time"
+      kill "$DYNAMODB_STUB_PID" 2>/dev/null || true
+      wait "$DYNAMODB_STUB_PID" 2>/dev/null || true
+    else
+      # Moves gg-oracle-repltest-002 into copy_required_ids and points the aws provider's dynamodb endpoint at the stub.
+      python3 - "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf" "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/provider_and_stubs.tf" "$DYNAMODB_STUB_PORT" <<'PYEOF'
+import re
 import sys
-path = sys.argv[1]
-with open(path) as f:
+
+dynamodb_tf_path, provider_path, port = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(dynamodb_tf_path) as f:
     text = f.read()
 text = text.replace(
     "goldengate_config_migration_copy_required_ids = toset([])",
     'goldengate_config_migration_copy_required_ids = toset(["gg-oracle-repltest-002"])',
 )
-with open(path, "w") as f:
+with open(dynamodb_tf_path, "w") as f:
     f.write(text)
+
+with open(provider_path) as f:
+    provider_text = f.read()
+provider_text = re.sub(
+    r'(provider "aws" \{.*?)\n\}',
+    r'\1\n  endpoints {\n    dynamodb = "http://127.0.0.1:%s"\n  }\n}' % port,
+    provider_text,
+    count=1,
+    flags=re.S,
+)
+with open(provider_path, "w") as f:
+    f.write(provider_text)
 PYEOF
-    if ! grep -qF 'copy_required_ids = toset(["gg-oracle-repltest-002"])' "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf"; then
-      fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): the copy-required sandbox transform did not move gg-oracle-repltest-002 into copy_required_ids -- refusing to trust its plan result"
-    else
-      set +e
-      (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired" && terraform plan -refresh=false -no-color) >"${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log" 2>&1
-      DYNAMODB_PLAN_COPYREQUIRED_STATUS=$?
-      set -e
-      if [ "$DYNAMODB_PLAN_COPYREQUIRED_STATUS" -ne 0 ] \
-          && grep -qF 'reading DynamoDB Table Item (gg-eks-pipeline|gg-oracle-repltest-01|CONFIG)' "${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log" \
-          && ! grep -qF 'aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-002"] will be created' "${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log"; then
-        pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): with gg-oracle-repltest-002 classified COPY_REQUIRED, planning correctly ATTEMPTS a read-only lookup of the exact expected legacy key (gg-eks-pipeline|gg-oracle-repltest-01|CONFIG) and fails closed (no live credentials in this sandbox) BEFORE ever proposing a pipeline_config CONFIG item action -- the mechanism never fabricates/substitutes default content when the real legacy item cannot be read, and no live AWS data was returned or exchanged"
-      else
-        fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): expected a fail-closed plan attempting exactly the expected legacy key read, never proposing a pipeline_config action"
-        cat "${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log"
+
+      DYNAMODB_TRANSFORM_OK=true
+      if ! grep -qF 'copy_required_ids = toset(["gg-oracle-repltest-002"])' "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/dynamodb.tf"; then
+        DYNAMODB_TRANSFORM_OK=false
       fi
+      if ! grep -qF "dynamodb = \"http://127.0.0.1:${DYNAMODB_STUB_PORT}\"" "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired/provider_and_stubs.tf"; then
+        DYNAMODB_TRANSFORM_OK=false
+      fi
+
+      if [ "$DYNAMODB_TRANSFORM_OK" != "true" ]; then
+        fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): the copy-required sandbox transform did not produce the expected copy_required_ids/localhost-endpoint configuration -- refusing to trust its plan result"
+      else
+        set +e
+        (cd "${DYNAMODB_REAL_PROOF_ROOT}/envs/dev-copyrequired" && terraform plan -refresh=false -no-color) >"${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log" 2>&1
+        DYNAMODB_PLAN_COPYREQUIRED_STATUS=$?
+        set -e
+
+        DYNAMODB_CAPTURED_REQUEST="${DYNAMODB_REAL_PROOF_ROOT}/captured_request.json"
+        # Asserts the captured request itself (TableName/Key), never the provider's own error-message key ordering.
+        if [ "$DYNAMODB_PLAN_COPYREQUIRED_STATUS" -ne 0 ] \
+            && [ -s "$DYNAMODB_CAPTURED_REQUEST" ] \
+            && python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    captured = json.load(f)
+body = captured.get("body", {})
+key = body.get("Key", {})
+ok = (
+    "GetItem" in captured.get("target", "")
+    and body.get("TableName") == "gg-eks-pipeline"
+    and key.get("pipeline", {}).get("S") == "gg-oracle-repltest-01"
+    and key.get("recordType", {}).get("S") == "CONFIG"
+)
+sys.exit(0 if ok else 1)
+' "$DYNAMODB_CAPTURED_REQUEST" \
+            && ! grep -qF 'aws_dynamodb_table_item.pipeline_config["gg-oracle-repltest-002"] will be created' "${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log" \
+            && ! grep -q "dynamodb\.eu-west-1\.amazonaws\.com" "${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log"; then
+          pass "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): COPY_REQUIRED requests the exact OLD key (gg-eks-pipeline, pipeline=gg-oracle-repltest-01, recordType=CONFIG) from a localhost stub, fails closed, never proposes creating the NEW CONFIG item, and never contacts a real AWS endpoint"
+        else
+          fail "DYNAMODB-CONFIG-MIGRATION-REAL-PROOF (e): expected a fail-closed plan against the localhost stub with the exact OLD key request, never proposing a pipeline_config action, never contacting a real AWS endpoint"
+          cat "${DYNAMODB_REAL_PROOF_ROOT}/plan_copyrequired.log"
+          [ -f "$DYNAMODB_CAPTURED_REQUEST" ] && cat "$DYNAMODB_CAPTURED_REQUEST"
+        fi
+      fi
+
+      kill "$DYNAMODB_STUB_PID" 2>/dev/null || true
+      wait "$DYNAMODB_STUB_PID" 2>/dev/null || true
     fi
   fi
   rm -rf "$DYNAMODB_REAL_PROOF_ROOT"
