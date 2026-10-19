@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -u
 
-NS_RUNTIME="goldengate-dev"
-NS_MONITOR="goldengate-monitoring"
-RUNTIME_POD="gg-mssql-repltest-001-0"
-MONITOR_POD="$(kubectl get pods -n "$NS_MONITOR" -l app.kubernetes.io/name=gg-monitor -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
 NODE="ip-10-238-186-172.eu-west-1.compute.internal"
 
 section() {
@@ -12,62 +8,49 @@ section() {
   echo "===== $1 ====="
 }
 
-section "RUNTIME POD STATUS"
-kubectl get pod "$RUNTIME_POD" -n "$NS_RUNTIME" \
-  -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName,INIT:.status.initContainerStatuses[*].state.waiting.reason,CONTAINER:.status.containerStatuses[*].state.waiting.reason' \
-  2>/dev/null
+section "SECRETS STORE DAEMONSETS"
+kubectl get daemonset -A \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,DESIRED:.status.desiredNumberScheduled,CURRENT:.status.currentNumberScheduled,READY:.status.numberReady,AVAILABLE:.status.numberAvailable' \
+  2>/dev/null \
+  | grep -Ei 'secret|provider|csi' || true
 
-section "RUNTIME POD EVENTS"
-kubectl describe pod "$RUNTIME_POD" -n "$NS_RUNTIME" 2>/dev/null \
-  | sed -n '/Events:/,$p'
+section "SECRETS STORE PODS"
+kubectl get pods -A -o wide 2>/dev/null \
+  | grep -Ei 'secrets-store|provider-aws|provider.*aws' || true
 
-section "RUNTIME INIT LOG"
-kubectl logs "$RUNTIME_POD" -n "$NS_RUNTIME" \
-  -c prepare-u02-permissions \
-  --tail=80 2>&1 \
-  | tail -n 80
+section "AWS PROVIDER DAEMONSET DETAILS"
+AWS_DS="$(kubectl get daemonset -A \
+  -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' \
+  --no-headers 2>/dev/null \
+  | grep -Ei 'provider.*aws|aws.*provider' \
+  | head -1 || true)"
 
-section "MONITOR POD STATUS"
-if [ -n "$MONITOR_POD" ]; then
-  kubectl get pod "$MONITOR_POD" -n "$NS_MONITOR" \
-    -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName,WAITING:.status.containerStatuses[*].state.waiting.reason' \
-    2>/dev/null
-else
-  echo "Monitor pod not found"
-fi
+if [ -n "$AWS_DS" ]; then
+  AWS_NS="$(echo "$AWS_DS" | awk '{print $1}')"
+  AWS_NAME="$(echo "$AWS_DS" | awk '{print $2}')"
 
-section "MONITOR POD EVENTS"
-if [ -n "$MONITOR_POD" ]; then
-  kubectl describe pod "$MONITOR_POD" -n "$NS_MONITOR" 2>/dev/null \
+  echo "FOUND: ${AWS_NS}/${AWS_NAME}"
+
+  kubectl describe daemonset "$AWS_NAME" -n "$AWS_NS" 2>/dev/null \
     | sed -n '/Events:/,$p'
+else
+  echo "AWS Secrets Store CSI provider DaemonSet: NOT FOUND"
 fi
 
-section "RECENT RUNTIME WARNINGS"
-kubectl get events -n "$NS_RUNTIME" \
-  --field-selector type=Warning \
-  --sort-by=.lastTimestamp \
-  2>/dev/null \
-  | tail -n 25
-
-section "RECENT MONITOR WARNINGS"
-kubectl get events -n "$NS_MONITOR" \
-  --field-selector type=Warning \
-  --sort-by=.lastTimestamp \
-  2>/dev/null \
-  | tail -n 20
-
-section "NODE CONDITIONS"
+section "NODE POD CAPACITY"
 kubectl get node "$NODE" \
-  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,MEMORY:.status.conditions[?(@.type=="MemoryPressure")].status,DISK:.status.conditions[?(@.type=="DiskPressure")].status,PID:.status.conditions[?(@.type=="PIDPressure")].status' \
+  -o custom-columns='NODE:.metadata.name,CAPACITY_PODS:.status.capacity.pods,ALLOCATABLE_PODS:.status.allocatable.pods' \
   2>/dev/null
 
-section "NODE TAINTS"
-kubectl get node "$NODE" \
-  -o jsonpath='{range .spec.taints[*]}{.key}={.value}:{.effect}{"\n"}{end}' \
-  2>/dev/null
-
-section "PODS ON AFFECTED NODE"
+section "PODS ASSIGNED TO NODE"
+printf "COUNT="
 kubectl get pods -A \
   --field-selector spec.nodeName="$NODE" \
-  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase' \
-  2>/dev/null
+  --no-headers 2>/dev/null | wc -l
+
+section "PENDING PROVIDER PODS"
+kubectl get pods -A \
+  --field-selector=status.phase=Pending \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' \
+  2>/dev/null \
+  | grep -Ei 'secret|provider|csi' || true
