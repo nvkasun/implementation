@@ -11,7 +11,7 @@ variable "environment" {
 }
 
 locals {
-  # Pipeline-Aware Descriptor Hierarchy: the ONLY canonical runtime descriptor shape is exactly two levels under pipelines/ -- pipelines/<pipeline-id>/<deployment-id>/values.yaml. This exact two-star fileset pattern is itself the complete discovery-boundary contract, mirroring automation/goldengate-deployment-model.py's own find_values_files() exactly: envs/dev/argocd/values.yaml and envs/dev/goldengate-monitor/values.yaml (both siblings of pipelines/, never inside it) are never matched at all -- there is no longer a goldengate_ignored_runtime_folders filter to maintain, since the pattern itself structurally excludes them.
+  # Canonical descriptor shape: pipelines/<pipeline-id>/<deployment-id>/values.yaml, mirroring find_values_files(). Sibling files like argocd/values.yaml are structurally excluded.
   goldengate_runtime_value_files = sort(fileset(path.module, "pipelines/*/*/values.yaml"))
 
   goldengate_runtime_pipeline_folder_by_id = {
@@ -28,7 +28,7 @@ locals {
     for id, doc in local.goldengate_runtime_documents : id => try(jsonencode(doc.deployment.enabled), "")
   }
 
-  # Automated Replication Implementation Removal: a top-level `replication` key of ANY shape (null, {}, enabled:false, enabled:true) is a retired-schema tombstone here, key-presence based -- mirrors automation/goldengate-deployment-model.py's own _reject_replication_key_presence() guard. Never a `!= null` value-tolerant check: a present `replication: null` key must still be rejected, exactly like the existing lifecycle/root-enabled/runtime-enabled tombstone guards below.
+  # A top-level `replication` key of any shape is a retired-schema tombstone -- key-presence based, mirrors _reject_replication_key_presence().
   goldengate_replication_key_present = {
     for id, doc in local.goldengate_runtime_documents : id => try(contains(keys(doc), "replication"), false)
   }
@@ -82,7 +82,7 @@ locals {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.storage.u02.type, "")
   }
 
-  # Pipeline-Aware Descriptor Hierarchy Migration: exactly four intentional deployment-ID renames must NOT change the underlying managed EFS filesystem's immutable creation_token (creation_token is a ForceNew argument on the real aws_efs_file_system resource below, so changing it would destroy and recreate the filesystem). Mirrors automation/goldengate-deployment-model.py's own LEGACY_MANAGED_EFS_CREATION_TOKENS exactly (never imported -- Terraform cannot import Python; a dedicated drift test in that module's own test suite proves the two copies agree). A narrowly-scoped, explicit, auditable mapping of NEW deployment ID -> the EXACT creation token the existing AWS filesystem was already created with under its OLD deployment ID -- NOT a general runtime-identity override: a deployment ID absent from this map always derives its token normally below. This file lives only under envs/dev/, so (unlike the Python module, which serves every environment) this map needs no environment key -- it can never leak into another environment's Terraform state. Never add a future entry here for a genuinely new runtime.
+  # Four bounded id renames must not change the EFS creation_token (ForceNew) -- mirrors LEGACY_MANAGED_EFS_CREATION_TOKENS in goldengate-deployment-model.py. Never add an entry for a genuinely new runtime.
   goldengate_legacy_managed_efs_creation_tokens = {
     "gg-postgresql-repltest-001" = "dev-gg-postgresql-repltest-01-efs"
     "gg-mssql-repltest-001"      = "dev-gg-mssql-repltest-01-efs"
@@ -90,7 +90,7 @@ locals {
     "gg-postgresql-repltest-002" = "dev-gg-postgresql-repltest-02-efs"
   }
 
-  # Keyed by every folder-driven document (not just goldengate_enabled_deployments): storage follows the runtime's Git folder, never deployment.enabled. A managed EFS module instance must never disappear from this map merely because a deployment is temporarily disabled -- only physical deletion of the values.yaml file removes an entry here, and that case is guarded upstream by the workflow's managed_efs_deletion_guard job, which must run before any Terraform apply can observe the removal.
+  # Keyed by every folder-driven document, not just enabled ones -- this must never disappear from this map merely because a deployment is temporarily disabled. Deletion is guarded upstream by managed_efs_deletion_guard.
   goldengate_managed_efs_deployments = {
     for id, doc in local.goldengate_runtime_documents : id => {
       creation_token = lookup(local.goldengate_legacy_managed_efs_creation_tokens, id, "${var.environment}-${id}-efs")
@@ -101,7 +101,7 @@ locals {
   # No filtering here; terraform_data.goldengate_runtime_contract enforces the full contract as a plan-blocking precondition.
   goldengate_runtime_candidates = local.goldengate_runtime_documents
 
-  # GoldenGate Runtime Desired-State Simplification: deployment.enabled is the SOLE runtime-presence control (lifecycle.state was retired -- terraform_data.goldengate_runtime_contract's own precondition above now rejects its presence outright). try()-guarded so an invalid document fails via the precondition below, not a secondary "unsupported attribute" error.
+  # deployment.enabled is the sole runtime-presence control; lifecycle.state is retired and rejected by the contract precondition below.
   goldengate_enabled_deployments = {
     for id, doc in local.goldengate_runtime_candidates : id => doc
     if try(doc.deployment.enabled, false) == true
@@ -127,11 +127,11 @@ locals {
 
   goldengate_tls_secret_name = local.gg_env_tls_secret_name
 
-  # The permanent, stable self-service runtime identity: every singleRuntime deployment of every deploymentType (including future ones) shares this ONE IRSA subject, so onboarding a new engine never requires an IAM trust-policy edit -- deploymentType controls image/product/ports/replication semantics, never AWS runtime identity. Never derived from the folder inventory -- it is a platform invariant, not a per-type/per-count value. This is a fresh EKS cluster: there is no migration-compatibility trust to preserve, so this is the ONLY approved runtime trust subject. Mirrors automation/goldengate-deployment-model.py's resolve_runtime_service_account().
+  # One shared IRSA subject for every deploymentType -- onboarding a new engine never needs an IAM trust-policy edit. Mirrors resolve_runtime_service_account().
   goldengate_canonical_runtime_trust_subject = "system:serviceaccount:${local.goldengate_shared_environment.runtimeNamespace}:gg-runtime-sa"
 
   goldengate_secrets_trust_policy = jsondecode(file("${path.module}/policies/goldengate-secrets-read-dev/assume_role_policy/sts.json"))
-  # The OIDC condition-map key is derived from the live-discovered cluster issuer (envs/dev/environment.tf), never a hardcoded destroyed- or new-cluster literal -- a recreated EKS cluster gets a different issuer, and this lookup must follow it automatically.
+  # OIDC condition-map key follows the live-discovered cluster issuer -- never a hardcoded literal, so a recreated cluster is picked up automatically.
   goldengate_secrets_trust_subjects = local.goldengate_secrets_trust_policy.Statement[0].Condition.StringLike[
     "${local.gg_env_oidc_hostpath}:sub"
   ]
@@ -184,7 +184,7 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: the deployment ID (folder name) must end in a 3-digit pipeline correlation suffix (-NNN)."
     }
     precondition {
-      # Pipeline-Aware Descriptor Hierarchy (contract G): the 3-digit suffix of deployment.pipeline must exactly equal the deployment ID's own 3-digit suffix. Short-circuits (via can()) to vacuously true when either input doesn't end in -NNN at all -- the two preconditions above already produce a clear, dedicated error message for that case; substr() is never evaluated on a malformed/too-short string.
+      # deployment.pipeline's 3-digit suffix must equal the deployment id's suffix; short-circuits when either is malformed (handled above).
       condition = (
         !can(regex("-[0-9]{3}$", each.key))
         || !can(regex("-[0-9]{3}$", try(each.value.deployment.pipeline, "")))
@@ -246,27 +246,27 @@ resource "terraform_data" "goldengate_runtime_contract" {
       error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.csi.serviceAccountRoleArn is a forbidden override -- it is a shared platform invariant."
     }
     precondition {
-      # GoldenGate Runtime Desired-State Simplification: lifecycle.state is retired as a second runtime-presence source of truth -- deployment.enabled is now the ONLY authoritative control, so a descriptor still carrying a lifecycle block is rejected outright (mirrors automation/goldengate-deployment-model.py's _reject_lifecycle_presence_control), never silently reinterpreted. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based (contains(keys(...), "lifecycle")), never try(each.value.lifecycle, null) == null -- that null-tolerant form incorrectly treats a PRESENT key with a null value (`lifecycle: null`) as equivalent to the key being absent entirely, since yamldecode() still includes a null-valued key in the decoded object's own keys(). The contract is that the key must not be present at all, present-with-null included.
+      # lifecycle.state is retired; deployment.enabled is the sole presence control. Key-presence based -- `lifecycle: null` is still rejected.
       condition     = !try(contains(keys(each.value), "lifecycle"), false)
       error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: lifecycle.state is no longer supported for runtime presence; use deployment.enabled only."
     }
     precondition {
-      # GoldenGate Runtime Presence Contract Finalization: a legacy descriptor-root `enabled:` key (outside deployment.enabled) is a second, potentially contradictory runtime-presence signal -- rejected outright here too, mirroring automation/goldengate-deployment-model.py's _reject_root_level_enabled. Never fires for nested `enabled` fields belonging to other components (ingress.enabled, persistence.enabled, replication.enabled, etc.) since those are different mapping keys entirely. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based, so `enabled: null` at the descriptor root is rejected exactly like `enabled: true`/`enabled: false` -- see the lifecycle precondition above for why a null-tolerant try(...) == null form is wrong here.
+      # A root-level `enabled:` key (outside deployment.enabled) is rejected -- never fires for nested enabled fields like ingress.enabled.
       condition     = !try(contains(keys(each.value), "enabled"), false)
       error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: root-level enabled is no longer supported; use deployment.enabled only."
     }
     precondition {
-      # GoldenGate Runtime Presence Contract Finalization: runtime.enabled was a second, chart-level runtime-presence switch that could silently contradict deployment.enabled -- it is no longer part of the schema at all and is rejected outright here too, mirroring automation/goldengate-deployment-model.py's _reject_runtime_enabled_presence_control. Nested feature flags such as runtime.csi.enabled are untouched -- only runtime's own `enabled` key is prohibited. GoldenGate Runtime Presence Contract -- Final Safety Correction: key-presence based, so `runtime.enabled: null` is rejected exactly like a literal true/false value -- see the lifecycle precondition above for why a null-tolerant try(...) == null form is wrong here.
+      # runtime.enabled (a second presence switch) is rejected; nested flags like runtime.csi.enabled are untouched.
       condition     = !try(contains(keys(each.value.runtime), "enabled"), false)
       error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: runtime.enabled is no longer supported as a runtime presence control; use deployment.enabled only."
     }
     precondition {
-      # Automated Replication Implementation Removal (Task 4): mirrors automation/goldengate-deployment-model.py's _reject_replication_key_presence() -- rejects the mere PRESENCE of a top-level `replication` key in ANY shape (null, {}, enabled:false, enabled:true), never merely a disallowed value inside it. Key-presence based, exactly like the lifecycle/root-enabled/runtime-enabled tombstone preconditions above -- a present `replication: null` key must still be rejected. GoldenGate database connections, credentials, Extract, trails, Distribution Path, and Replicat are configured manually by an operator/DBA through the GoldenGate UI after deployment; there is deliberately no replacement replication-shaped field, and this precondition never parses nested schema -- only presence.
+      # A top-level `replication` key of any shape is rejected -- replication is configured manually through the GoldenGate UI.
       condition     = !local.goldengate_replication_key_present[each.key]
       error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: unsupported descriptor key: top-level replication automation has been retired; configure database connections and replication processes manually through the GoldenGate UI."
     }
     precondition {
-      # Fresh-EKS Phase A/Phase 9: ingress.hostDomain/alb.groupName/alb.certificateArn are shared environment configuration, injected by the deploy workflow from envs/dev/environment.yaml -- forbid their reintroduction rather than requiring/validating a descriptor-owned copy. ingress.alb.groupOrder remains deployment-specific and stays required/validated below.
+      # ingress.hostDomain/alb fields are shared environment config, injected by the workflow -- forbidden in descriptors. groupOrder stays required.
       condition     = try(each.value.ingress.hostDomain, null) == null
       error_message = "envs/${var.environment}/pipelines/.../${each.key}/values.yaml: ingress.hostDomain is a forbidden override -- it is shared environment configuration and must not be set in a runtime descriptor."
     }
@@ -363,7 +363,7 @@ resource "terraform_data" "goldengate_cross_pipeline_contract" {
       error_message = "Two or more enabled GoldenGate deployments share the same ALB group order."
     }
     precondition {
-      # Permanent, fresh-cluster architecture: the runtime trust subject must be EXACTLY the one canonical gg-runtime-sa identity -- no wildcard, no per-engine subject, no migration-compatibility entry. try() guards the [0] index: Terraform's && does not short-circuit evaluation errors, so an empty subjects list must not crash `terraform plan` with "Invalid index" -- it must fail this precondition instead.
+      # Trust subject must be exactly the canonical gg-runtime-sa identity -- no wildcard, no per-engine entry. try() guards against an empty-list index crash.
       condition = (
         length(local.goldengate_secrets_trust_subjects) == 1
         && try(local.goldengate_secrets_trust_subjects[0], "") == local.goldengate_canonical_runtime_trust_subject
@@ -413,7 +413,7 @@ check "goldengate_at_most_one_target_per_pipeline" {
   }
 }
 
-# Fresh-EKS Phase A/Phase 9: the full repository is always derived as the canonical environment configuration's ECR registry + repositoryName (never descriptor-asserted), so it is definitionally inside the approved private ECR account/region -- this diagnostic now proves every enabled deployment supplies the one thing it DOES own, a non-empty repositoryName (the plan-blocking grammar/safety check itself lives in the goldengate_runtime_contract precondition above).
+# The full repository is always derived from ECR registry + repositoryName -- this just checks every enabled deployment supplies a non-empty repositoryName.
 check "goldengate_image_repository_name_present" {
   assert {
     condition = alltrue([

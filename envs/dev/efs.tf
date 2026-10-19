@@ -1,8 +1,8 @@
-# Managed-mode GoldenGate runtime EFS filesystems: one dedicated module instance per managed runtime deployment, keyed by deployment ID, created through the approved corporate Terraform workflow (this file lives in the normal envs/dev root processed by .github/workflows/10-sub-iam-secrets.yaml -> AbuDhabiCommercialBank/adcb-reusable-workflows/aws-terraform-apply.yaml@main) -- one Terraform state does not mean one EFS: each for_each key below is its own dedicated aws_efs_file_system inside the approved module. Existing-mode deployments get no module instance here since their filesystem already exists outside Terraform. Scope boundary: this file owns the EFS filesystem + mount targets only, via the approved ADCB module below -- it does NOT create EFS access points, which remain owned by the EFS CSI driver's dynamic provisioning (helm/goldengate/templates/efs-storageclass.yaml -> StorageClass -> PVC), exactly as today.
+# Managed-mode EFS: one dedicated module instance per managed deployment. Existing-mode deployments have no instance here. Owns the filesystem + mount targets only -- never EFS access points (CSI-provisioned).
 
-# Explicit managed-EFS decommission control -- NEVER derived from deployment.enabled (or the retired lifecycle.state). deployment.enabled=false by itself always retains managed EFS (see local.goldengate_managed_efs_deployments's own comment); an ID may be added here ONLY after its workload/PVC/access-point cleanup has been independently verified. Removing an ID later makes its managed EFS desired again, so Terraform recreates it in the current environment without reconstructing the runtime descriptor. GoldenGate Runtime Desired-State Simplification: this hold is an intentionally SEPARATE authorization from runtime desired presence -- deployment.enabled=true (activating runtime compute) never by itself clears this hold or authorizes managed-EFS creation for an ID listed here; only an explicit, independently-verified edit to this list does.
+# Explicit managed-EFS decommission list -- never derived from deployment.enabled. Add an id only after verified cleanup; this hold is a separate authorization from runtime desired presence.
 locals {
-  # GoldenGate Runtime Presence Contract Finalization: gg-postgresql-repltest-01 and gg-mssql-repltest-01 were held here while their runtimes were intentionally frozen -- that freeze has ended, both are now genuine deployment.enabled=true deployment intents, and this explicit, independently-verified edit removes exactly those two false decommission authorizations (per this file's own header comment: only an explicit edit here clears a hold, never deployment.enabled by itself). Steady state is an empty set unless a genuine, separately-authorized EFS decommission target exists.
+  # Empty unless a verified EFS decommission target exists.
   goldengate_managed_efs_decommission_ids = toset([])
 
   goldengate_managed_efs_desired_deployments = {
@@ -11,7 +11,7 @@ locals {
   }
 }
 
-# Gated on desired (post-decommission) managed EFS deployments, NOT the canonical inventory: the canonical map deliberately keeps a decommissioned deployment's identity even after its EFS is destroyed (see the canonical map's own comment), but the shared EFS SG itself is owned and lifecycled by the separate aws-cloud-factory-infra repo -- once every desired EFS module instance that needed it is gone, that repo is free to delete the SG, and this data lookup must stop resolving it or a later plan/apply here would fail trying to read an intentionally deleted security group. This file never creates, deletes, or otherwise manages the SG resource itself -- read-only lookup only.
+# Gated on desired (post-decommission) deployments. The shared EFS security group is infra-owned -- read-only lookup, never managed here.
 data "aws_security_group" "goldengate_efs_shared" {
   count = length(local.goldengate_managed_efs_desired_deployments) > 0 ? 1 : 0
 
@@ -21,7 +21,7 @@ data "aws_security_group" "goldengate_efs_shared" {
   }
 }
 
-# Fail-closed guard for the decommission set above: an ID that isn't a real managed-EFS deployment is very likely a typo about to silently no-op instead of decommissioning the intended filesystem. GoldenGate Runtime Desired-State Simplification: the previous consistency precondition requiring each decommissioned ID's descriptor to independently declare itself inactive (lifecycle.state=absent) is retired along with that field -- deployment.enabled is now the sole runtime-presence control and is deliberately NOT substituted here, since this list is (per its own header comment) an explicit, out-of-band storage-destruction authorization, never derived from -- or coupled to -- any single descriptor field. A deployment.enabled=true runtime (desired compute presence) can legitimately still have its managed-EFS creation held back by this list; that is exactly the "runtime desired presence" vs "persistent storage destruction authorization" separation this task requires.
+# Guards against a typo silently no-opping a decommission. deployment.enabled never substitutes for this explicit storage-destruction authorization.
 resource "terraform_data" "goldengate_managed_efs_decommission_contract" {
   input = local.goldengate_managed_efs_decommission_ids
 
@@ -31,14 +31,14 @@ resource "terraform_data" "goldengate_managed_efs_decommission_contract" {
       error_message = "envs/dev/efs.tf: goldengate_managed_efs_decommission_ids contains a deployment ID that is not a current managed-EFS deployment -- refusing to silently no-op an intended EFS decommission."
     }
     precondition {
-      # Automated Replication Implementation Removal (Task 4), EFS Decommission Safety Strengthening: the prior precondition here read replication.enabled from Git to decide whether a decommission ID was safe -- that signal no longer exists (the declarative replication schema is retired; GoldenGate database connections, Extract, trails, Distribution Path, and Replicat are now configured manually by an operator/DBA through the GoldenGate UI and are never represented in Git). Deleting that check outright without a replacement would make managed-EFS decommission STRICTLY LESS SAFE than before, since Git can no longer prove replication is quiescent for a candidate ID. This is a STRONGER fail-closed rule, not a like-for-like replacement: goldengate_managed_efs_decommission_ids must remain the empty set while manual GoldenGate process/replication state is opaque to Git and unverifiable from this repository -- there is deliberately no way to satisfy this precondition with a non-empty decommission list today. A future, separately-approved teardown safety mechanism (out of scope for this task) would need to establish an independent, verifiable signal that a candidate deployment's manual GoldenGate state has been safely quiesced/decommissioned by an operator before any ID may be added here again. This does not affect current steady state: the decommission set is already the empty set (see the locals block above), so this precondition passes today exactly as before -- it only forecloses ever adding an ID to it under the old (now-nonexistent) replication.enabled=false justification.
+      # Decommission list must stay empty -- manual GoldenGate/replication state is opaque to Git and can't prove a decommission is safe.
       condition     = length(local.goldengate_managed_efs_decommission_ids) == 0
       error_message = "envs/dev/efs.tf: goldengate_managed_efs_decommission_ids must be empty -- manual GoldenGate replication/process state is opaque to Git and cannot be used to prove a managed-EFS decommission is safe. Adding an ID here requires a future, separately-approved teardown safety mechanism that this task does not implement."
     }
   }
 }
 
-# Managed EFS Identity Migration Correction: a `moved` block migrates the Terraform STATE ADDRESS -- it is a SEPARATE, complementary mechanism from LEGACY_MANAGED_EFS_CREATION_TOKENS above (which only keeps the resource's own immutable creation_token argument unchanged once its state address already points at the right instance). Terraform does NOT correlate two different for_each keys as "the same resource" merely because their resource arguments (including creation_token) happen to be equal -- for_each is address-identity-based, not argument-based, so without an explicit moved block, changing module.goldengate_runtime_efs["gg-postgresql-repltest-01"] to module.goldengate_runtime_efs["gg-postgresql-repltest-001"] is, from Terraform's own state-address perspective, one module instance disappearing and an entirely unrelated one appearing -- Terraform would plan to destroy the OLD instance's aws_efs_file_system (and everything the approved module creates under it) and create a NEW one, even though creation_token is identical on both sides. This exact bounded set of four moved blocks is the ONLY thing that tells Terraform "these two addresses are the same underlying resource, carry its existing state across" -- LEGACY_MANAGED_EFS_CREATION_TOKENS above is a completely independent, necessary-but-not-sufficient safeguard for what state ends up being applied to that (now correctly addressed) resource once the address migration is in effect. Never remove one without the other; never add a future moved block here for a genuinely new runtime.
+# moved blocks preserve Terraform state identity across the four id renames -- for_each does NOT correlate addresses by matching creation_token, so without this Terraform would destroy/recreate the EFS. Equal creation_token is necessary but not sufficient; complementary to LEGACY_MANAGED_EFS_CREATION_TOKENS. Never remove one without the other, never add a new one for a genuinely new runtime.
 moved {
   from = module.goldengate_runtime_efs["gg-postgresql-repltest-01"]
   to   = module.goldengate_runtime_efs["gg-postgresql-repltest-001"]
@@ -59,7 +59,7 @@ moved {
   to   = module.goldengate_runtime_efs["gg-postgresql-repltest-002"]
 }
 
-# One approved-module instance per managed-mode runtime deployment EXCLUDING the explicit decommission set above, keyed by deployment ID -- module.goldengate_runtime_efs["gg-a"] and module.goldengate_runtime_efs["gg-b"] are two dedicated filesystems even though both live in this one Terraform state. `name` is the deterministic creation token; the approved module's v1.0.0 source has been manually verified to set `creation_token = var.name`, so this is an exact, verified contract, not an assumption. THROUGHPUT CONTRACT WARNING: v1.0.0 does NOT pass throughput_mode straight through to the AWS API -- its verified resource code is `throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")`, so the module INPUT "enhanced" is what produces the AWS EFS API value "elastic" (any other input, including the raw AWS value "elastic" itself, falls through to "bursting"); this exact input/output pair is a verified module-source contract, not a historical AWS filesystem observation. Do NOT replace "enhanced" below with the raw AWS value "elastic" without re-reading the module's actual resource code first -- v1.0.0 also has no provisioned-throughput branch, so "provisioned" is not a valid input either.
+# One module instance per desired managed deployment; `name` is the deterministic creation token. v1.0.0's verified resource code: `throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")` -- do not pass "elastic"/"provisioned" directly.
 module "goldengate_runtime_efs" {
   for_each = local.goldengate_managed_efs_desired_deployments
   source   = "git::https://github.com/AbuDhabiCommercialBank/aws-tf-module-efs?ref=v1.0.0"
@@ -77,7 +77,7 @@ module "goldengate_runtime_efs" {
   business_unit        = "TechnologyPlatform"
   cost_center          = "219"
 
-  # Deterministic, non-secret ownership tags merged into the EFS resource via the approved module's verified var.custom_tags input -- GoldenGateDeploymentId is the sole mechanism the read-only managed_efs_inventory_guard uses to map one AWS EFS filesystem back to exactly one runtime deployment; never credentials, secret ARNs, or database details.
+  # GoldenGateDeploymentId is how managed_efs_inventory_guard maps an EFS filesystem back to its deployment -- never secrets here.
   custom_tags = {
     ManagedBy              = "goldengate-eks-app"
     GoldenGateDeploymentId = each.key

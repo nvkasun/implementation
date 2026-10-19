@@ -2701,7 +2701,7 @@ class ApplicationSetNamingDriftTests(unittest.TestCase):
 
 
 class ApplicationSetOwnershipDriftTests(unittest.TestCase):
-    """Phase 5 Runtime Application Self-Healing: proves the ApplicationSet/Application ownership-safety invariants deliberately mirrored between runtime_state.py (pre-reconciliation preflight) and runtime_acceptance.py (post-reconciliation strict acceptance) cannot silently diverge -- by calling both real functions directly against the same fabricated fixtures and comparing their actual return values, never by comparing source text. Covers (A) _check_child_owner_reference, byte-for-byte identical in both files, and (B) the overlapping ApplicationSet ownership-shape assertions inside _check_applicationset_ownership (runtime_state.py) / _check_applicationset (runtime_acceptance.py, patched only at its get_json() boundary so it receives the identical fabricated object). Deliberately never exercises Sync/Health status -- those are acceptance-only and must stay that way; the pre-existing recoverable-OWNED/MIGRATION_CANDIDATE/BROKEN regression tests in test_runtime_state.py and test_runtime_acceptance.py already prove that divergence is preserved and are untouched here."""
+    """Verify mirrored Phase 5 ownership checks remain consistent."""
 
     APPSET_NAME = "goldengate-dev-oracle-payments-01-appset"
     APP_NAME = "goldengate-dev-oracle-payments-01"
@@ -2719,7 +2719,7 @@ class ApplicationSetOwnershipDriftTests(unittest.TestCase):
         cls.runtime_acceptance = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.runtime_acceptance)
 
-    # --- A: child ownerReference parity (both functions take identical already-fetched primitives, no I/O) ---
+    # Child ownerReference parity.
 
     def _valid_owner_ref(self, **overrides):
         ref = {"apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet", "name": self.APPSET_NAME, "uid": self.APPSET_UID, "controller": True}
@@ -2783,7 +2783,7 @@ class ApplicationSetOwnershipDriftTests(unittest.TestCase):
         self.assertEqual(from_state, [])
         self.assertEqual(from_state, from_acceptance)
 
-    # --- B: ApplicationSet ownership-shape parity (runtime_acceptance patched only at its get_json() boundary) ---
+    # ApplicationSet ownership parity.
 
     def _valid_appset_obj(self, **label_overrides):
         labels = {"goldengate.adcb/environment": self.ENVIRONMENT, "goldengate.adcb/deployment-id": self.DEPLOYMENT_ID}
