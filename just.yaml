@@ -1,30 +1,11 @@
-#!/usr/bin/env bash
-set -u
+Hi Uday, good morning!
 
-echo "===== NODES ====="
-kubectl get nodes \
-  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,PODS:.status.allocatable.pods'
+Just wanted to kindly follow up on my contract renewal status. May I check whether the renewal confirmation has already been communicated to my vendor?
 
-echo
-echo "===== AWS SECRETS PROVIDER ====="
-kubectl get daemonset secrets-store-csi-driver-provider-aws \
-  -n kube-system \
-  -o custom-columns='NAME:.metadata.name,DESIRED:.status.desiredNumberScheduled,CURRENT:.status.currentNumberScheduled,READY:.status.numberReady,AVAILABLE:.status.numberAvailable'
+I understand that some of my colleagues have received their renewal offer letters from their respective vendors over the past few days. However, when I checked with my vendor, they mentioned that they haven't received any communication from ADCB regarding my renewal yet.
 
-kubectl get pods -n kube-system -o wide \
-  | grep 'secrets-store-csi-driver-provider-aws'
+For the previous one-month extension, I noticed that the contract renewal team had updated the request to extend my contract until 31st October.
 
-echo
-echo "===== GOLDENGATE RUNTIMES ====="
-kubectl get pods -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,NODE:.spec.nodeName'
+Since we're approaching the end of October, could you please help me check the current status of my contract renewal and whether any further action is required?
 
-echo
-echo "===== MONITOR ====="
-kubectl get pods -n goldengate-monitoring \
-  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,NODE:.spec.nodeName'
-
-echo
-echo "===== ARGO APPLICATIONS ====="
-kubectl get applications -n argocd \
-  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
+Really appreciate your support on this, Uday. Thank you!
