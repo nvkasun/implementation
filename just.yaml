@@ -1,11 +1,52 @@
-Hi Uday, good morning!
+#!/usr/bin/env bash
+set -u
 
-Just wanted to kindly follow up on my contract renewal status. May I check whether the renewal confirmation has already been communicated to my vendor?
+echo "===== EKS NODES ====="
+kubectl get nodes \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
 
-I understand that some of my colleagues have received their renewal offer letters from their respective vendors over the past few days. However, when I checked with my vendor, they mentioned that they haven't received any communication from ADCB regarding my renewal yet.
+echo
+echo "===== AWS SECRETS PROVIDER ====="
+kubectl get daemonset secrets-store-csi-driver-provider-aws \
+  -n kube-system \
+  -o custom-columns='DESIRED:.status.desiredNumberScheduled,CURRENT:.status.currentNumberScheduled,READY:.status.numberReady,AVAILABLE:.status.numberAvailable'
 
-For the previous one-month extension, I noticed that the contract renewal team had updated the request to extend my contract until 31st October.
+echo
+echo "===== GOLDENGATE STATEFULSETS ====="
+kubectl get statefulset -n goldengate-dev \
+  gg-mssql-repltest-001 \
+  gg-postgresql-repltest-001 \
+  gg-oracle-repltest-002 \
+  gg-postgresql-repltest-002 \
+  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas'
 
-Since we're approaching the end of October, could you please help me check the current status of my contract renewal and whether any further action is required?
+echo
+echo "===== GOLDENGATE PODS ====="
+kubectl get pods -n goldengate-dev \
+  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,NODE:.spec.nodeName' \
+  | grep -E 'NAME|gg-(mssql|oracle|postgresql)-repltest'
 
-Really appreciate your support on this, Uday. Thank you!
+echo
+echo "===== PERSISTENT STORAGE ====="
+kubectl get pvc -n goldengate-dev \
+  -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,CAPACITY:.status.capacity.storage'
+
+echo
+echo "===== MONITOR ====="
+kubectl get deployment gg-monitor -n goldengate-monitoring \
+  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,AVAILABLE:.status.availableReplicas'
+
+kubectl get pods -n goldengate-monitoring \
+  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase'
+
+echo
+echo "===== ARGO APPLICATIONS ====="
+kubectl get applications -n argocd \
+  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' \
+  | grep -E 'NAME|goldengate'
+
+echo
+echo "===== RUNTIME APPLICATIONSETS ====="
+kubectl get applicationsets -n argocd \
+  -o custom-columns='NAME:.metadata.name' \
+  | grep -E 'NAME|goldengate-dev-.*-appset'
