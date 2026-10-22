@@ -1,52 +1,61 @@
-#!/usr/bin/env bash
-set -u
-
-echo "===== EKS NODES ====="
-kubectl get nodes \
-  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
-
-echo
-echo "===== AWS SECRETS PROVIDER ====="
-kubectl get daemonset secrets-store-csi-driver-provider-aws \
-  -n kube-system \
-  -o custom-columns='DESIRED:.status.desiredNumberScheduled,CURRENT:.status.currentNumberScheduled,READY:.status.numberReady,AVAILABLE:.status.numberAvailable'
-
-echo
-echo "===== GOLDENGATE STATEFULSETS ====="
-kubectl get statefulset -n goldengate-dev \
-  gg-mssql-repltest-001 \
-  gg-postgresql-repltest-001 \
-  gg-oracle-repltest-002 \
-  gg-postgresql-repltest-002 \
-  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas'
-
-echo
-echo "===== GOLDENGATE PODS ====="
-kubectl get pods -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,NODE:.spec.nodeName' \
-  | grep -E 'NAME|gg-(mssql|oracle|postgresql)-repltest'
-
-echo
-echo "===== PERSISTENT STORAGE ====="
-kubectl get pvc -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,CAPACITY:.status.capacity.storage'
-
-echo
-echo "===== MONITOR ====="
-kubectl get deployment gg-monitor -n goldengate-monitoring \
-  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,AVAILABLE:.status.availableReplicas'
-
-kubectl get pods -n goldengate-monitoring \
-  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase'
-
-echo
-echo "===== ARGO APPLICATIONS ====="
-kubectl get applications -n argocd \
-  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' \
-  | grep -E 'NAME|goldengate'
-
-echo
-echo "===== RUNTIME APPLICATIONSETS ====="
-kubectl get applicationsets -n argocd \
-  -o custom-columns='NAME:.metadata.name' \
-  | grep -E 'NAME|goldengate-dev-.*-appset'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GoldenGateMonitorEcrAuthorization",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "GoldenGateMonitorEcrBuildAndPublish",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:DescribeRepositories",
+        "ecr:DescribeImages",
+        "ecr:GetRepositoryPolicy",
+        "ecr:SetRepositoryPolicy",
+        "ecr:CreateRepository",
+        "ecr:TagResource",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage"
+      ],
+      "Resource": [
+        "arn:aws:ecr:eu-west-1:229410149234:repository/goldengate-monitor",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-monitor",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/argocd",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-platform",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate"
+      ]
+    },
+    {
+      "Sid": "GoldenGateArtifactRead",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:DescribeRepositories",
+        "ecr:DescribeImages",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
+      "Resource": [
+        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-fluent-bit",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-cloudwatch-agent-operator",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-cloudwatch-agent",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-kube-state-metrics",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-node-exporter",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/ogg-oracle",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/ogg-postgresql",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/ogg-sqlserver"
+      ]
+    }
+  ]
+}
