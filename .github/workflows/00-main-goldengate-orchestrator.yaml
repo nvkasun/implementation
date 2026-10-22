@@ -35,7 +35,7 @@ on:
           reusable workflow. Leave false for normal execution.
         required: false
         type: boolean
-        default: false
+        default: true
 
       terraform_governance_override_reason:
         description: >
@@ -43,7 +43,7 @@ on:
           enabled.
         required: false
         type: string
-        default: ""
+        default: "Cloud Factory POC work for the Goldengate on EKS Deploymnet"
 
   push:
     branches:
