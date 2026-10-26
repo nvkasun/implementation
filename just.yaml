@@ -1,72 +1,45 @@
 #!/usr/bin/env bash
 set -u
 
-ARGO_NS="argocd"
-GG_NS="goldengate-dev"
-
-LATEST_JOB="$(
-  kubectl get jobs -n "$ARGO_NS" \
-    -l app.kubernetes.io/name=argocd-ecr-token-sync \
-    --sort-by=.metadata.creationTimestamp \
-    -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null
-)"
-
-TOKEN_POD=""
-if [ -n "$LATEST_JOB" ]; then
-  TOKEN_POD="$(
-    kubectl get pods -n "$ARGO_NS" \
-      -l job-name="$LATEST_JOB" \
-      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
-  )"
-fi
-
-echo "===== NODE STATUS ====="
-kubectl get nodes \
-  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,ALLOCATABLE-PODS:.status.allocatable.pods'
+echo "===== GOLDENGATE STATEFULSETS ====="
+kubectl get statefulset -n goldengate-dev \
+  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas'
 
 echo
-echo "===== POD COUNT PER NODE ====="
-for NODE in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
-  COUNT=$(kubectl get pods -A \
-    --field-selector spec.nodeName="$NODE" \
-    --no-headers 2>/dev/null | wc -l)
-  echo "$NODE | pods=$COUNT"
+echo "===== GOLDENGATE PODS ====="
+kubectl get pods -n goldengate-dev \
+  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,NODE:.spec.nodeName' \
+  | grep -E 'NAME|gg-(oracle|postgresql|mssql)-repltest'
+
+echo
+echo "===== PERSISTENT STORAGE ====="
+kubectl get pvc -n goldengate-dev \
+  -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,CAPACITY:.status.capacity.storage'
+
+echo
+echo "===== ARGO APPLICATIONS ====="
+kubectl get applications -n argocd \
+  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' \
+  | grep -E 'NAME|goldengate'
+
+echo
+echo "===== MONITOR ====="
+kubectl get deployment gg-monitor -n goldengate-monitoring \
+  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,AVAILABLE:.status.availableReplicas'
+
+echo
+echo "===== U02 PERMISSIONS ====="
+for POD in \
+  gg-postgresql-repltest-001-0 \
+  gg-mssql-repltest-001-0 \
+  gg-oracle-repltest-002-0 \
+  gg-postgresql-repltest-002-0
+do
+  echo "--- $POD ---"
+  kubectl exec -n goldengate-dev "$POD" -- \
+    stat -c '%a %U:%G %n' \
+      /u02 \
+      /u02/oggf \
+      /u02/oggf/certificate \
+    2>/dev/null || echo "CHECK FAILED"
 done
-
-echo
-echo "===== PENDING PODS ====="
-kubectl get pods -A \
-  --field-selector=status.phase=Pending \
-  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' \
-  2>/dev/null
-
-echo
-echo "===== TOKEN SYNC JOB ====="
-echo "JOB=${LATEST_JOB:-NONE}"
-echo "POD=${TOKEN_POD:-NONE}"
-
-if [ -n "$TOKEN_POD" ]; then
-  kubectl describe pod "$TOKEN_POD" -n "$ARGO_NS" 2>/dev/null \
-    | sed -n '/Events:/,$p'
-fi
-
-echo
-echo "===== GOLDENGATE PENDING EVENT ====="
-kubectl describe pod gg-mssql-repltest-001-0 -n "$GG_NS" 2>/dev/null \
-  | sed -n '/Events:/,$p'
-
-echo
-echo "===== AWS SECRETS PROVIDER ====="
-kubectl get daemonset secrets-store-csi-driver-provider-aws \
-  -n kube-system \
-  -o custom-columns='DESIRED:.status.desiredNumberScheduled,CURRENT:.status.currentNumberScheduled,READY:.status.numberReady,AVAILABLE:.status.numberAvailable' \
-  2>/dev/null
-
-echo
-echo "===== RECENT SCHEDULING WARNINGS ====="
-kubectl get events -A \
-  --field-selector type=Warning \
-  --sort-by=.lastTimestamp \
-  2>/dev/null \
-  | grep -Ei 'FailedScheduling|Too many pods|Insufficient|NodeAffinity|taint|FailedMount' \
-  | tail -n 30
