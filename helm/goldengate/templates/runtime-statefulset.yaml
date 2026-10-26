@@ -36,6 +36,10 @@ spec:
 {{- end }}
 
 {{- if .Values.runtime.initPermissions.enabled }}
+{{- $initPermissionsMode := .Values.runtime.initPermissions.mode | default "0770" | toString }}
+{{- if not (regexMatch "^07[0-7]0$" $initPermissionsMode) }}
+{{- fail "runtime.initPermissions.mode must be a quoted octal string of the form 07X0 (no permissions for others)." }}
+{{- end }}
       initContainers:
         - name: prepare-u02-permissions
           image: "{{ required "runtime.image.repository is required when deploymentModel=singleRuntime" .Values.runtime.image.repository }}:{{ required "runtime.image.tag is required when deploymentModel=singleRuntime" .Values.runtime.image.tag }}"
@@ -46,16 +50,19 @@ spec:
             - |
               set -e
 
-              echo "Preparing writable GoldenGate runtime directories..."
+              echo "Preparing GoldenGate runtime directories..."
 
               mkdir -p /u02/oggf
-              rm -rf /u02/oggf/certificate
               mkdir -p /u02/oggf/certificate
               mkdir -p /u03
 
-              echo "Applying temporary test permissions..."
-              chown -R 0:0 /u02 /u03 || true
-              chmod -R {{ .Values.runtime.initPermissions.mode | default "0777" }} /u02 /u03
+              # Non-recursive: persisted GoldenGate state below these directories is never re-owned or re-moded.
+              MODE={{ $initPermissionsMode | quote }}
+
+              chmod "$MODE" /u02
+              chmod "$MODE" /u02/oggf
+              chmod "$MODE" /u02/oggf/certificate
+              chmod "$MODE" /u03
 
               echo "Testing write access..."
               touch /u02/oggf/certificate/write-test.txt

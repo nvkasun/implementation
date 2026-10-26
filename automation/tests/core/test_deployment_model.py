@@ -1490,7 +1490,7 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
             runtime_overrides={
                 "replicas": 1,
                 "service": {"type": "ClusterIP", "ports": {"https": 8443, "dist": 9013, "receiver": None, "metrics": 9015}},
-                "initPermissions": {"enabled": True, "mode": "0777"},
+                "initPermissions": {"enabled": True, "mode": "0770"},
             },
             ingress_overrides={"className": "alb"},
         )
@@ -1500,6 +1500,7 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
         self.assertIsNone(d["servicePorts"]["receiver"])
         self.assertEqual(d["servicePorts"]["metrics"], 9015)
         self.assertTrue(d["initPermissionsEnabled"])
+        self.assertEqual(d["initPermissionsMode"], "0770")
 
     def test_invalid_replicas_is_rejected(self):
         doc = _minimal_shape_doc(runtime_overrides={"replicas": 0})
@@ -1525,6 +1526,33 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
         active, inactive, invalid = gdm.scan("dev")
         self.assertEqual(len(invalid), 1)
 
+    def test_safe_init_permissions_mode_is_accepted(self):
+        for mode in ("0770", "0750", "0700"):
+            with self.subTest(mode=mode):
+                d = self._describe("gg-shape-001", _minimal_shape_doc(runtime_overrides={"initPermissions": {"enabled": True, "mode": mode}}))
+                self.assertEqual(d["initPermissionsMode"], mode)
+
+    def test_unsafe_or_malformed_init_permissions_mode_is_rejected(self):
+        bad_modes = ("0777", "0775", "0771", "0670", "770", "00770", "0780", " 0770", "0770 ", "0770;id", "$(id)", "${MODE}", "`id`", "0o770", "", 770, 504, 0o770, 7.7, True, None, ["0770"], {"mode": "0770"})
+        for mode in bad_modes:
+            with self.subTest(mode=mode):
+                write_doc(self._tmp.name, "dev", "gg-shape-001", _minimal_shape_doc(runtime_overrides={"initPermissions": {"enabled": True, "mode": mode}}))
+                active, inactive, invalid = gdm.scan("dev")
+                self.assertEqual(len(invalid), 1)
+                self.assertIn("runtime.initPermissions.mode", invalid[0][1])
+                self.assertNotIn(repr(mode), invalid[0][1])
+
+    def test_missing_init_permissions_mode_is_rejected_when_enabled(self):
+        write_doc(self._tmp.name, "dev", "gg-shape-001", _minimal_shape_doc(runtime_overrides={"initPermissions": {"enabled": True}}))
+        active, inactive, invalid = gdm.scan("dev")
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("runtime.initPermissions.mode", invalid[0][1])
+
+    def test_init_permissions_mode_is_not_required_when_disabled(self):
+        d = self._describe("gg-shape-001", _minimal_shape_doc(runtime_overrides={"initPermissions": {"enabled": False}}))
+        self.assertFalse(d["initPermissionsEnabled"])
+        self.assertIsNone(d["initPermissionsMode"])
+
     def test_real_dev_descriptors_expose_the_new_fields(self):
         # Not a scratch fixture -- proves the extension works against the real, live envs/dev descriptors too.
         gdm.REPO_ROOT = self._original_root
@@ -1536,6 +1564,8 @@ class ExtendedRuntimeShapeFieldsTests(ScratchEnvironmentTestCase):
             self.assertGreaterEqual(d["replicas"], 1)
             self.assertIn("https", d["servicePorts"])
             self.assertIsInstance(d["initPermissionsEnabled"], bool)
+            self.assertTrue(d["initPermissionsEnabled"])
+            self.assertEqual(d["initPermissionsMode"], "0770")
             self.assertIsInstance(d["ingressEnabled"], bool)
             self.assertTrue(d["ingressClassName"])
             # Neither real DEV descriptor declares an explicit ingress.host, so both resolve to the default "<deploymentId>.<dnsDomain>" -- derived from the real environment.yaml, never hardcoded.

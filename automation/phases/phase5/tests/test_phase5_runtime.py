@@ -6,12 +6,15 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
+
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TOOL_PATH = REPO_ROOT / "automation" / "phases" / "phase5" / "phase5_runtime.py"
@@ -765,6 +768,85 @@ class RenderedManifestContractTests(unittest.TestCase):
         docs = [_statefulset(namespace="wrong-namespace"), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin")]
         with self.assertRaises(phase5_runtime.Phase5Error):
             phase5_runtime._validate_singleruntime_manifest_contract(docs, VALUES, DEPLOYMENT_ID, TARGET_NAMESPACE, IMAGE_REPOSITORY, IMAGE_TAG, IMAGE_DIGEST)
+
+
+    def test_safe_non_recursive_init_script_passes(self):
+        script = 'mkdir -p /u02/oggf/certificate\nMODE="0770"\nchmod "$MODE" /u02\nrm -f /u02/oggf/certificate/write-test.txt\nrm -f -- "$SERVICE_MANAGER_PID_FILE" # ServiceManager.pid'
+        docs = [_statefulset(init_script=script), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin")]
+        with redirect_stdout(io.StringIO()):
+            phase5_runtime._validate_singleruntime_manifest_contract(docs, VALUES, DEPLOYMENT_ID, TARGET_NAMESPACE, IMAGE_REPOSITORY, IMAGE_TAG, IMAGE_DIGEST)
+
+    def test_recursive_or_destructive_init_script_fails(self):
+        pid_cleanup = '\nrm -f -- "$SERVICE_MANAGER_PID_FILE" # ServiceManager.pid'
+        for bad in ("rm -rf /u02/oggf/certificate", "rm -r /u02/oggf", "rm -fR /u02", "chown -R 0:0 /u02 /u03 || true", "chmod -R 0777 /u02 /u03",
+                    "chmod -v -R 0770 /u02", "chgrp -R 0 /u02", "chmod --recursive 0770 /u02", "find /u02 -exec chmod 0770 {} +",
+                    'echo "Applying temporary test permissions..."'):
+            with self.subTest(bad=bad):
+                docs = [_statefulset(init_script=bad + pid_cleanup), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin")]
+                with self.assertRaises(phase5_runtime.Phase5Error):
+                    with redirect_stdout(io.StringIO()):
+                        phase5_runtime._validate_singleruntime_manifest_contract(docs, VALUES, DEPLOYMENT_ID, TARGET_NAMESPACE, IMAGE_REPOSITORY, IMAGE_TAG, IMAGE_DIGEST)
+
+
+# ==== REAL HELM RENDER: init-container persistent-state safety ====
+
+REAL_DEV_RUNTIME_RETAINED_CLAIMS = {
+    "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml": "gg-postgresql-repltest-01-u02",
+    "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml": "gg-mssql-repltest-01-u02",
+    "envs/dev/pipelines/repltest-ora-to-pg-002/gg-oracle-repltest-002/values.yaml": "gg-oracle-repltest-01-u02",
+    "envs/dev/pipelines/repltest-ora-to-pg-002/gg-postgresql-repltest-002/values.yaml": "gg-postgresql-repltest-02-u02",
+}
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm not available")
+class RealRuntimeInitContainerRenderTests(unittest.TestCase):
+    """Renders the real chart against each real DEV descriptor and checks the init container never mutates /u02 recursively or destructively."""
+
+    def _render(self, values_file, extra_args=()):
+        deployment_id = Path(values_file).parent.name
+        overrides = phase5_runtime._helm_set_overrides(
+            "dev", IMAGE_REPOSITORY, "goldengate-dev.example.internal", "gg-test-alb",
+            "arn:aws:acm:eu-west-1:000000000000:certificate/00000000-0000-0000-0000-000000000000",
+            "dev/goldengate/source/admin", "dev/goldengate/tls", "eu-west-1", "gg-runtime-sa", phase5_runtime.EFS_DRY_RUN_PLACEHOLDER)
+        return subprocess.run(["helm", "template", deployment_id, str(REPO_ROOT / "helm" / "goldengate"), "--namespace", TARGET_NAMESPACE,
+                               "--values", str(REPO_ROOT / values_file), *overrides, *extra_args], capture_output=True, text=True)
+
+    def test_real_descriptors_render_a_safe_non_recursive_init_container(self):
+        for values_file, retained_claim in REAL_DEV_RUNTIME_RETAINED_CLAIMS.items():
+            with self.subTest(values_file=values_file):
+                deployment_id = Path(values_file).parent.name
+                proc = self._render(values_file)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                docs = phase5_runtime._parse_rendered_documents(proc.stdout)
+                values = yaml.safe_load((REPO_ROOT / values_file).read_text())
+                with redirect_stdout(io.StringIO()):
+                    phase5_runtime._validate_singleruntime_manifest_contract(docs, values, deployment_id, TARGET_NAMESPACE, IMAGE_REPOSITORY, values["runtime"]["image"]["tag"], IMAGE_DIGEST)
+
+                pod_spec = next(d for d in docs if d["kind"] == "StatefulSet")["spec"]["template"]["spec"]
+                self.assertEqual(len(pod_spec["containers"]), 1)
+                self.assertEqual([c["name"] for c in pod_spec["initContainers"]], [phase5_runtime.INIT_CONTAINER_NAME])
+                script = phase5_runtime._init_script_text(pod_spec["initContainers"][0])
+                for required in ("mkdir -p /u02/oggf\n", "mkdir -p /u02/oggf/certificate\n", "mkdir -p /u03\n", 'MODE="0770"\n',
+                                 'chmod "$MODE" /u02\n', 'chmod "$MODE" /u02/oggf\n', 'chmod "$MODE" /u02/oggf/certificate\n', 'chmod "$MODE" /u03\n',
+                                 'SERVICE_MANAGER_PID_FILE="/u02/ServiceManager/var/run/ServiceManager.pid"', 'rm -f -- "$SERVICE_MANAGER_PID_FILE"',
+                                 "touch /u02/oggf/certificate/write-test.txt", "rm -f /u02/oggf/certificate/write-test.txt"):
+                    self.assertIn(required, script)
+                for forbidden in ("rm -rf /u02/oggf/certificate", "chown -R", "chmod -R", "Applying temporary test permissions", "0777"):
+                    self.assertNotIn(forbidden, script)
+                self.assertEqual([line for line in script.splitlines() if line.strip().startswith("rm ")],
+                                 ["rm -f /u02/oggf/certificate/write-test.txt", '  rm -f -- "$SERVICE_MANAGER_PID_FILE"'])
+
+                u02 = next(v for v in pod_spec["volumes"] if v["name"] == "u02")
+                self.assertEqual(u02["persistentVolumeClaim"]["claimName"], retained_claim)
+                self.assertEqual([d for d in docs if d["kind"] == "PersistentVolumeClaim"], [])
+
+    def test_chart_rejects_unsafe_init_permissions_mode(self):
+        values_file = next(iter(REAL_DEV_RUNTIME_RETAINED_CLAIMS))
+        for mode in ("0777", "0775", "0770; id", "$(id)", "770"):
+            with self.subTest(mode=mode):
+                proc = self._render(values_file, ("--set-string", f"runtime.initPermissions.mode={mode}"))
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("runtime.initPermissions.mode", proc.stderr)
 
 
 # ==== EFS RENDER TESTS ====

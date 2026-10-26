@@ -46,7 +46,7 @@ runtime:
 
   initPermissions:
     enabled: true
-    mode: "0777"
+    mode: "0770"
 
   service:
     type: ClusterIP

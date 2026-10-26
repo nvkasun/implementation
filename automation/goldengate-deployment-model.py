@@ -58,6 +58,9 @@ _VALID_ROLES = ("source", "target")
 _ECR_REPO_SUFFIX_RE = re.compile(r"^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*\Z")
 _EFS_FILESYSTEM_ID_RE = re.compile(r"^fs-[0-9a-f]+\Z")
 
+# Owner rwx, group any, others none; mirrored by helm/goldengate/templates/runtime-statefulset.yaml.
+_INIT_PERMISSIONS_MODE_RE = re.compile(r"^07[0-7]0\Z")
+
 _VALID_EFS_MODES = ("managed", "existing")
 _EFS_CREATION_TOKEN_MAX_LENGTH = 64
 
@@ -446,9 +449,13 @@ def parse_descriptor(deployment_id, environment, doc, shared=None, pipeline_fold
     if not (isinstance(replicas, int) and not isinstance(replicas, bool) and replicas >= 1):
         raise DescriptorError("invalid deployment metadata: runtime.replicas must be a positive integer")
 
-    init_permissions_enabled = (runtime.get("initPermissions") or {}).get("enabled", False)
+    init_permissions = runtime.get("initPermissions") or {}
+    init_permissions_enabled = init_permissions.get("enabled", False)
     if not _is_literal_bool(init_permissions_enabled):
         raise DescriptorError("invalid deployment metadata: runtime.initPermissions.enabled must be a literal Boolean")
+    init_permissions_mode = init_permissions.get("mode")
+    if init_permissions_enabled and not (isinstance(init_permissions_mode, str) and _INIT_PERMISSIONS_MODE_RE.match(init_permissions_mode)):
+        raise DescriptorError("invalid deployment metadata: runtime.initPermissions.mode must be a quoted octal string of the form 07X0 (no permissions for others) when runtime.initPermissions.enabled=true")
 
     ingress_enabled = ingress.get("enabled", False)
     if not _is_literal_bool(ingress_enabled):
@@ -510,6 +517,7 @@ def parse_descriptor(deployment_id, environment, doc, shared=None, pipeline_fold
         "serviceType": service_type,
         "servicePorts": service_ports,
         "initPermissionsEnabled": init_permissions_enabled,
+        "initPermissionsMode": init_permissions_mode if init_permissions_enabled else None,
         "ingressEnabled": ingress_enabled,
         "ingressClassName": ingress_class_name,
         # The runtime's own resolved Ingress hostname (ingress.host override, or the "<deploymentId>.<dnsDomain>" default) -- distinct from the "ingressHost" key above, which is this document's own legacy name for the SHARED dnsDomain; never renamed/repurposed here to avoid silently changing that unrelated contract.

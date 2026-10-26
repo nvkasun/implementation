@@ -46,7 +46,7 @@ runtime:
 
   initPermissions:
     enabled: true
-    mode: "0777"
+    mode: "0770"
 
   # TARGET-side service contract: Receiver exposed, Distribution Server unused -- mirrors the existing gg-postgresql-payments-01 target convention.
   service:

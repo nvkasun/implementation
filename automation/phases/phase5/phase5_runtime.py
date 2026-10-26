@@ -39,6 +39,15 @@ REPOSITORY_PULL_ACTIONS = [
 INIT_CONTAINER_NAME = "prepare-u02-permissions"
 FORBIDDEN_CONTAINER_SUBSTRINGS = ("goldengate-observer", "utility-sidecar", "fluent-bit", "fluentbit")
 
+# Recursive or destructive persistent-state operations the init container must never perform on /u02.
+FORBIDDEN_INIT_SCRIPT_PATTERNS = (
+    re.compile(r"\brm\s+-[A-Za-z]*[rR]"),
+    re.compile(r"\bch(own|mod|grp)\s+(-[A-Za-z]+\s+)*-[A-Za-z]*R"),
+    re.compile(r"--recursive\b"),
+    re.compile(r"\bfind\b"),
+    re.compile(r"temporary test permissions", re.IGNORECASE),
+)
+
 # Never a real AWS resource -- syntactically valid only so Helm rendering/validation has something to compare against on a Validate (deploy=false) run; never committed, never sent to Argo CD/AWS.
 EFS_DRY_RUN_PLACEHOLDER = "fs-0dead0000000beef0"
 
@@ -1100,6 +1109,10 @@ def _validate_singleruntime_manifest_contract(docs, values, deployment_id, targe
     if 'rm -f -- "$SERVICE_MANAGER_PID_FILE"' not in init_script_text:
         raise Phase5Error(f"the {INIT_CONTAINER_NAME} init container does not contain the expected stale-PID removal command (rm -f -- \"$SERVICE_MANAGER_PID_FILE\").")
     print(f"OK: required {INIT_CONTAINER_NAME} init container and stale ServiceManager.pid cleanup are present.")
+    for pattern in FORBIDDEN_INIT_SCRIPT_PATTERNS:
+        if pattern.search(init_script_text):
+            raise Phase5Error(f"the {INIT_CONTAINER_NAME} init container contains a forbidden recursive or destructive operation (pattern {pattern.pattern!r}).")
+    print(f"OK: {INIT_CONTAINER_NAME} init container performs no recursive or destructive /u02 operation.")
 
     # --- Services: exactly one ClusterIP + one headless, partitioned strictly by clusterIP/type ---
     services = [d for d in docs if d.get("kind") == "Service"]

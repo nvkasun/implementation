@@ -46,7 +46,7 @@ runtime:
 
   initPermissions:
     enabled: true
-    mode: "0777"
+    mode: "0770"
 
   # SOURCE-side service contract: Distribution Server exposed (dist), Receiver unused until this runtime is paired with the gg-mssql-repltest-01 target on the same pipeline.
   service:

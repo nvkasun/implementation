@@ -1076,7 +1076,7 @@ class RuntimeAcceptanceExternalClaimTests(unittest.TestCase):
                 "image": {"repositoryName": "ogg-oracle", "tag": "1.0.0"},
                 "csi": {"enabled": True, "admin": {"enabled": True, "mountPath": ADMIN_MOUNT_PATH}, "certificate": {"enabled": True, "mountPath": CERTIFICATE_MOUNT_PATH}},
                 "storage": {"u02": {"type": "existingClaim", "existingClaim": EXTERNAL_CLAIM_NAME}},
-                "initPermissions": {"enabled": True},
+                "initPermissions": {"enabled": True, "mode": "0770"},
                 "service": {"type": "ClusterIP", "ports": {"https": 8443, "dist": None, "receiver": 9014, "metrics": 9015}},
             },
             "ingress": {"enabled": False},
