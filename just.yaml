@@ -1,75 +1,72 @@
 #!/usr/bin/env bash
 set -u
 
-NS="argocd"
-CJ="argocd-ecr-token-sync"
-
-echo "===== CURRENT TIME ====="
-date -u '+UTC: %Y-%m-%d %H:%M:%S'
-date '+LOCAL: %Y-%m-%d %H:%M:%S %Z'
-
-echo
-echo "===== TOKEN SYNC CRONJOB ====="
-kubectl get cronjob "$CJ" -n "$NS" \
-  -o custom-columns='NAME:.metadata.name,SCHEDULE:.spec.schedule,SUSPEND:.spec.suspend,LAST-SCHEDULE:.status.lastScheduleTime,LAST-SUCCESS:.status.lastSuccessfulTime,ACTIVE:.status.active[*].name'
-
-echo
-echo "===== RECENT TOKEN SYNC JOBS ====="
-kubectl get jobs -n "$NS" \
-  -l app.kubernetes.io/name=argocd-ecr-token-sync \
-  --sort-by=.metadata.creationTimestamp \
-  -o custom-columns='NAME:.metadata.name,START:.status.startTime,COMPLETED:.status.completionTime,SUCCEEDED:.status.succeeded,FAILED:.status.failed' \
-  | tail -n 8
+ARGO_NS="argocd"
+GG_NS="goldengate-dev"
 
 LATEST_JOB="$(
-  kubectl get jobs -n "$NS" \
+  kubectl get jobs -n "$ARGO_NS" \
     -l app.kubernetes.io/name=argocd-ecr-token-sync \
     --sort-by=.metadata.creationTimestamp \
     -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null
 )"
 
-echo
-echo "===== LATEST TOKEN SYNC JOB LOG ====="
+TOKEN_POD=""
 if [ -n "$LATEST_JOB" ]; then
-  echo "JOB=$LATEST_JOB"
-  kubectl logs "job/$LATEST_JOB" -n "$NS" --tail=120 2>&1
-else
-  echo "NO TOKEN SYNC JOB FOUND"
+  TOKEN_POD="$(
+    kubectl get pods -n "$ARGO_NS" \
+      -l job-name="$LATEST_JOB" \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+  )"
 fi
 
+echo "===== NODE STATUS ====="
+kubectl get nodes \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,ALLOCATABLE-PODS:.status.allocatable.pods'
+
 echo
-echo "===== REPOSITORY SECRET METADATA ====="
-for SECRET in \
-  argocd-ecr-goldengate-oci \
-  argocd-ecr-goldengate-monitor-oci \
-  argocd-ecr-goldengate-platform-oci \
-  argocd-ecr-amazon-cloudwatch-observability-oci
-do
-  kubectl get secret "$SECRET" -n "$NS" \
-    -o jsonpath='{.metadata.name}{" | resourceVersion="}{.metadata.resourceVersion}{" | managedTimes="}{range .metadata.managedFields[*]}{.time}{" "}{end}{"\n"}' \
-    2>/dev/null || echo "$SECRET | NOT FOUND"
+echo "===== POD COUNT PER NODE ====="
+for NODE in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+  COUNT=$(kubectl get pods -A \
+    --field-selector spec.nodeName="$NODE" \
+    --no-headers 2>/dev/null | wc -l)
+  echo "$NODE | pods=$COUNT"
 done
 
 echo
-echo "===== REPO SERVER ECR ERRORS - LAST 12H ====="
-kubectl logs deployment/argocd-repo-server -n "$NS" \
-  --since=12h 2>&1 \
-  | grep -Ei '403|forbidden|ecr|manifest|resolve revision|repository' \
-  | tail -n 60 || true
+echo "===== PENDING PODS ====="
+kubectl get pods -A \
+  --field-selector=status.phase=Pending \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' \
+  2>/dev/null
 
 echo
-echo "===== ARGO APPLICATION CONDITIONS ====="
-kubectl get applications -n "$NS" \
-  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,CONDITION:.status.conditions[*].type' \
-  | grep -E 'NAME|goldengate'
+echo "===== TOKEN SYNC JOB ====="
+echo "JOB=${LATEST_JOB:-NONE}"
+echo "POD=${TOKEN_POD:-NONE}"
+
+if [ -n "$TOKEN_POD" ]; then
+  kubectl describe pod "$TOKEN_POD" -n "$ARGO_NS" 2>/dev/null \
+    | sed -n '/Events:/,$p'
+fi
 
 echo
-echo "===== GOLDENGATE POD HEALTH ====="
-kubectl get pods -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase' \
-  | grep -E 'NAME|gg-(oracle|postgresql|mssql)'
+echo "===== GOLDENGATE PENDING EVENT ====="
+kubectl describe pod gg-mssql-repltest-001-0 -n "$GG_NS" 2>/dev/null \
+  | sed -n '/Events:/,$p'
 
 echo
-echo "===== GOLDENGATE SERVICE ENDPOINTS ====="
-kubectl get endpoints -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,ENDPOINTS:.subsets[*].addresses[*].ip'
+echo "===== AWS SECRETS PROVIDER ====="
+kubectl get daemonset secrets-store-csi-driver-provider-aws \
+  -n kube-system \
+  -o custom-columns='DESIRED:.status.desiredNumberScheduled,CURRENT:.status.currentNumberScheduled,READY:.status.numberReady,AVAILABLE:.status.numberAvailable' \
+  2>/dev/null
+
+echo
+echo "===== RECENT SCHEDULING WARNINGS ====="
+kubectl get events -A \
+  --field-selector type=Warning \
+  --sort-by=.lastTimestamp \
+  2>/dev/null \
+  | grep -Ei 'FailedScheduling|Too many pods|Insufficient|NodeAffinity|taint|FailedMount' \
+  | tail -n 30
