@@ -496,6 +496,43 @@ def check_environment_variable_not_exposed_as_secret(filename, doc, findings):
             findings.append(f"{filename}: workflow_call output {output_name!r} must never expose a secret, found value {value!r}")
 
 
+def check_governance_defaults(main_doc, terraform_doc, findings):
+    """Require break-glass inputs to default fail closed."""
+    main_inputs = (((_on_block(main_doc).get("workflow_dispatch") or {}).get("inputs")) or {})
+    terraform_on = _on_block(terraform_doc)
+    contracts = (
+        ("MAIN workflow_dispatch", main_inputs),
+        (
+            f"{CORPORATE_TERRAFORM_WORKFLOW_FILENAME} workflow_dispatch",
+            (((terraform_on.get("workflow_dispatch") or {}).get("inputs")) or {}),
+        ),
+        (
+            f"{CORPORATE_TERRAFORM_WORKFLOW_FILENAME} workflow_call",
+            (((terraform_on.get("workflow_call") or {}).get("inputs")) or {}),
+        ),
+    )
+
+    for label, inputs in contracts:
+        override = inputs.get("terraform_governance_override")
+        reason = inputs.get("terraform_governance_override_reason")
+
+        if not isinstance(override, dict):
+            findings.append(f"{label}: missing terraform_governance_override input")
+        else:
+            if override.get("type") != "boolean":
+                findings.append(f"{label}: terraform_governance_override must be boolean")
+            if override.get("default") is not False:
+                findings.append(f"{label}: terraform_governance_override must default to false")
+
+        if not isinstance(reason, dict):
+            findings.append(f"{label}: missing terraform_governance_override_reason input")
+        else:
+            if reason.get("type") != "string":
+                findings.append(f"{label}: terraform_governance_override_reason must be string")
+            if reason.get("default") != "":
+                findings.append(f"{label}: terraform_governance_override_reason must default to an empty string")
+
+
 def check_corporate_terraform_boundary(main_doc, terraform_doc, findings):
     """Rule 11: the corporate Terraform reusable workflow call remains present in 10-sub-iam-secrets.yaml with its governance-override inputs intact, and MAIN's own call site into 10-sub-iam-secrets.yaml is unchanged by this fix."""
     jobs = _jobs(terraform_doc)
@@ -623,6 +660,7 @@ def run_checks(workflow_dir):
     terraform_path = os.path.join(workflow_dir, CORPORATE_TERRAFORM_WORKFLOW_FILENAME)
     terraform_doc = load_workflow(terraform_path)
     workflows_inspected += 1
+    check_governance_defaults(main_doc, terraform_doc, findings)
     check_corporate_terraform_boundary(main_doc, terraform_doc, findings)
 
     check_ops_workflows_retain_own_protection(workflow_dir, findings)
