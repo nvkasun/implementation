@@ -1,61 +1,75 @@
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "GoldenGateMonitorEcrAuthorization",
-      "Effect": "Allow",
-      "Action": [
-        "ecr:GetAuthorizationToken"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "GoldenGateMonitorEcrBuildAndPublish",
-      "Effect": "Allow",
-      "Action": [
-        "ecr:DescribeRepositories",
-        "ecr:DescribeImages",
-        "ecr:GetRepositoryPolicy",
-        "ecr:SetRepositoryPolicy",
-        "ecr:CreateRepository",
-        "ecr:TagResource",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:BatchGetImage",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:InitiateLayerUpload",
-        "ecr:UploadLayerPart",
-        "ecr:CompleteLayerUpload",
-        "ecr:PutImage"
-      ],
-      "Resource": [
-        "arn:aws:ecr:eu-west-1:229410149234:repository/goldengate-monitor",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-monitor",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/argocd",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-platform",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate"
-      ]
-    },
-    {
-      "Sid": "GoldenGateArtifactRead",
-      "Effect": "Allow",
-      "Action": [
-        "ecr:DescribeRepositories",
-        "ecr:DescribeImages",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:BatchGetImage",
-        "ecr:GetDownloadUrlForLayer"
-      ],
-      "Resource": [
-        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-fluent-bit",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-cloudwatch-agent-operator",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-cloudwatch-agent",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-kube-state-metrics",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-node-exporter",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/ogg-oracle",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/ogg-postgresql",
-        "arn:aws:ecr:eu-west-1:229410149234:repository/ogg-sqlserver"
-      ]
-    }
-  ]
-}
+#!/usr/bin/env bash
+set -u
+
+NS="argocd"
+CJ="argocd-ecr-token-sync"
+
+echo "===== CURRENT TIME ====="
+date -u '+UTC: %Y-%m-%d %H:%M:%S'
+date '+LOCAL: %Y-%m-%d %H:%M:%S %Z'
+
+echo
+echo "===== TOKEN SYNC CRONJOB ====="
+kubectl get cronjob "$CJ" -n "$NS" \
+  -o custom-columns='NAME:.metadata.name,SCHEDULE:.spec.schedule,SUSPEND:.spec.suspend,LAST-SCHEDULE:.status.lastScheduleTime,LAST-SUCCESS:.status.lastSuccessfulTime,ACTIVE:.status.active[*].name'
+
+echo
+echo "===== RECENT TOKEN SYNC JOBS ====="
+kubectl get jobs -n "$NS" \
+  -l app.kubernetes.io/name=argocd-ecr-token-sync \
+  --sort-by=.metadata.creationTimestamp \
+  -o custom-columns='NAME:.metadata.name,START:.status.startTime,COMPLETED:.status.completionTime,SUCCEEDED:.status.succeeded,FAILED:.status.failed' \
+  | tail -n 8
+
+LATEST_JOB="$(
+  kubectl get jobs -n "$NS" \
+    -l app.kubernetes.io/name=argocd-ecr-token-sync \
+    --sort-by=.metadata.creationTimestamp \
+    -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null
+)"
+
+echo
+echo "===== LATEST TOKEN SYNC JOB LOG ====="
+if [ -n "$LATEST_JOB" ]; then
+  echo "JOB=$LATEST_JOB"
+  kubectl logs "job/$LATEST_JOB" -n "$NS" --tail=120 2>&1
+else
+  echo "NO TOKEN SYNC JOB FOUND"
+fi
+
+echo
+echo "===== REPOSITORY SECRET METADATA ====="
+for SECRET in \
+  argocd-ecr-goldengate-oci \
+  argocd-ecr-goldengate-monitor-oci \
+  argocd-ecr-goldengate-platform-oci \
+  argocd-ecr-amazon-cloudwatch-observability-oci
+do
+  kubectl get secret "$SECRET" -n "$NS" \
+    -o jsonpath='{.metadata.name}{" | resourceVersion="}{.metadata.resourceVersion}{" | managedTimes="}{range .metadata.managedFields[*]}{.time}{" "}{end}{"\n"}' \
+    2>/dev/null || echo "$SECRET | NOT FOUND"
+done
+
+echo
+echo "===== REPO SERVER ECR ERRORS - LAST 12H ====="
+kubectl logs deployment/argocd-repo-server -n "$NS" \
+  --since=12h 2>&1 \
+  | grep -Ei '403|forbidden|ecr|manifest|resolve revision|repository' \
+  | tail -n 60 || true
+
+echo
+echo "===== ARGO APPLICATION CONDITIONS ====="
+kubectl get applications -n "$NS" \
+  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,CONDITION:.status.conditions[*].type' \
+  | grep -E 'NAME|goldengate'
+
+echo
+echo "===== GOLDENGATE POD HEALTH ====="
+kubectl get pods -n goldengate-dev \
+  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase' \
+  | grep -E 'NAME|gg-(oracle|postgresql|mssql)'
+
+echo
+echo "===== GOLDENGATE SERVICE ENDPOINTS ====="
+kubectl get endpoints -n goldengate-dev \
+  -o custom-columns='NAME:.metadata.name,ENDPOINTS:.subsets[*].addresses[*].ip'
