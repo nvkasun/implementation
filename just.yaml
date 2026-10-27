@@ -1,54 +1,13 @@
-
-#!/usr/bin/env bash
-set -u
-
-NS="goldengate-dev"
-
-echo "========================================"
-echo " GoldenGate Admin Server Diagnostics"
-echo "========================================"
-
-for APP in \
-  gg-postgresql-repltest-001 \
-  gg-postgresql-repltest-002
-do
-  echo
-  echo "========== $APP =========="
-
-  kubectl exec -n "$NS" "${APP}-0" \
-    -c ogg-postgresql -- sh -c '
-
-    echo "--- Administration Server process ---"
-    ps -ef | grep "[/]u01/ogg/bin/adminsrvr" ||
-      echo "ADMIN SERVER NOT RUNNING"
-
-    echo "--- Service Manager log: recent relevant errors ---"
-    FILE="/u02/ServiceManager/var/log/ServiceManager.log"
-
-    if [ -f "$FILE" ]; then
-      tail -n 250 "$FILE" |
-        grep -Ei "adminsrvr|error|fail|fatal|exit|terminate" |
-        tail -n 20 |
-        cut -c 1-220 || true
-    else
-      echo "Service Manager log unavailable"
-    fi
-
-    echo "--- Administration log file candidates ---"
-    find /u02 -type f \
-      \( -iname "*adminsrvr*.log" \
-      -o -iname "*adminserver*.log" \) \
-      2>/dev/null | head -n 10
-
-    echo "--- Administration Server API ---"
-    curl -sk --max-time 8 \
-      -o /dev/null \
-      -w "HTTP %{http_code}\n" \
-      https://127.0.0.1:8443/services/v2/extracts
-
-  ' 2>&1
-done
+kubectl exec -n goldengate-dev \
+  gg-postgresql-repltest-002-0 \
+  -c ogg-postgresql -- sh -c '
+echo "=== ADMIN SERVER LOG: LAST 50 LINES ==="
+tail -n 50 /u02/Deployment/var/log/adminsrvr.log 2>/dev/null |
+  sed -E "s/(password|token|secret)[=:][^ ,]+/\1=[REDACTED]/Ig" |
+  cut -c 1-200
 
 echo
-echo "=== Diagnostics Complete ==="
-echo "No Kubernetes or GoldenGate changes made."
+echo "=== ADMIN SERVER CONFIG FILES ==="
+find /u02/ServiceManager/var/run -maxdepth 1 \
+  -iname "*adminsrvr*" -printf "%f\n" 2>/dev/null
+'
