@@ -1,13 +1,53 @@
-kubectl exec -n goldengate-dev \
-  gg-postgresql-repltest-002-0 \
+
+#!/usr/bin/env bash
+set -u
+
+NS="goldengate-dev"
+POD="gg-postgresql-repltest-002-0"
+
+echo "=== GOLDENGATE ADMIN STARTUP DIAGNOSTICS ==="
+
+kubectl exec -n "$NS" "$POD" \
   -c ogg-postgresql -- sh -c '
-echo "=== ADMIN SERVER LOG: LAST 50 LINES ==="
-tail -n 50 /u02/Deployment/var/log/adminsrvr.log 2>/dev/null |
-  sed -E "s/(password|token|secret)[=:][^ ,]+/\1=[REDACTED]/Ig" |
-  cut -c 1-200
 
 echo
-echo "=== ADMIN SERVER CONFIG FILES ==="
-find /u02/ServiceManager/var/run -maxdepth 1 \
-  -iname "*adminsrvr*" -printf "%f\n" 2>/dev/null
+echo "1. Current GoldenGate processes"
+ps -ef | grep -E "[S]erviceManager|[a]dminsrvr|[d]istsrvr|[r]ecvsrvr|[p]msrvr"
+
+echo
+echo "2. Administration Server configuration file"
+find /u02/ServiceManager/var/run \
+  -maxdepth 1 -type f \
+  -iname "*adminsrvr*" \
+  -printf "%f %s bytes\n" 2>/dev/null
+
+echo
+echo "3. Administration Server log timestamps"
+stat -c "%y %n" \
+  /u02/Deployment/var/log/adminsrvr.log 2>/dev/null
+
+echo
+echo "4. Recent Service Manager lifecycle messages"
+grep -Ei \
+  "adminsrvr|start|stop|exit|terminate|failed" \
+  /u02/ServiceManager/var/log/ServiceManager.log \
+  2>/dev/null | tail -n 25 | cut -c 1-220
+
+echo
+echo "5. Admin Server REST endpoint"
+curl -sk --max-time 8 \
+  -o /dev/null \
+  -w "HTTP %{http_code}\n" \
+  https://127.0.0.1:8443/services/v2/extracts
+
+echo
+echo "6. Administration Server executable"
+if [ -x /u01/ogg/bin/adminsrvr ]; then
+  echo "Executable exists"
+else
+  echo "Executable missing"
+fi
 '
+
+echo
+echo "=== DIAGNOSTICS COMPLETE ==="
