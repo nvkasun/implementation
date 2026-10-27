@@ -4,46 +4,51 @@ set -u
 
 NS="goldengate-dev"
 
-echo "=== GOLDENGATE HTTP 502 DIAGNOSTICS ==="
+echo "========================================"
+echo " GoldenGate Admin Server Diagnostics"
+echo "========================================"
 
-for APP in gg-postgresql-repltest-001 gg-postgresql-repltest-002; do
+for APP in \
+  gg-postgresql-repltest-001 \
+  gg-postgresql-repltest-002
+do
   echo
   echo "========== $APP =========="
 
-  POD="${APP}-0"
+  kubectl exec -n "$NS" "${APP}-0" \
+    -c ogg-postgresql -- sh -c '
 
-  kubectl exec -n "$NS" "$POD" -c ogg-postgresql -- sh -c '
-    echo "--- GoldenGate and NGINX processes ---"
-    ps -ef 2>/dev/null |
-      grep -Ei "nginx|adminsrvr|ServiceManager" |
-      grep -v grep |
-      head -15
+    echo "--- Administration Server process ---"
+    ps -ef | grep "[/]u01/ogg/bin/adminsrvr" ||
+      echo "ADMIN SERVER NOT RUNNING"
 
-    echo "--- Listening TCP ports ---"
-    if command -v ss >/dev/null 2>&1; then
-      ss -lnt 2>/dev/null |
-        grep -E "8443|900|901|902" |
-        head -20
+    echo "--- Service Manager log: recent relevant errors ---"
+    FILE="/u02/ServiceManager/var/log/ServiceManager.log"
+
+    if [ -f "$FILE" ]; then
+      tail -n 250 "$FILE" |
+        grep -Ei "adminsrvr|error|fail|fatal|exit|terminate" |
+        tail -n 20 |
+        cut -c 1-220 || true
     else
-      echo "ss command unavailable"
+      echo "Service Manager log unavailable"
     fi
 
-    echo "--- HTTPS status codes ---"
-    for path in \
-      / \
-      /services/v2/extracts \
-      /services/v2/replicats
-    do
-      code=$(curl -sk --max-time 8 \
-        -o /dev/null \
-        -w "%{http_code}" \
-        "https://127.0.0.1:8443${path}")
+    echo "--- Administration log file candidates ---"
+    find /u02 -type f \
+      \( -iname "*adminsrvr*.log" \
+      -o -iname "*adminserver*.log" \) \
+      2>/dev/null | head -n 10
 
-      echo "${path}: HTTP ${code}"
-    done
-  ' 2>&1 | head -65
+    echo "--- Administration Server API ---"
+    curl -sk --max-time 8 \
+      -o /dev/null \
+      -w "HTTP %{http_code}\n" \
+      https://127.0.0.1:8443/services/v2/extracts
 
+  ' 2>&1
 done
 
 echo
-echo "=== DIAGNOSTICS COMPLETE ==="
+echo "=== Diagnostics Complete ==="
+echo "No Kubernetes or GoldenGate changes made."
