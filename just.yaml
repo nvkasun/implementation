@@ -1,45 +1,158 @@
 #!/usr/bin/env bash
-set -u
+# ADCB GoldenGate EKS: operator-initiated Argo CD morning reconciliation.
+# Requirements: kubectl, jq, working kubeconfig and RBAC to get/patch Argo CD CRs.
+# Does not delete, prune, force, replace, scale, or terminate application operations.
+set -Eeuo pipefail
 
-echo "===== GOLDENGATE STATEFULSETS ====="
-kubectl get statefulset -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas'
+ARGOCD_NAMESPACE="${ARGOCD_NAMESPACE:-argocd}"
+EXPECTED_CONTEXT="${EXPECTED_CONTEXT:-}"   # strongly recommended; kubectl config current-context must match
+MODE="sync"                            # sync | refresh
+REFRESH_KIND="normal"                  # normal | hard
+WAIT_SECONDS="${WAIT_SECONDS:-300}"
+POLL_SECONDS="${POLL_SECONDS:-10}"
+INCLUDE_ALL_NAMESPACES=false
+DRY_RUN=false
+SYNC_ALL=false
+LOG_DIR="${LOG_DIR:-./argocd-morning-logs}"
 
-echo
-echo "===== GOLDENGATE PODS ====="
-kubectl get pods -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,NODE:.spec.nodeName' \
-  | grep -E 'NAME|gg-(oracle|postgresql|mssql)-repltest'
+usage() {
+  cat <<'USAGE'
+Usage: ./argocd-morning-reconcile.sh [--dry-run] [--refresh-only] [--hard-refresh]
+       [--sync-all] [--all-namespaces] [--namespace N] [--context NAME]
+       [--wait-seconds N] [--poll-seconds N]
 
-echo
-echo "===== PERSISTENT STORAGE ====="
-kubectl get pvc -n goldengate-dev \
-  -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,CAPACITY:.status.capacity.storage'
-
-echo
-echo "===== ARGO APPLICATIONS ====="
-kubectl get applications -n argocd \
-  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' \
-  | grep -E 'NAME|goldengate'
-
-echo
-echo "===== MONITOR ====="
-kubectl get deployment gg-monitor -n goldengate-monitoring \
-  -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,AVAILABLE:.status.availableReplicas'
-
-echo
-echo "===== U02 PERMISSIONS ====="
-for POD in \
-  gg-postgresql-repltest-001-0 \
-  gg-mssql-repltest-001-0 \
-  gg-oracle-repltest-002-0 \
-  gg-postgresql-repltest-002-0
-do
-  echo "--- $POD ---"
-  kubectl exec -n goldengate-dev "$POD" -- \
-    stat -c '%a %U:%G %n' \
-      /u02 \
-      /u02/oggf \
-      /u02/oggf/certificate \
-    2>/dev/null || echo "CHECK FAILED"
+Default: refresh all ApplicationSets and Applications in the Argo CD namespace,
+then sync only applications that are OutOfSync. Wait and report unresolved states.
+No pruning, force, replace, deletion, resource restarts or modification of PVCs.
+--sync-all requests an ordinary sync even for currently Synced applications.
+--hard-refresh invalidates manifest/cache and should be used sparingly.
+--all-namespaces discovers Argo CRs in all namespaces (requires relevant RBAC).
+USAGE
+}
+while (($#)); do
+  case "$1" in
+    --dry-run) DRY_RUN=true;;
+    --refresh-only) MODE=refresh;;
+    --hard-refresh) REFRESH_KIND=hard;;
+    --sync-all) SYNC_ALL=true;;
+    --all-namespaces) INCLUDE_ALL_NAMESPACES=true;;
+    --namespace|--context|--wait-seconds|--poll-seconds)
+      (($# >= 2)) || { echo "Missing value for $1" >&2; exit 2; }
+      case "$1" in
+        --namespace) ARGOCD_NAMESPACE="$2";;
+        --context) EXPECTED_CONTEXT="$2";;
+        --wait-seconds) WAIT_SECONDS="$2";;
+        --poll-seconds) POLL_SECONDS="$2";;
+      esac
+      shift;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2;;
+  esac
+  shift
 done
+for c in kubectl jq date; do command -v "$c" >/dev/null || { echo "Missing $c" >&2; exit 2; }; done
+[[ "$WAIT_SECONDS" =~ ^[0-9]+$ && "$POLL_SECONDS" =~ ^[1-9][0-9]*$ ]] || { echo "Wait/poll durations must be integers" >&2; exit 2; }
+context="$(kubectl config current-context)"
+if [[ -n "$EXPECTED_CONTEXT" && "$context" != "$EXPECTED_CONTEXT" ]]; then
+  echo "Refusing: kubeconfig context '$context' does not match '$EXPECTED_CONTEXT'" >&2; exit 2
+fi
+kubectl get --raw=/readyz >/dev/null || { echo "Kubernetes API unavailable" >&2; exit 2; }
+kubectl get crd applications.argoproj.io applicationsets.argoproj.io >/dev/null || { echo "Argo CD CRDs missing" >&2; exit 2; }
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/reconcile-$(date -u +%Y%m%dT%H%M%SZ).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+printf '=== Argo CD morning reconciliation UTC %s context=%s namespace=%s dry-run=%s ===\n' "$(date -u -Is)" "$context" "$ARGOCD_NAMESPACE" "$DRY_RUN"
+
+args=(-n "$ARGOCD_NAMESPACE")
+$INCLUDE_ALL_NAMESPACES && args=(-A)
+
+get_list() {
+  kubectl get "$1" "${args[@]}" -o json
+}
+
+# Fail closed on RBAC/access errors, rather than silently treating absent data as empty.
+appsets="$(get_list applicationsets.argoproj.io)"
+apps="$(get_list applications.argoproj.io)"
+
+printf 'Found %s ApplicationSets and %s Applications\n' \
+  "$(jq '.items|length' <<<"$appsets")" "$(jq '.items|length' <<<"$apps")"
+
+run() {
+  printf '  +'; printf ' %q' "$@"; printf '\n'
+  if ! $DRY_RUN; then "$@"; fi
+}
+
+# Force a new generator evaluation, including Git generators.
+while IFS=$'\t' read -r ns name; do
+  [[ -n "${name:-}" ]] || continue
+  echo "[ApplicationSet] $ns/$name: request generator refresh"
+  run kubectl annotate -n "$ns" applicationset "$name" \
+    argocd.argoproj.io/application-set-refresh=true --overwrite
+ done < <(jq -r '.items[] | [.metadata.namespace,.metadata.name] | @tsv' <<<"$appsets")
+
+# Allow newly generated Applications to appear after AppSet reconcile.
+if ! $DRY_RUN; then sleep 5; fi
+apps="$(get_list applications.argoproj.io)"
+
+while IFS=$'\t' read -r ns name; do
+  [[ -n "${name:-}" ]] || continue
+  echo "[Application] $ns/$name: request $REFRESH_KIND refresh"
+  run kubectl annotate -n "$ns" application "$name" \
+    "argocd.argoproj.io/refresh=$REFRESH_KIND" --overwrite
+ done < <(jq -r '.items[] | [.metadata.namespace,.metadata.name] | @tsv' <<<"$apps")
+
+if ! $DRY_RUN; then sleep 10; fi
+apps="$(get_list applications.argoproj.io)"
+failures=0
+
+while IFS=$'\t' read -r ns name sync health skip operation deletion; do
+  [[ -n "${name:-}" ]] || continue
+  echo "[Check] $ns/$name sync=$sync health=$health operation=$operation"
+  if [[ "$skip" == true || "$deletion" == true ]]; then
+    echo "  SKIP: skip-reconcile annotation or deletionTimestamp present"
+    ((failures+=1)); continue
+  fi
+  [[ "$MODE" == sync ]] || continue
+  if [[ "$sync" != OutOfSync && "$SYNC_ALL" != true ]]; then
+    echo "  No sync needed; refreshing is sufficient for current state"
+    continue
+  fi
+  if [[ "$operation" == true ]]; then
+    echo "  SKIP: an operation is already in progress; do not overwrite it"
+    ((failures+=1)); continue
+  fi
+  # Standard Argo CD Application CRD operation mechanism. Intentionally omits
+  # prune/force/replace; Argo CD's syncPolicy and resource syncOptions still apply.
+  # Preserve multi-source source selection by using the Application's desired config.
+  echo "  Request standard Argo CD sync"
+  if ! run kubectl patch -n "$ns" application "$name" --type=merge \
+    -p '{"operation":{"sync":{"syncStrategy":{"hook":{}}}}}'; then
+    echo "  ERROR: sync request failed"
+    ((failures+=1))
+  fi
+ done < <(jq -r '.items[] | [.metadata.namespace,.metadata.name, (.status.sync.status // "Unknown"), (.status.health.status // "Unknown"), ((.metadata.annotations["argocd.argoproj.io/skip-reconcile"] == "true")|tostring), ((.operation != null)|tostring), ((.metadata.deletionTimestamp != null)|tostring)] | @tsv' <<<"$apps")
+
+if $DRY_RUN; then echo "DRY RUN: no changes made"; exit 0; fi
+
+# Await convergence without modifying Kubernetes workloads directly.
+end=$((SECONDS + WAIT_SECONDS))
+while :; do
+  current="$(get_list applications.argoproj.io)" || exit 1
+  unresolved="$(jq -r '.items[] | select((.status.sync.status != "Synced") or (.status.health.status != "Healthy") or (.operation != null)) | [.metadata.namespace,.metadata.name, (.status.sync.status // "Unknown"), (.status.health.status // "Unknown"), (if .operation then "operation-active" else "idle" end)] | @tsv' <<<"$current")"
+  if [[ -z "$unresolved" ]]; then break; fi
+  (( SECONDS < end )) || break
+  sleep "$POLL_SECONDS"
+done
+
+echo '=== Final Application Status ==='
+jq -r '.items[] | [.metadata.namespace,.metadata.name, (.status.sync.status // "Unknown"), (.status.health.status // "Unknown"), (.status.operationState.phase // "none"), (.status.operationState.message // "")] | @tsv' <<<"$current"
+
+if [[ -n "$unresolved" || "$failures" -gt 0 ]]; then
+  echo '=== Unresolved Applications (namespace / name / sync / health / operation) ==='
+  printf '%s\n' "${unresolved:-<none; review skipped/errors above>}"
+  echo '=== Diagnostics: application conditions and unhealthy resources ==='
+  jq -r '.items[] | select((.status.sync.status != "Synced") or (.status.health.status != "Healthy")) | "APP \(.metadata.namespace)/\(.metadata.name)\nCONDITIONS: \((.status.conditions // []) | tojson)\nUNHEALTHY: \([.status.resources[]? | select(.health.status != "Healthy" and .health.status != null) | {kind,name,namespace,health,sync}] | tojson)\nLAST OPERATION: \((.status.operationState // {}) | {phase,message} | tojson)"' <<<"$current"
+  echo "NOT FULLY CONVERGED. Inspect root causes; no destructive recovery was attempted. Log: $LOG_FILE" >&2
+  exit 1
+fi
+echo "SUCCESS: all discovered Applications are Synced and Healthy. Log: $LOG_FILE"
