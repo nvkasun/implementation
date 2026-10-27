@@ -3,41 +3,47 @@
 set -u
 
 NS="goldengate-dev"
-TARGETS=(
-  "gg-postgresql-repltest-001"
-  "gg-postgresql-repltest-002"
-)
 
-echo "=== GoldenGate Admin API Comparison ==="
+echo "=== GOLDENGATE HTTP 502 DIAGNOSTICS ==="
 
-for APP in "${TARGETS[@]}"; do
+for APP in gg-postgresql-repltest-001 gg-postgresql-repltest-002; do
   echo
-  echo "===== $APP ====="
+  echo "========== $APP =========="
 
   POD="${APP}-0"
 
-  kubectl get pod "$POD" -n "$NS" \
-    -o jsonpath='Pod phase: {.status.phase}{"\n"}'
+  kubectl exec -n "$NS" "$POD" -c ogg-postgresql -- sh -c '
+    echo "--- GoldenGate and NGINX processes ---"
+    ps -ef 2>/dev/null |
+      grep -Ei "nginx|adminsrvr|ServiceManager" |
+      grep -v grep |
+      head -15
 
-  kubectl exec -n "$NS" "$POD" \
-    -c ogg-postgresql -- sh -c '
-    for PATH_ in \
-      "/" \
-      "/services/v2/" \
-      "/services/v2/extracts" \
-      "/services/v2/replicats"
+    echo "--- Listening TCP ports ---"
+    if command -v ss >/dev/null 2>&1; then
+      ss -lnt 2>/dev/null |
+        grep -E "8443|900|901|902" |
+        head -20
+    else
+      echo "ss command unavailable"
+    fi
+
+    echo "--- HTTPS status codes ---"
+    for path in \
+      / \
+      /services/v2/extracts \
+      /services/v2/replicats
     do
-      CODE=$(curl -sk \
-        --max-time 10 \
+      code=$(curl -sk --max-time 8 \
         -o /dev/null \
         -w "%{http_code}" \
-        "https://127.0.0.1:8443${PATH_}")
+        "https://127.0.0.1:8443${path}")
 
-      echo "${PATH_} => HTTP ${CODE}"
+      echo "${path}: HTTP ${code}"
     done
-  ' 2>&1 | grep -E 'HTTP|not found|error'
+  ' 2>&1 | head -65
+
 done
 
 echo
-echo "=== Comparison Complete ==="
-echo "No credentials used; no resources modified."
+echo "=== DIAGNOSTICS COMPLETE ==="
