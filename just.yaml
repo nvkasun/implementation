@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# GoldenGate EKS | Argo CD morning reconciliation v3
+# GoldenGate EKS | Argo CD morning reconciliation v4
 # Scope: discovered Applications + ApplicationSets in argocd namespace.
 # Requires: kubectl, jq, kubeconfig with get/list/annotate/patch access.
-# Non-destructive: no force, prune, replace, pod restarts, deletion, or PVC modification.
+# Sync is non-destructive. Optional --recover-csi-pods deletes ONLY eligible stuck pods.
+# No forced sync/prune, PVC deletion, or workload scaling.
 set -Eeuo pipefail
 
 NS="${ARGOCD_NAMESPACE:-argocd}"
@@ -19,16 +20,24 @@ SYNC_UNKNOWN=false
 SKIP_ECR=false
 ECR_TIMEOUT="${ECR_TIMEOUT_SECONDS:-360}"
 ECR_CRONJOB="${ECR_CRONJOB:-argocd-ecr-token-sync}"
+RECOVER_CSI=false
+CSI_NAMESPACE_LIST="${CSI_NAMESPACES:-goldengate-dev,goldengate-monitoring}"
+CSI_MAX_PODS="${CSI_MAX_PODS:-4}"
+CSI_MIN_AGE="${CSI_MIN_AGE_SECONDS:-120}"
+CSI_RECOVERY_TIMEOUT="${CSI_RECOVERY_TIMEOUT_SECONDS:-180}"
 
 usage() {
   cat <<'HELP'
-Usage: ./argocd-morning-reconcile-v3.sh [options]
+Usage: ./argocd-morning-reconcile-v4.sh [options]
   --dry-run           Preview annotations and sync decisions; make no changes
   --refresh-only      Request refreshes but do not sync
   --hard-refresh      Invalidate Argo CD manifest cache (use only when needed)
   --sync-all          Request safe sync even for Synced applications (not default)
   --sync-unknown      Disabled for safety: Unknown requires successful comparison
   --skip-ecr          Skip the credential refresh (diagnostic use only)
+  --recover-csi-pods  Opt in to targeted recreation of pods stuck on AWS CSI provider mount failure
+  --csi-namespaces X  Comma-separated eligible namespaces (default: goldengate-dev,goldengate-monitoring)
+  --csi-max-pods N    Maximum total pod recreations per run (default: 4)
   --ecr-timeout N     Time allowed for the refresh Job (default: 360s)
   --namespace NAME    Argo CD namespace (default: argocd)
   --context NAME      Refuse to run if current kubeconfig context does not match
@@ -51,7 +60,8 @@ while (($#)); do
     --sync-all) SYNC_ALL=true ;;
     --sync-unknown) echo "--sync-unknown is disabled: sync status must be known" >&2; exit 2 ;;
     --skip-ecr) SKIP_ECR=true ;;
-    --namespace|--context|--wait-seconds|--refresh-wait|--poll-seconds|--ecr-timeout)
+    --recover-csi-pods) RECOVER_CSI=true ;;
+    --namespace|--context|--wait-seconds|--refresh-wait|--poll-seconds|--ecr-timeout|--csi-namespaces|--csi-max-pods)
       (($# > 1)) || { echo "Missing value for $1" >&2; exit 2; }
       case "$1" in
         --namespace) NS="$2" ;;
@@ -60,6 +70,8 @@ while (($#)); do
         --refresh-wait) REFRESH_WAIT="$2" ;;
         --poll-seconds) POLL="$2" ;;
         --ecr-timeout) ECR_TIMEOUT="$2" ;;
+        --csi-namespaces) CSI_NAMESPACE_LIST="$2" ;;
+        --csi-max-pods) CSI_MAX_PODS="$2" ;;
       esac
       shift ;;
     -h|--help) usage; exit 0 ;;
@@ -68,7 +80,7 @@ while (($#)); do
   shift
 done
 for x in kubectl jq date tee; do command -v "$x" >/dev/null || { echo "Missing required command: $x" >&2; exit 2; }; done
-[[ "$WAIT" =~ ^[0-9]+$ && "$REFRESH_WAIT" =~ ^[0-9]+$ && "$POLL" =~ ^[1-9][0-9]*$ && "$ECR_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid time argument" >&2; exit 2; }
+[[ "$WAIT" =~ ^[0-9]+$ && "$REFRESH_WAIT" =~ ^[0-9]+$ && "$POLL" =~ ^[1-9][0-9]*$ && "$ECR_TIMEOUT" =~ ^[1-9][0-9]*$ && "$CSI_MAX_PODS" =~ ^[1-9][0-9]*$ && "$CSI_MIN_AGE" =~ ^[0-9]+$ && "$CSI_RECOVERY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid time argument" >&2; exit 2; }
 CTX="$(kubectl config current-context)"
 [[ -z "$EXPECTED_CONTEXT" || "$CTX" == "$EXPECTED_CONTEXT" ]] || { echo "Context mismatch: $CTX" >&2; exit 2; }
 kubectl get --raw=/readyz >/dev/null || { echo "Kubernetes API not ready" >&2; exit 2; }
@@ -229,6 +241,82 @@ while IFS= read -r name; do
     ((failures+=1))
   fi
 done < <(jq -r '.items[].metadata.name' <<<"$APPS")
+
+
+# Optional Phase 5: targeted recreation of a pod ONLY if an AWS provider-not-found
+# FailedMount event matches that Pending/ContainerCreating pod. The owner controller
+# must be an existing single-replica Deployment (via ReplicaSet) or StatefulSet.
+# We never touch healthy pods, controllers, PVCs, or arbitrary FailedMount cases.
+recover_csi_pods() {
+  echo "=== PHASE 5 | TARGETED CSI MOUNT RECOVERY (opt-in) ==="
+  local count=0 ns podjson events obj owner_kind owner_name owner_uid replicas rs deploy age podname waiting
+  local -a namespaces
+  IFS=',' read -r -a namespaces <<<"$CSI_NAMESPACE_LIST"
+  local handled='|'
+  for ns in "${namespaces[@]}"; do
+    [[ "$ns" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || { echo "Invalid CSI namespace: $ns"; return 2; }
+    kubectl get namespace "$ns" >/dev/null || { echo "Missing namespace $ns"; return 2; }
+    podjson="$(kubectl get pods -n "$ns" -o json)" || return 2
+    # Candidates must be Pending and have a container waiting to be created.
+    while IFS= read -r podname; do
+      [[ -n "$podname" ]] || continue
+      (( count < CSI_MAX_PODS )) || { echo "CSI recreation limit reached ($CSI_MAX_PODS)"; return 0; }
+      obj="$(jq -c --arg n "$podname" '.items[] | select(.metadata.name == $n)' <<<"$podjson")"
+      [[ -n "$obj" ]] || continue
+      [[ "$(jq -r '.metadata.deletionTimestamp // empty' <<<"$obj")" == "" ]] || continue
+      waiting="$(jq -r '[.status.containerStatuses[]?.state.waiting.reason] | any(. == "ContainerCreating")' <<<"$obj")"
+      [[ "$waiting" == "true" ]] || continue
+      # Guard against deleting a freshly created pod on its first mount attempt.
+      age="$(jq -r '.metadata.creationTimestamp' <<<"$obj")"
+      local age_epoch now_epoch
+      age_epoch="$(date -u -d "$age" +%s)" || continue
+      now_epoch="$(date -u +%s)"
+      (( now_epoch - age_epoch >= CSI_MIN_AGE )) || continue
+      # Check actual pod events, not Argo CD health alone.
+      events="$(kubectl get events -n "$ns" --field-selector "involvedObject.kind=Pod,involvedObject.name=$podname" -o json)" || return 2
+      if ! jq -e '[.items[] | select(.reason == "FailedMount" and (.message | test("provider not found: provider [\\\"]?aws|error connecting to provider [\\\"]?aws"; "i")))] | length > 0' <<<"$events" >/dev/null; then
+        continue
+      fi
+      owner_kind="$(jq -r '.metadata.ownerReferences[]? | select(.controller == true) | .kind' <<<"$obj" | head -n1)"
+      owner_name="$(jq -r '.metadata.ownerReferences[]? | select(.controller == true) | .name' <<<"$obj" | head -n1)"
+      [[ "$owner_kind" == 'ReplicaSet' || "$owner_kind" == 'StatefulSet' ]] || { echo "Skipping $ns/$podname: unsupported owner $owner_kind"; continue; }
+      if [[ "$owner_kind" == 'ReplicaSet' ]]; then
+        rs="$(kubectl get replicasets.apps "$owner_name" -n "$ns" -o json)" || continue
+        deploy="$(jq -r '.metadata.ownerReferences[]? | select(.controller == true and .kind == "Deployment") | .name' <<<"$rs" | head -n1)"
+        [[ -n "$deploy" ]] || { echo "Skipping $ns/$podname: ReplicaSet without Deployment owner"; continue; }
+        replicas="$(kubectl get deployment "$deploy" -n "$ns" -o jsonpath='{.spec.replicas}')" || continue
+        owner_uid="deployment/$deploy"
+      else
+        replicas="$(kubectl get statefulset "$owner_name" -n "$ns" -o jsonpath='{.spec.replicas}')" || continue
+        owner_uid="statefulset/$owner_name"
+      fi
+      [[ "$replicas" == '1' ]] || { echo "Skipping $ns/$podname: workload $owner_uid has replicas=$replicas (requires exactly 1)"; continue; }
+      [[ "$handled" != *"|$ns:$owner_uid|"* ]] || continue
+      handled+="$ns:$owner_uid|"
+      echo "[CSI FailedMount] $ns/$podname owner=$owner_uid; AWS provider registration failure confirmed"
+      if "$DRY"; then echo "  DRY RUN: would delete only pod $ns/$podname"; continue; fi
+      # Standard graceful deletion; its owning controller creates the replacement.
+      if ! kubectl delete pod "$podname" -n "$ns" --wait=false; then
+        echo "  ERROR: unable to request pod recreation"; ((failures+=1)); continue
+      fi
+      ((count+=1))
+      echo "  Waiting ${CSI_RECOVERY_TIMEOUT}s for controller pod readiness..."
+      # Controller readiness is checked; a pod created on another node is allowed.
+      if kubectl rollout status "$owner_uid" -n "$ns" --timeout="${CSI_RECOVERY_TIMEOUT}s"; then
+        echo "  RECOVERED: $owner_uid ready"
+      else
+        echo "  UNRESOLVED: $owner_uid not ready; inspect fresh pod events and CSI provider node coverage"
+        ((failures+=1))
+      fi
+    done < <(jq -r '.items[] | select(.status.phase == "Pending") | .metadata.name' <<<"$podjson")
+  done
+  echo "Targeted pod recreations requested: $count"
+}
+if "$RECOVER_CSI"; then
+  recover_csi_pods || { echo "CSI recovery failed to inspect required resources"; exit 2; }
+else
+  echo "CSI pod recreation disabled by default. Use --recover-csi-pods after verifying FailedMount provider errors."
+fi
 
 echo "Waiting up to ${WAIT}s for application health/sync convergence..."
 deadline=$((SECONDS + WAIT))
