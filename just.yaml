@@ -5,36 +5,53 @@ set -u
 NS="goldengate-dev"
 POD="gg-postgresql-repltest-002-0"
 
-echo "=== GoldenGate Service Startup Investigation ==="
+echo "======================================"
+echo " GOLDENGATE ADMIN RECOVERY VALIDATION"
+echo "======================================"
 
 kubectl exec -n "$NS" "$POD" \
   -c ogg-postgresql -- sh -c '
 
-echo "--- Registered service configuration files ---"
-find /u02/ServiceManager/var/run \
-  -maxdepth 1 -name "*config.dat" \
-  -printf "%f\n" 2>/dev/null | sort
-
 echo
-echo "--- Service Manager recent admin events ---"
-grep -Ei "adminsrvr|administration|autostart|auto.start|restart|stopped" \
-  /u02/ServiceManager/var/log/ServiceManager.log \
-  2>/dev/null | tail -n 25 | cut -c 1-180
+echo "[1] Administration Server process"
 
-echo
-echo "--- Administration Server process ---"
 if ps -ef | grep -q "[/]u01/ogg/bin/adminsrvr"; then
-  echo "RUNNING"
+  echo "PASS: Administration Server RUNNING"
 else
-  echo "STOPPED"
+  echo "FAIL: Administration Server STOPPED"
 fi
 
 echo
-echo "--- Administration Server configuration metadata ---"
-stat -c "%n | size=%s | modified=%y" \
-  /u02/ServiceManager/var/run/*adminsrvr* \
-  2>/dev/null
+echo "[2] GoldenGate REST API"
+
+CODE=$(curl -sk --max-time 10 \
+  -o /dev/null \
+  -w "%{http_code}" \
+  https://127.0.0.1:8443/services/v2/extracts)
+
+echo "Extract API HTTP: $CODE"
+
+case "$CODE" in
+  401)
+    echo "PASS: Protected API reachable"
+    ;;
+  502)
+    echo "FAIL: Administration upstream unavailable"
+    ;;
+  *)
+    echo "CHECK: Unexpected status $CODE"
+    ;;
+esac
 '
 
 echo
-echo "=== Check Complete ==="
+echo "[3] Kubernetes workload status"
+
+kubectl get pod "$POD" -n "$NS" \
+  -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[0].ready' \
+  --no-headers
+
+echo
+echo "======================================"
+echo " VALIDATION COMPLETE"
+echo "======================================"
