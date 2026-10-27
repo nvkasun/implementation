@@ -1,64 +1,32 @@
 #!/usr/bin/env bash
-# GoldenGate PostgreSQL target + monitor diagnostics. Read-only.
-set -uo pipefail
-NS="${RUNTIME_NAMESPACE:-goldengate-dev}"
-MON_NS="${MONITOR_NAMESPACE:-goldengate-monitoring}"
-ARGO_NS="${ARGOCD_NAMESPACE:-argocd}"
-APP="${APPLICATION_NAME:-goldengate-dev-postgresql-repltest-002}"
-KEY="${DEPLOYMENT_ID:-gg-postgresql-repltest-002}"
-OUT="${OUTPUT_FILE:-gg-diagnostics-$(date -u +%Y%m%dT%H%M%SZ).txt}"
-for c in kubectl date sed grep; do command -v "$c" >/dev/null || { echo "Missing command: $c" >&2; exit 2; }; done
-umask 077
-exec > >(tee "$OUT") 2>&1
-section(){ printf '\n========== %s ==========\n' "$1"; }
-run(){ printf '\n$'; printf ' %q' "$@"; printf '\n'; "$@" 2>&1 || echo "[WARN] command returned nonzero"; }
-# Redact common token/password/authorization patterns in log output.
-redact(){ sed -E 's/((password|passwd|token|authorization|secret|api[_-]?key)[=: ]+)[^[:space:]]+/\1[REDACTED]/Ig; s/(Bearer )[A-Za-z0-9._~+\/-]+/\1[REDACTED]/Ig'; }
-section "Context and time"
-run date -u
-run kubectl config current-context
-run kubectl cluster-info
-section "Runtime and monitor workloads"
-run kubectl get pods -n "$NS" -o wide
-run kubectl get pods -n "$MON_NS" -o wide
-run kubectl get statefulsets,deployments -n "$NS"
-run kubectl get deployments -n "$MON_NS"
-section "Target pod descriptions (events included)"
-PODS="$(kubectl get pods -n "$NS" -o custom-columns=:metadata.name --no-headers 2>/dev/null | grep -F "$KEY" || true)"
-if [[ -z "$PODS" ]]; then echo "No pod name contains $KEY"; fi
-while IFS= read -r pod; do
- [[ -n "$pod" ]] || continue
- run kubectl describe pod "$pod" -n "$NS"
- section "Target pod logs: $pod"
- CONTAINERS="$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null || true)"
- for ctr in $CONTAINERS; do
-   echo "-- container $ctr --"
-   kubectl logs "$pod" -n "$NS" -c "$ctr" --since=45m --tail=140 2>&1 | redact || true
- done
-done <<< "$PODS"
-section "Runtime service and endpoint routing"
-run kubectl get services -n "$NS" -o wide
-run kubectl get endpointslices -n "$NS" -o wide
-run kubectl get endpoints -n "$NS"
-section "Target SecretProviderClass configuration (metadata only, no secret references)"
-# Avoid dumping object names/paths or secret data; use only name and namespace.
-run kubectl get secretproviderclasses -n "$NS" -o custom-columns='NAME:.metadata.name,PROVIDER:.spec.provider'
-run kubectl get secretproviderclasses -n "$MON_NS" -o custom-columns='NAME:.metadata.name,PROVIDER:.spec.provider'
-section "Relevant recent namespace events"
-kubectl get events -n "$NS" --sort-by=.lastTimestamp --no-headers 2>&1 | grep -Ei "$KEY|FailedMount|Unhealthy|BackOff|Failed" | tail -65 | redact || true
-kubectl get events -n "$MON_NS" --sort-by=.lastTimestamp --no-headers 2>&1 | grep -Ei 'gg-monitor|FailedMount|Unhealthy|BackOff|Failed' | tail -50 | redact || true
-section "Argo CD Application status (safe summary)"
-# JSONPath selects only status, and conditions can include endpoint details but not secret values.
-run kubectl get application "$APP" -n "$ARGO_NS" -o jsonpath='{.status.sync.status}{" sync / "}{.status.health.status}{" health\n"}{range .status.conditions[*]}{.type}{": "}{.message}{"\n"}{end}'
-section "Monitor readiness and non-sensitive logs"
-run kubectl get deployments -n "$MON_NS" -o wide
-kubectl logs -n "$MON_NS" deployment/gg-monitor --since=45m --tail=250 2>&1 | redact || true
-section "Monitor pod environment variable NAMES only (no values)"
-run kubectl get deployment gg-monitor -n "$MON_NS" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{": "}{range .env[*]}{.name}{" "}{end}{"\n"}{end}'
-section "NetworkPolicies and CSI daemonset readiness"
-run kubectl get networkpolicies -n "$NS"
-run kubectl get networkpolicies -n "$MON_NS"
-run kubectl get daemonsets -A
-section "Summary"
-echo "Report collected read-only. Review before sharing: logs and pod descriptions might contain private addresses, identifiers, or application-supplied sensitive text."
-echo "Output file: $OUT"
+# Read-only GoldenGate target Admin API diagnostic; concise screenshot-friendly output.
+set -u
+NS=goldengate-dev
+MON_NS=goldengate-monitoring
+POD=gg-postgresql-repltest-002-0
+APP=goldengate-dev-postgresql-repltest-002
+SVC=gg-postgresql-repltest-002
+say(){ printf '\n=== %s ===\n' "$1"; }
+run(){ "$@" 2>&1 | tail -n 14; }
+status=0
+say '1/6 TARGET AND MONITOR READINESS'
+kubectl get pod "$POD" -n "$NS" -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount,NODE:.spec.nodeName' 2>&1
+kubectl get deployment gg-monitor -n "$MON_NS" -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas' 2>&1
+say '2/6 SERVICE ENDPOINTS'
+kubectl get svc "$SVC" -n "$NS" -o custom-columns='NAME:.metadata.name,IP:.spec.clusterIP,PORTS:.spec.ports[*].port' 2>&1
+kubectl get endpointslice -n "$NS" -l "kubernetes.io/service-name=$SVC" -o custom-columns='NAME:.metadata.name,IPS:.endpoints[*].addresses,READY:.endpoints[*].conditions.ready' 2>&1
+say '3/6 ADMIN HTTPS RESPONSE (NO CREDENTIALS)'
+# HTTP 401 here is expected for endpoints requiring authentication; check transport only.
+# Run via kubectl exec if curl exists inside the runtime image; no TLS verification bypass hidden.
+if kubectl exec -n "$NS" "$POD" -c ogg-postgresql -- sh -c 'command -v curl >/dev/null' >/dev/null 2>&1; then
+  kubectl exec -n "$NS" "$POD" -c ogg-postgresql -- sh -c 'curl -skS --max-time 8 -o /dev/null -w "local https://127.0.0.1:8443/ => HTTP %{http_code}\n" https://127.0.0.1:8443/ 2>&1' | tail -n 4
+else
+  echo 'SKIP: curl unavailable inside target container'
+fi
+say '4/6 TARGET CONTAINER RECENT ERRORS (FILTERED)'
+kubectl logs -n "$NS" "$POD" -c ogg-postgresql --since=20m --tail=250 2>&1 | grep -Ei 'admin|unauthoriz|forbidden|HTTP|error|failed|exception|listen|nginx' | tail -n 12 || true
+say '5/6 MONITOR DISCOVERY ERRORS (FILTERED)'
+kubectl logs -n "$MON_NS" deployment/gg-monitor --since=8m --tail=1200 2>&1 | grep -E 'gg-postgresql-repltest-002|listing extracts failed|listing replicats failed' | tail -n 14 | cut -c 1-200 || true
+say '6/6 ARGO CD HEALTH'
+kubectl get application "$APP" -n argocd -o json 2>/dev/null | jq -r '"sync=\(.status.sync.status // "unknown") health=\(.status.health.status // "unknown")", ((.status.conditions // [])[] | "condition=\(.type): \(.message)")' | cut -c 1-200 || echo 'Not available'
+printf '\n=== NEXT ===\nShare screenshots of sections 3, 4 and 5. HTTPError in monitor logs alone does not expose HTTP status; do not paste credentials.\n'
