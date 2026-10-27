@@ -1,57 +1,18 @@
-
-#!/usr/bin/env bash
-set -u
-
-NS="goldengate-dev"
-POD="gg-postgresql-repltest-002-0"
-
-echo "======================================"
-echo " GOLDENGATE ADMIN RECOVERY VALIDATION"
-echo "======================================"
-
-kubectl exec -n "$NS" "$POD" \
+kubectl exec -n goldengate-dev \
+  gg-postgresql-repltest-002-0 \
   -c ogg-postgresql -- sh -c '
+echo "=== GOLDENGATE ADMIN VALIDATION ==="
 
-echo
-echo "[1] Administration Server process"
+ps -ef | grep "[/]u01/ogg/bin/adminsrvr" || true
 
-if ps -ef | grep -q "[/]u01/ogg/bin/adminsrvr"; then
-  echo "PASS: Administration Server RUNNING"
-else
-  echo "FAIL: Administration Server STOPPED"
-fi
+for path in \
+  /services/v2/extracts \
+  /services/v2/replicats
+do
+  code=$(curl -sk --max-time 10 \
+    -o /dev/null -w "%{http_code}" \
+    "https://127.0.0.1:8443${path}")
 
-echo
-echo "[2] GoldenGate REST API"
-
-CODE=$(curl -sk --max-time 10 \
-  -o /dev/null \
-  -w "%{http_code}" \
-  https://127.0.0.1:8443/services/v2/extracts)
-
-echo "Extract API HTTP: $CODE"
-
-case "$CODE" in
-  401)
-    echo "PASS: Protected API reachable"
-    ;;
-  502)
-    echo "FAIL: Administration upstream unavailable"
-    ;;
-  *)
-    echo "CHECK: Unexpected status $CODE"
-    ;;
-esac
+  echo "$path => HTTP $code"
+done
 '
-
-echo
-echo "[3] Kubernetes workload status"
-
-kubectl get pod "$POD" -n "$NS" \
-  -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[0].ready' \
-  --no-headers
-
-echo
-echo "======================================"
-echo " VALIDATION COMPLETE"
-echo "======================================"
