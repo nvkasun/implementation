@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GoldenGate EKS | Argo CD morning reconciliation v2
+# GoldenGate EKS | Argo CD morning reconciliation v3
 # Scope: discovered Applications + ApplicationSets in argocd namespace.
 # Requires: kubectl, jq, kubeconfig with get/list/annotate/patch access.
 # Non-destructive: no force, prune, replace, pod restarts, deletion, or PVC modification.
@@ -16,16 +16,20 @@ HARD=false
 REFRESH_ONLY=false
 SYNC_ALL=false
 SYNC_UNKNOWN=false
+SKIP_ECR=false
+ECR_TIMEOUT="${ECR_TIMEOUT_SECONDS:-360}"
+ECR_CRONJOB="${ECR_CRONJOB:-argocd-ecr-token-sync}"
 
 usage() {
   cat <<'HELP'
-Usage: ./argocd-morning-reconcile-v2.sh [options]
+Usage: ./argocd-morning-reconcile-v3.sh [options]
   --dry-run           Preview annotations and sync decisions; make no changes
   --refresh-only      Request refreshes but do not sync
   --hard-refresh      Invalidate Argo CD manifest cache (use only when needed)
   --sync-all          Request safe sync even for Synced applications (not default)
-  --sync-unknown      Attempt sync on Unknown only if no comparison error;
-                      cannot repair repository/chart/RBAC/manifest failures
+  --sync-unknown      Disabled for safety: Unknown requires successful comparison
+  --skip-ecr          Skip the credential refresh (diagnostic use only)
+  --ecr-timeout N     Time allowed for the refresh Job (default: 360s)
   --namespace NAME    Argo CD namespace (default: argocd)
   --context NAME      Refuse to run if current kubeconfig context does not match
   --wait-seconds N    Maximum final health wait (default: 300)
@@ -33,7 +37,8 @@ Usage: ./argocd-morning-reconcile-v2.sh [options]
   --poll-seconds N    Poll interval (default: 10)
   -h, --help          Show help
 
-By default: refresh ApplicationSets/Applications, wait for comparison,
+By default: run ECR credential refresh Job and require success, then
+refresh ApplicationSets/Applications, wait for comparison,
 sync only OutOfSync Applications, and print unresolved diagnostics.
 Exit code: 0 = all apps Synced/Healthy, 1 = unresolved, 2 = prereq/config error.
 HELP
@@ -44,8 +49,9 @@ while (($#)); do
     --refresh-only) REFRESH_ONLY=true ;;
     --hard-refresh) HARD=true ;;
     --sync-all) SYNC_ALL=true ;;
-    --sync-unknown) SYNC_UNKNOWN=true ;;
-    --namespace|--context|--wait-seconds|--refresh-wait|--poll-seconds)
+    --sync-unknown) echo "--sync-unknown is disabled: sync status must be known" >&2; exit 2 ;;
+    --skip-ecr) SKIP_ECR=true ;;
+    --namespace|--context|--wait-seconds|--refresh-wait|--poll-seconds|--ecr-timeout)
       (($# > 1)) || { echo "Missing value for $1" >&2; exit 2; }
       case "$1" in
         --namespace) NS="$2" ;;
@@ -53,6 +59,7 @@ while (($#)); do
         --wait-seconds) WAIT="$2" ;;
         --refresh-wait) REFRESH_WAIT="$2" ;;
         --poll-seconds) POLL="$2" ;;
+        --ecr-timeout) ECR_TIMEOUT="$2" ;;
       esac
       shift ;;
     -h|--help) usage; exit 0 ;;
@@ -61,7 +68,7 @@ while (($#)); do
   shift
 done
 for x in kubectl jq date tee; do command -v "$x" >/dev/null || { echo "Missing required command: $x" >&2; exit 2; }; done
-[[ "$WAIT" =~ ^[0-9]+$ && "$REFRESH_WAIT" =~ ^[0-9]+$ && "$POLL" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid time argument" >&2; exit 2; }
+[[ "$WAIT" =~ ^[0-9]+$ && "$REFRESH_WAIT" =~ ^[0-9]+$ && "$POLL" =~ ^[1-9][0-9]*$ && "$ECR_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid time argument" >&2; exit 2; }
 CTX="$(kubectl config current-context)"
 [[ -z "$EXPECTED_CONTEXT" || "$CTX" == "$EXPECTED_CONTEXT" ]] || { echo "Context mismatch: $CTX" >&2; exit 2; }
 kubectl get --raw=/readyz >/dev/null || { echo "Kubernetes API not ready" >&2; exit 2; }
@@ -89,6 +96,7 @@ safe_to_sync() {
     and ((.spec.syncPolicy.syncOptions // [] |
       map(select(test("^(Force|Replace|ServerSideApply)=true$";"i"))) | length) == 0)
     and ([.status.resources[]? | select(.requiresPruning == true)] | length == 0)
+    and (.spec.syncPolicy.automated.prune != true)
   ' >/dev/null
 }
 conditions_error() {
@@ -96,6 +104,56 @@ conditions_error() {
     (.type | test("ComparisonError|InvalidSpecError|UnknownError|ManifestGenerationError";"i"))
   )] | length > 0' >/dev/null
 }
+# Phase 0: refresh existing Argo CD ECR OCI repository credentials FIRST.
+# Never print Secret data or ECR passwords. The existing chart-owned CronJob
+# contains the approved IRSA, aws-cli, and kubectl Secret-apply implementation.
+if ! "$SKIP_ECR"; then
+  echo "=== PHASE 0 | ECR OCI REPOSITORY CREDENTIAL REFRESH ==="
+  kubectl get cronjob "$ECR_CRONJOB" -n "$NS" >/dev/null || {
+    echo "ERROR: required CronJob $NS/$ECR_CRONJOB not found; cannot proceed" >&2; exit 2;
+  }
+  suspended="$(kubectl get cronjob "$ECR_CRONJOB" -n "$NS" -o jsonpath='{.spec.suspend}')"
+  if [[ "$suspended" == "true" ]]; then
+    echo "ERROR: ECR credential-refresh CronJob is suspended; refusing bypass" >&2; exit 2
+  fi
+  if "$DRY"; then
+    echo "DRY RUN: would launch a one-off Job from CronJob $ECR_CRONJOB and verify completion before reconciliation"
+  else
+    # kubectl create job uses the LIVE CronJob template; no redeployment required.
+    # Unique job name prevents collisions with scheduled jobs.
+    job="argocd-ecr-refresh-$(date -u +%s)-$$"
+    echo "Launching approved refresh Job: $job"
+    kubectl create job "$job" --from="cronjob/$ECR_CRONJOB" -n "$NS" || {
+      echo "ERROR: failed creating token-sync Job" >&2; exit 1;
+    }
+    if ! kubectl wait -n "$NS" --for=condition=complete "job/$job" --timeout="${ECR_TIMEOUT}s"; then
+      echo "ERROR: ECR refresh Job failed or timed out: $job" >&2
+      kubectl get "job/$job" -n "$NS" -o wide || true
+      kubectl get pods -n "$NS" -l "job-name=$job" -o wide || true
+      echo "Inspect safely: kubectl logs -n $NS job/$job"
+      exit 1
+    fi
+    # Do not echo the raw Job logs into a shared console or log file: repository
+    # sync scripts can occasionally print sensitive command diagnostics.
+    echo "ECR refresh Job completed: $job (raw logs intentionally omitted)"
+    # Verify repository Secret metadata only, never values/passwords.
+    for secret in argocd-ecr-goldengate-oci argocd-ecr-goldengate-monitor-oci \
+                  argocd-ecr-goldengate-platform-oci argocd-ecr-amazon-cloudwatch-observability-oci; do
+      if ! kubectl get secret "$secret" -n "$NS" -o json | jq -e '
+        .metadata.labels["argocd.argoproj.io/secret-type"] == "repository"
+        and ((.data.url // "") | length > 0)
+        and ((.data.password // "") | length > 0)
+      ' >/dev/null; then
+        echo "ERROR: repository Secret $secret is missing/incomplete after token refresh" >&2
+        exit 1
+      fi
+      echo "Verified repository Secret metadata: $secret"
+    done
+  fi
+else
+  echo "WARNING: --skip-ecr selected; no credential refresh attempted"
+fi
+
 SETS="$(set_json)"
 APPS="$(app_json)"
 echo "Discovered $(jq '.items|length' <<<"$SETS") ApplicationSets; $(jq '.items|length' <<<"$APPS") Applications"
@@ -153,14 +211,8 @@ while IFS= read -r name; do
     OutOfSync) : ;;
     Synced) if ! "$SYNC_ALL"; then echo "  Synced; no sync requested"; continue; fi ;;
     Unknown)
-      if conditions_error <<<"$obj"; then
-        echo "  BLOCKED: Comparison/manifest/spec error. Refresh or sync cannot repair underlying source failure."
-        ((failures+=1)); continue
-      fi
-      if ! "$SYNC_UNKNOWN"; then
-        echo "  BLOCKED: Unknown; add --sync-unknown only after confirming source/manifest access."
-        ((failures+=1)); continue
-      fi
+      echo "  BLOCKED: Unknown desired-state comparison; inspect conditions, do not request sync"
+      ((failures+=1)); continue
       ;;
     *) echo "  BLOCKED: unsupported sync status $sync"; ((failures+=1)); continue ;;
   esac
