@@ -1,35 +1,17 @@
 
--- GoldenGate POC: PostgreSQL source table
--- Database: defaultdb
+-- GoldenGate POC: Create SQL Server target database
+-- Run using the authorized RDS administrative login.
 
-CREATE SCHEMA IF NOT EXISTS gg_poc;
+IF DB_ID(N'goldengate_poc') IS NULL
+BEGIN
+    CREATE DATABASE goldengate_poc;
+END;
+GO
 
-CREATE TABLE IF NOT EXISTS gg_poc.replication_test (
-    id              INTEGER PRIMARY KEY,
-    customer_name   VARCHAR(100) NOT NULL,
-    transaction_ref VARCHAR(50) NOT NULL,
-    amount          NUMERIC(15,2) NOT NULL,
-    status          VARCHAR(20) NOT NULL,
-    created_at      TIMESTAMP(3) NOT NULL
-                    DEFAULT CURRENT_TIMESTAMP
-);
-
--- Confirm table exists and is empty
-SELECT COUNT(*) AS initial_row_count
-FROM gg_poc.replication_test;
-
--- Confirm primary key and replica identity
 SELECT
-    n.nspname AS schema_name,
-    c.relname AS table_name,
-    CASE c.relreplident
-        WHEN 'd' THEN 'DEFAULT'
-        WHEN 'f' THEN 'FULL'
-        WHEN 'i' THEN 'USING INDEX'
-        WHEN 'n' THEN 'NOTHING'
-    END AS replica_identity
-FROM pg_class c
-JOIN pg_namespace n
-    ON n.oid = c.relnamespace
-WHERE n.nspname = 'gg_poc'
-  AND c.relname = 'replication_test';
+    name AS database_name,
+    state_desc AS database_status,
+    recovery_model_desc AS recovery_model
+FROM sys.databases
+WHERE name = N'goldengate_poc';
+GO
