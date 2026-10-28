@@ -1,31 +1,35 @@
 
--- GoldenGate POC: PostgreSQL source validation
+-- GoldenGate POC: PostgreSQL source table
 -- Database: defaultdb
--- Read-only; no changes are made.
 
-SELECT
-    current_database() AS database_name,
-    current_user AS connected_user,
-    current_setting('server_version') AS pg_version;
+CREATE SCHEMA IF NOT EXISTS gg_poc;
 
-SELECT
-    name AS parameter,
-    setting AS current_value,
-    unit
-FROM pg_settings
-WHERE name IN (
-    'wal_level',
-    'rds.logical_replication',
-    'max_replication_slots',
-    'max_wal_senders',
-    'max_connections',
-    'server_encoding'
-)
-ORDER BY name;
+CREATE TABLE IF NOT EXISTS gg_poc.replication_test (
+    id              INTEGER PRIMARY KEY,
+    customer_name   VARCHAR(100) NOT NULL,
+    transaction_ref VARCHAR(50) NOT NULL,
+    amount          NUMERIC(15,2) NOT NULL,
+    status          VARCHAR(20) NOT NULL,
+    created_at      TIMESTAMP(3) NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
+);
 
+-- Confirm table exists and is empty
+SELECT COUNT(*) AS initial_row_count
+FROM gg_poc.replication_test;
+
+-- Confirm primary key and replica identity
 SELECT
-    slot_name,
-    plugin,
-    slot_type,
-    active
-FROM pg_replication_slots;
+    n.nspname AS schema_name,
+    c.relname AS table_name,
+    CASE c.relreplident
+        WHEN 'd' THEN 'DEFAULT'
+        WHEN 'f' THEN 'FULL'
+        WHEN 'i' THEN 'USING INDEX'
+        WHEN 'n' THEN 'NOTHING'
+    END AS replica_identity
+FROM pg_class c
+JOIN pg_namespace n
+    ON n.oid = c.relnamespace
+WHERE n.nspname = 'gg_poc'
+  AND c.relname = 'replication_test';
