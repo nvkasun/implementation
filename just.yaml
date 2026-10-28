@@ -1,49 +1,36 @@
-
 #!/usr/bin/env bash
-set -u
-
-NS="goldengate-dev"
-
-echo "=== GOLDENGATE RESTART STATE COMPARISON ==="
-
-for APP in \
-  gg-postgresql-repltest-001 \
-  gg-postgresql-repltest-002
-do
+# Read-only GoldenGate microservices restart/startup audit for VDR screenshots.
+set -uo pipefail
+NS="${GG_NAMESPACE:-goldengate-dev}"
+APPS=(gg-oracle-repltest-002 gg-postgresql-repltest-002 gg-postgresql-repltest-001 gg-mssql-repltest-001)
+command -v kubectl >/dev/null || { echo 'ERROR: kubectl not found'; exit 2; }
+printf '=== GoldenGate restart audit | %s | ns=%s ===\n' "$(date -u '+%Y-%m-%d %H:%M UTC')" "$NS"
+for app in "${APPS[@]}"; do
+  pod="${app}-0"
   echo
-  echo "========== $APP =========="
-
-  kubectl exec -n "$NS" "${APP}-0" \
-    -c ogg-postgresql -- sh -c '
-
-    echo "[1] Managed service processes"
-    ps -ef | grep -E \
-      "[/]u01/ogg/bin/(ServiceManager|adminsrvr|distsrvr|recvsrvr|pmsrvr)" |
-      sed -E "s/.*\/u01\/ogg\/bin\///" |
-      cut -c 1-100
-
-    echo "[2] Admin service config metadata"
-    find /u02/ServiceManager/var/run \
-      -maxdepth 1 -type f \
-      -name "*adminsrvr-config.dat" \
-      -printf "%f | %s bytes | %TY-%Tm-%Td %TH:%TM\n" \
-      2>/dev/null
-
-    echo "[3] Recent Admin lifecycle events"
-    grep -E \
-      "Task .*adminsrvr.*started|Service:.*adminsrvr|Service Manager is restarting" \
-      /u02/ServiceManager/var/log/ServiceManager.log \
-      2>/dev/null |
-      tail -n 8 |
-      cut -c 1-180
-
-    echo "[4] Admin REST status"
-    curl -sk --max-time 8 \
-      -o /dev/null \
-      -w "HTTP %{http_code}\n" \
-      https://127.0.0.1:8443/services/v2/extracts
-  '
+  printf '========== %s ==========\n' "$app"
+  kubectl get pod "$pod" -n "$NS" -o jsonpath='Kubernetes: phase={.status.phase} ready={.status.containerStatuses[0].ready} restarts={.status.containerStatuses[0].restartCount} node={.spec.nodeName}{"\n"}' 2>&1 || { echo 'Pod lookup failed'; continue; }
+  container="$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.spec.containers[0].name}' 2>/dev/null)"
+  if [[ -z "$container" ]]; then echo 'Container lookup failed'; continue; fi
+  kubectl exec -n "$NS" "$pod" -c "$container" -- sh -s <<'INNER' 2>&1 || echo 'ERROR: in-pod diagnostics failed'
+echo '[1] Microservice process presence'
+for svc in ServiceManager adminsrvr distsrvr recvsrvr pmsrvr; do
+  if ps -ef | grep -F "/u01/ogg/bin/$svc" | grep -v grep >/dev/null 2>&1; then echo "  $svc: RUNNING"; else echo "  $svc: NOT RUNNING"; fi
 done
-
+echo '[2] Admin REST route (unauthenticated)'
+if command -v curl >/dev/null 2>&1; then
+  curl -sk --max-time 8 -o /dev/null -w '  extracts endpoint HTTP %{http_code}\n' https://127.0.0.1:8443/services/v2/extracts 2>/dev/null || echo '  HTTP request failed'
+else echo '  curl unavailable'; fi
+echo '[3] Persisted service config metadata (not contents)'
+find /u02/ServiceManager/var/run -maxdepth 1 -type f \( -iname '*adminsrvr*config.dat' -o -iname '*distsrvr*config.dat' -o -iname '*recvsrvr*config.dat' -o -iname '*pmsrvr*config.dat' \) -printf '  %f | %s bytes | %TY-%Tm-%Td %TH:%TM\n' 2>/dev/null | sort | head -12
+echo '[4] Latest Service Manager startup/restart events'
+log=/u02/ServiceManager/var/log/ServiceManager.log
+if [ -r "$log" ]; then
+  grep -Ei 'Service Manager is restarting|Task .*:(adminsrvr|distsrvr|recvsrvr|pmsrvr).*started|Service:.*adminsrvr|Status:.*stopped' "$log" 2>/dev/null | tail -n 9 | cut -c 1-180 || true
+else echo '  Service Manager log unavailable'; fi
+INNER
+done
 echo
-echo "=== READ-ONLY COMPARISON COMPLETE ==="
+echo '=== END ==='
+echo 'Read-only: no pod deletion, restarts, configuration writes, or credentials requested.'
+echo 'Note: This audit checks behaviour/metadata; effective auto-restart POLICY must be reviewed using authenticated Service Manager settings.'
