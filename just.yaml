@@ -1,15 +1,215 @@
+A. PostgreSQL source database — 4 screenshots
+DBeaver connection: PostgreSQL → defaultdb
 
--- GoldenGate POC: MSSQL target final verification
+01-postgresql-source-database.png
+
+Evidence: PostgreSQL database name, connected user and engine version.
+
+Capture area: Show DBeaver's PostgreSQL connection and the results of this query.
+
+
+
+SELECT
+    current_database() AS database_name,
+    current_user AS connected_user,
+    version() AS postgres_version;
+
+
+
+
+
+02-postgresql-logical-replication-parameters.png
+
+Evidence: PostgreSQL logical replication prerequisites.
+
+Capture area: Include all six parameter values in the results grid, especially wal_level=logical, rds.logical_replication=on, max_replication_slots=10 and max_wal_senders=25.
+
+
+
+SELECT
+    name AS parameter,
+    setting AS current_value
+FROM pg_settings
+WHERE name IN (
+    'wal_level',
+    'rds.logical_replication',
+    'max_replication_slots',
+    'max_wal_senders',
+    'max_connections',
+    'server_encoding'
+)
+ORDER BY name;
+
+
+
+
+
+03-postgresql-source-table-structure.png
+
+Evidence: Source schema, table columns and data types.
+
+Capture area: Expand defaultdb → Schemas → gg_poc → Tables → replication_test in DBeaver and show the six columns in the query results.
+
+
+
+SELECT
+    column_name,
+    data_type,
+    is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'gg_poc'
+  AND table_name = 'replication_test'
+ORDER BY ordinal_position;
+
+
+
+
+
+04-postgresql-source-cdc-baseline.png
+
+Evidence: Primary key, replica identity, empty replication table and existing logical replication slots.
+
+Capture area: Run the script and show the source_table_status result. Capture the replication-slot result separately if needed; it should currently be empty.
+
+
+
+SELECT
+    n.nspname AS schema_name,
+    c.relname AS table_name,
+    CASE c.relreplident
+        WHEN 'd' THEN 'DEFAULT'
+        WHEN 'f' THEN 'FULL'
+        WHEN 'i' THEN 'USING INDEX'
+        WHEN 'n' THEN 'NOTHING'
+    END AS replica_identity,
+    EXISTS (
+        SELECT 1
+        FROM pg_constraint pk
+        WHERE pk.conrelid = c.oid
+          AND pk.contype = 'p'
+    ) AS has_primary_key,
+    (SELECT COUNT(*)
+     FROM gg_poc.replication_test) AS initial_row_count
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'gg_poc'
+  AND c.relname = 'replication_test';
+
+SELECT slot_name, plugin, active
+FROM pg_replication_slots;
+
+
+
+
+B. SQL Server target database — 4 screenshots
+DBeaver connection: SQL Server → goldengate_poc
+
+05-mssql-target-database.png
+
+Evidence: SQL Server target database created and online with FULL recovery model.
+
+Capture area: Show goldengate_poc in Database Navigator and the database status/recovery model in the result grid.
+
+
+
+SELECT
+    name AS database_name,
+    state_desc AS database_status,
+    recovery_model_desc AS recovery_model
+FROM sys.databases
+WHERE name = 'goldengate_poc';
+
+
+
+
+
+06-mssql-target-table-structure.png
+
+Evidence: Six matching SQL Server target columns with appropriate data types.
+
+Capture area: Expand goldengate_poc → Schemas → gg_poc → Tables → replication_test, and show all six rows in the query results.
+
+
+
+SELECT
+    COLUMN_NAME,
+    DATA_TYPE,
+    CHARACTER_MAXIMUM_LENGTH,
+    NUMERIC_PRECISION,
+    NUMERIC_SCALE,
+    IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'gg_poc'
+  AND TABLE_NAME = 'replication_test'
+ORDER BY ORDINAL_POSITION;
+
+
+
+
+
+07-mssql-target-primary-key.png
+
+Evidence: The target table has the expected primary key on id.
+
+Capture area: Show the primary-key constraint and column in DBeaver.
+
+
+
+SELECT
+    kc.name AS constraint_name,
+    c.name AS primary_key_column
+FROM sys.key_constraints kc
+JOIN sys.index_columns ic
+    ON kc.parent_object_id = ic.object_id
+   AND kc.unique_index_id = ic.index_id
+JOIN sys.columns c
+    ON ic.object_id = c.object_id
+   AND ic.column_id = c.column_id
+WHERE kc.parent_object_id =
+      OBJECT_ID(N'gg_poc.replication_test')
+  AND kc.type = 'PK'
+ORDER BY ic.key_ordinal;
+
+
+
+
+
+08-mssql-target-initial-empty-table.png
+
+Evidence: Target replication table exists and has zero rows before GoldenGate Replicat is configured.
+
+Capture area: Show the database name, table name and initial_row_count=0 in the SQL results.
+
+
 
 SELECT
     DB_NAME() AS database_name,
-    s.name AS schema_name,
-    t.name AS table_name
-FROM sys.tables t
-JOIN sys.schemas s
-    ON t.schema_id = s.schema_id
-WHERE s.name = 'gg_poc'
-  AND t.name = 'replication_test';
-
-SELECT COUNT(*) AS initial_row_count
+    'gg_poc.replication_test' AS table_name,
+    COUNT(*) AS initial_row_count
 FROM gg_poc.replication_test;
+
+
+
+
+Evidence collection checklist
+Screenshot tracking
+
+0 of 8 captured
+
+
+
+[ ] 01-postgresql-source-database.png
+
+[ ] 02-postgresql-logical-replication-parameters.png
+
+[ ] 03-postgresql-source-table-structure.png
+
+[ ] 04-postgresql-source-cdc-baseline.png
+
+[ ] 05-mssql-target-database.png
+
+[ ] 06-mssql-target-table-structure.png
+
+[ ] 07-mssql-target-primary-key.png
+
+[ ] 08-mssql-target-initial-empty-table.png
