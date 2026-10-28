@@ -1,31 +1,18 @@
 
--- SQL Server admin target permissions
--- READ ONLY
+-- GoldenGate POC - SQL Server msdb permission check
+-- Read-only. No changes.
 
 SELECT
-    DB_NAME() AS database_name,
-    SUSER_SNAME() AS connected_login,
-    USER_NAME() AS database_user,
-    IS_MEMBER('db_owner') AS is_db_owner,
-    HAS_PERMS_BY_NAME(
-        'gg_poc.replication_test',
-        'OBJECT',
-        'INSERT'
-    ) AS can_insert,
-    HAS_PERMS_BY_NAME(
-        'gg_poc.replication_test',
-        'OBJECT',
-        'UPDATE'
-    ) AS can_update,
-    HAS_PERMS_BY_NAME(
-        'gg_poc.replication_test',
-        'OBJECT',
-        'DELETE'
-    ) AS can_delete;
+    DB_NAME() AS current_database,
+    SUSER_SNAME() AS connected_login;
 
--- Check SQL Server Agent role in msdb
 SELECT
-    IS_ROLEMEMBER(
-        'SQLAgentUserRole',
-        SUSER_SNAME()
-    ) AS is_sql_agent_user;
+    dp.name AS msdb_user,
+    rp.name AS assigned_role
+FROM msdb.sys.database_role_members drm
+JOIN msdb.sys.database_principals dp
+    ON drm.member_principal_id = dp.principal_id
+JOIN msdb.sys.database_principals rp
+    ON drm.role_principal_id = rp.principal_id
+WHERE dp.name = SUSER_SNAME()
+ORDER BY rp.name;
