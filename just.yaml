@@ -1,18 +1,49 @@
-kubectl exec -n goldengate-dev \
-  gg-postgresql-repltest-002-0 \
-  -c ogg-postgresql -- sh -c '
-echo "=== GOLDENGATE ADMIN VALIDATION ==="
 
-ps -ef | grep "[/]u01/ogg/bin/adminsrvr" || true
+#!/usr/bin/env bash
+set -u
 
-for path in \
-  /services/v2/extracts \
-  /services/v2/replicats
+NS="goldengate-dev"
+
+echo "=== GOLDENGATE RESTART STATE COMPARISON ==="
+
+for APP in \
+  gg-postgresql-repltest-001 \
+  gg-postgresql-repltest-002
 do
-  code=$(curl -sk --max-time 10 \
-    -o /dev/null -w "%{http_code}" \
-    "https://127.0.0.1:8443${path}")
+  echo
+  echo "========== $APP =========="
 
-  echo "$path => HTTP $code"
+  kubectl exec -n "$NS" "${APP}-0" \
+    -c ogg-postgresql -- sh -c '
+
+    echo "[1] Managed service processes"
+    ps -ef | grep -E \
+      "[/]u01/ogg/bin/(ServiceManager|adminsrvr|distsrvr|recvsrvr|pmsrvr)" |
+      sed -E "s/.*\/u01\/ogg\/bin\///" |
+      cut -c 1-100
+
+    echo "[2] Admin service config metadata"
+    find /u02/ServiceManager/var/run \
+      -maxdepth 1 -type f \
+      -name "*adminsrvr-config.dat" \
+      -printf "%f | %s bytes | %TY-%Tm-%Td %TH:%TM\n" \
+      2>/dev/null
+
+    echo "[3] Recent Admin lifecycle events"
+    grep -E \
+      "Task .*adminsrvr.*started|Service:.*adminsrvr|Service Manager is restarting" \
+      /u02/ServiceManager/var/log/ServiceManager.log \
+      2>/dev/null |
+      tail -n 8 |
+      cut -c 1-180
+
+    echo "[4] Admin REST status"
+    curl -sk --max-time 8 \
+      -o /dev/null \
+      -w "HTTP %{http_code}\n" \
+      https://127.0.0.1:8443/services/v2/extracts
+  '
 done
-'
+
+echo
+echo "=== READ-ONLY COMPARISON COMPLETE ==="
