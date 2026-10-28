@@ -1,17 +1,16 @@
 
 -- GoldenGate POC: Create SQL Server target database
--- Run using the authorized RDS administrative login.
+-- Execute through DBeaver.
 
 IF DB_ID(N'goldengate_poc') IS NULL
 BEGIN
-    CREATE DATABASE goldengate_poc;
+    EXEC(N'CREATE DATABASE goldengate_poc');
 END;
-GO
 
+-- Verify database creation
 SELECT
     name AS database_name,
     state_desc AS database_status,
     recovery_model_desc AS recovery_model
 FROM sys.databases
 WHERE name = N'goldengate_poc';
-GO
