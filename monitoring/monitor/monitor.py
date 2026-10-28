@@ -279,6 +279,20 @@ def normalize_process_discovery(raw):
     }
 
 
+def normalize_registration(raw, expected_name):
+    """STATE#_deployment.registration, re-checked against the current registry name; anything malformed or stale reports UNAVAILABLE/MISMATCH, never MATCH."""
+    if not isinstance(raw, dict):
+        return {"status": "UNAVAILABLE", "expectedName": expected_name, "registeredNames": []}
+    names = raw.get("registeredNames")
+    names = sorted({n for n in names if isinstance(n, str) and collector._OGG_DEPLOYMENT_NAME_RE.match(n)}) if isinstance(names, list) else []
+    status = raw.get("status")
+    if status not in collector.REGISTRATION_STATUSES:
+        status = "UNAVAILABLE"
+    if status == "MATCH" and (raw.get("expectedName") != expected_name or expected_name not in names):
+        status = "MISMATCH"
+    return {"status": status, "expectedName": expected_name, "registeredNames": names[:collector.MAX_REPORTED_REGISTRATIONS]}
+
+
 def normalize_critical_services(raw):
     """Fail-closed: only a literal reachable=True entry counts as reachable, any other shape fails closed."""
     if not isinstance(raw, dict):
@@ -311,6 +325,7 @@ def read_runtime_view(table, role, deployment_name, deployment_meta,
         status_fields = {"effectiveStatus": "MISSING", "recordedAt": None, "ageSeconds": None, "fresh": False}
         critical_services = {}
         process_discovery = None
+    registration = normalize_registration((dep_item or {}).get("registration"), deployment_meta.get("oggDeploymentName"))
 
     return {
         "role": role,
@@ -326,6 +341,7 @@ def read_runtime_view(table, role, deployment_name, deployment_meta,
         "criticalServices": critical_services,
         "processes": processes,
         "processDiscovery": process_discovery,
+        "registration": registration,
         **status_fields,
     }
 
@@ -365,6 +381,7 @@ def read_deployment_processes_view(table, deployment_meta, now, stale_after_seco
     processes = [normalize_process_row(r, now, stale_after_seconds) for r in process_rows]
     critical_services = normalize_critical_services(dep_item.get("criticalServices")) if dep_item is not None else {}
     process_discovery = normalize_process_discovery(dep_item.get("processDiscovery")) if dep_item is not None else None
+    registration = normalize_registration((dep_item or {}).get("registration"), deployment_meta.get("oggDeploymentName"))
 
     return {
         "deploymentName": deployment_name,
@@ -375,6 +392,7 @@ def read_deployment_processes_view(table, deployment_meta, now, stale_after_seco
         "criticalServices": critical_services,
         "processes": processes,
         "processDiscovery": process_discovery,
+        "registration": registration,
         **status_fields,
     }
 

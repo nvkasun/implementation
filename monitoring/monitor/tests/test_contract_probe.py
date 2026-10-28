@@ -1443,3 +1443,102 @@ class CliMainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _routing_deployment(name, ogg_deployment_name):
+    return {**_deployment(name=name), "oggDeploymentName": ogg_deployment_name}
+
+
+def _in_pod_proxy(routed_name, fallback="ogg-12031"):
+    """Simulates the image's reverse proxy: only /services/<routed_name>/<service>/ reaches that service; anything else falls to the Service Manager."""
+    def fetch(deployment, path):
+        parts = path.split("/")
+        name, service = parts[2], parts[3]
+        if name == routed_name:
+            return 200, f"<html>{service} console for {name}</html>".encode()
+        if fallback == "ogg-12031":
+            return 404, b'{"messages":[{"code":"OGG-12031","title":"The requested resource does not exist."}]}'
+        return 200, b"<html>Service Manager</html>"
+    return fetch
+
+
+class RouteCheckTests(unittest.TestCase):
+    def test_migrated_runtime_routes_its_registered_name_and_reports_the_canonical_alias(self):
+        deployment = _routing_deployment("gg-postgresql-repltest-001", "gg-postgresql-repltest-01")
+        result = probe.check_routing(deployment, fetch=_in_pod_proxy("gg-postgresql-repltest-01"))
+        self.assertTrue(result["allRegisteredRoutesRouted"])
+        by_kind = {}
+        for r in result["routes"]:
+            by_kind.setdefault(r["nameKind"], {})[r["service"]] = r["result"]
+        self.assertEqual(by_kind["registered"], {s: "ROUTED" for s in probe.ROUTED_SERVICES})
+        self.assertEqual(by_kind["canonical"], {s: "WRONG_RESOURCE" for s in probe.ROUTED_SERVICES})
+
+    def test_proxy_routing_the_canonical_name_while_links_use_the_registered_name_fails(self):
+        # The reported defect: OGG_DEPLOYMENT (proxy) = canonical ID, Service Manager registration = legacy name.
+        deployment = _routing_deployment("gg-postgresql-repltest-001", "gg-postgresql-repltest-01")
+        result = probe.check_routing(deployment, fetch=_in_pod_proxy("gg-postgresql-repltest-001"))
+        self.assertFalse(result["allRegisteredRoutesRouted"])
+        registered = [r for r in result["routes"] if r["nameKind"] == "registered"]
+        self.assertEqual({r["result"] for r in registered}, {"WRONG_RESOURCE"})
+        self.assertEqual(registered[0]["path"], "/services/gg-postgresql-repltest-01/adminsrvr/v2/content/")
+
+    def test_a_200_that_serves_the_same_page_as_an_unregistered_name_is_not_routed(self):
+        deployment = _routing_deployment("gg-x-001", "gg-x-01")
+        result = probe.check_routing(deployment, fetch=_in_pod_proxy("nobody", fallback="generic-200"))
+        self.assertFalse(result["allRegisteredRoutesRouted"])
+        self.assertEqual({r["result"] for r in result["routes"]}, {"INDISTINGUISHABLE"})
+
+    def test_new_runtime_has_only_its_canonical_registered_name(self):
+        deployment = _routing_deployment("ogg-db2-settlement-123", "ogg-db2-settlement-123")
+        result = probe.check_routing(deployment, fetch=_in_pod_proxy("ogg-db2-settlement-123"))
+        self.assertTrue(result["allRegisteredRoutesRouted"])
+        self.assertEqual({r["nameKind"] for r in result["routes"]}, {"registered"})
+        self.assertEqual(len(result["routes"]), len(probe.ROUTED_SERVICES))
+
+    def test_request_failures_are_classified_not_raised(self):
+        def failing(deployment, path):
+            raise probe.ProbeRequestError("TLS_FAILED")
+        result = probe.check_routing(_routing_deployment("gg-x-001", "gg-x-001"), fetch=failing)
+        self.assertFalse(result["allRegisteredRoutesRouted"])
+        self.assertEqual({r["result"] for r in result["routes"]}, {"TLS_FAILED"})
+
+    def test_classify_route(self):
+        ok = b"<html>adminsrvr</html>"
+        control = b"<html>sm</html>"
+        cases = [
+            ((200, ok, 404, control), "ROUTED"),
+            ((200, ok, None, b""), "ROUTED"),
+            ((200, b"x OGG-12031 y", 404, control), "WRONG_RESOURCE"),
+            ((404, b"", 404, control), "NOT_FOUND"),
+            ((401, b"", 404, control), "AUTH_FAILED"),
+            ((403, b"", 404, control), "AUTH_FAILED"),
+            ((502, b"", 404, control), "ENDPOINT_UNAVAILABLE"),
+            ((302, b"", 404, control), "UNKNOWN"),
+            ((200, control, 200, control), "INDISTINGUISHABLE"),
+            ((200, b"a" * (probe.MAX_RESPONSE_BYTES + 1), 404, control), "UNEXPECTED_RESPONSE"),
+        ]
+        for args, expected in cases:
+            with self.subTest(expected=expected, status=args[0]):
+                self.assertEqual(probe.classify_route(*args), expected)
+
+    def test_route_path_only_accepts_valid_names_and_known_services(self):
+        self.assertEqual(probe.route_path("Legacy_Name-1", "pmsrvr"), "/services/Legacy_Name-1/pmsrvr/v2/content/")
+        for name, service in (("../x", "adminsrvr"), ("a b", "adminsrvr"), ("", "adminsrvr"), (None, "adminsrvr"), ("ok", "../admin"), ("ok", "other")):
+            with self.subTest(name=name, service=service), self.assertRaises(probe.ProbeValidationError):
+                probe.route_path(name, service)
+
+    def test_cli_argument_validation(self):
+        for argv in (["--deployment", "x", "--port", "metrics", "--check-routing"],
+                     ["--deployment", "x", "--port", "admin", "--check-routing", "--path", "/services/v2/deployments"],
+                     ["--deployment", "x", "--port", "admin", "--check-routing", "--follow-processes"]):
+            with self.subTest(argv=argv), mock.patch("sys.stderr"):
+                self.assertEqual(probe.main(argv), 2)
+
+    def test_cli_exit_code_reflects_registered_routes(self):
+        deployment = _routing_deployment("gg-x-001", "gg-x-01")
+        for routed, code in (("gg-x-01", 0), ("gg-x-001", 1)):
+            with self.subTest(routed=routed), \
+                    mock.patch.object(probe, "resolve_deployment", return_value=deployment), \
+                    mock.patch.object(probe, "_fetch_bounded", side_effect=_in_pod_proxy(routed)), \
+                    mock.patch("sys.stdout"):
+                self.assertEqual(probe.main(["--deployment", "gg-x-001", "--port", "admin", "--check-routing"]), code)

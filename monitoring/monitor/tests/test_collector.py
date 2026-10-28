@@ -332,6 +332,7 @@ class CredentialFailClosedTests(unittest.TestCase):
         """Runs polling_loop for exactly one tick (checkIntervalSeconds=0, stop_event set on the first CONFIG read)."""
         deployment = {
             "name": "gg-oracle-payments-01",
+            "oggDeploymentName": "gg-oracle-payments-01",
             "type": "oracle",
             "adminHost": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
             "adminPort": 8443,
@@ -1138,6 +1139,7 @@ class MetricPublicationIntegrationTests(unittest.TestCase):
 
     DEPLOYMENT = {
         "name": "gg-oracle-payments-01",
+        "oggDeploymentName": "gg-oracle-payments-01",
         "type": "oracle",
         "adminHost": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
         "adminPort": 8443,
@@ -1287,6 +1289,7 @@ class ProcessDiscoveryPersistenceTests(unittest.TestCase):
 
     DEPLOYMENT = {
         "name": "gg-oracle-payments-01",
+        "oggDeploymentName": "gg-oracle-payments-01",
         "type": "oracle",
         "adminHost": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
         "adminPort": 8443,
@@ -1388,12 +1391,84 @@ class ProcessDiscoveryPersistenceTests(unittest.TestCase):
         table = self._run_tick(discovery)
         table.scan.assert_not_called()
 
+    def test_registration_persisted_into_state_deployment(self):
+        for status, registered in (("MATCH", ["gg-oracle-payments-01"]), ("MISMATCH", ["gg-oracle-payments-1"])):
+            with self.subTest(status=status):
+                registration = {"status": status, "expectedName": "gg-oracle-payments-01", "registeredNames": registered}
+                write = self._deployment_write(self._run_tick(_discovery(status="EMPTY", registration=registration)))
+                self.assertIn("registration=:reg", write["UpdateExpression"])
+                self.assertEqual(write["ExpressionAttributeValues"][":reg"], registration)
+
+    def test_missing_registration_is_persisted_as_unavailable_never_match(self):
+        write = self._deployment_write(self._run_tick(_discovery(status="EMPTY")))
+        self.assertEqual(write["ExpressionAttributeValues"][":reg"]["status"], "UNAVAILABLE")
+
+    def test_registration_mismatch_is_logged(self):
+        registration = {"status": "MISMATCH", "expectedName": "gg-oracle-payments-01", "registeredNames": ["OldName"]}
+        with self.assertLogs(core.logger, level="WARNING") as log_ctx:
+            self._run_tick(_discovery(status="EMPTY", registration=registration))
+        self.assertTrue(any("deployment_registration_mismatch" in r.getMessage() and "OldName" in r.getMessage() for r in log_ctx.records))
+
+
+class RegistrationClassificationTests(unittest.TestCase):
+    """Service Manager registration vs the registry's oggDeploymentName, from the existing GET /services/v2/deployments liveness call."""
+
+    BASE = "https://gg-test:8443"
+
+    @staticmethod
+    def _payload(*names):
+        return {"response": {"items": [{"name": n} for n in names]}}
+
+    def test_match_mismatch_and_unavailable(self):
+        cases = [
+            ("gg-ledger-001", self._payload("ServiceManager", "gg-ledger-001"), "MATCH", ["gg-ledger-001"]),
+            ("gg-ledger-01", self._payload("ServiceManager", "gg-ledger-01"), "MATCH", ["gg-ledger-01"]),
+            ("gg-ledger-001", self._payload("ServiceManager", "gg-ledger-01"), "MISMATCH", ["gg-ledger-01"]),
+            ("gg-ledger-001", self._payload("ServiceManager"), "MISMATCH", []),
+            ("gg-ledger-001", self._payload("GG-LEDGER-001"), "MISMATCH", ["GG-LEDGER-001"]),
+            ("gg-ledger-001", self._payload("gg-ledger-01", "gg-ledger-001"), "MATCH", ["gg-ledger-001", "gg-ledger-01"]),
+            ("gg-ledger-001", {}, "UNAVAILABLE", []),
+            ("gg-ledger-001", {"response": {"items": "nope"}}, "UNAVAILABLE", []),
+            ("gg-ledger-001", None, "UNAVAILABLE", []),
+        ]
+        for expected, payload, status, names in cases:
+            with self.subTest(expected=expected, payload=payload):
+                result = core.classify_registration(expected, payload)
+                self.assertEqual(result, {"status": status, "expectedName": expected, "registeredNames": names})
+
+    def test_malformed_or_unsafe_items_are_ignored(self):
+        payload = {"response": {"items": [None, "x", {"name": None}, {"name": 7}, {"name": "../etc"}, {"name": "a b"}, {"name": "gg-ledger-001"}]}}
+        self.assertEqual(core.classify_registration("gg-ledger-001", payload)["registeredNames"], ["gg-ledger-001"])
+
+    def test_reported_names_are_bounded(self):
+        payload = self._payload(*[f"dep{i:02d}" for i in range(30)])
+        self.assertEqual(len(core.classify_registration("dep29", payload)["registeredNames"]), core.MAX_REPORTED_REGISTRATIONS)
+        self.assertEqual(core.classify_registration("dep29", payload)["status"], "MATCH")
+
+    def test_discover_processes_reuses_the_liveness_response_without_extra_requests(self):
+        responses = {
+            "/services/v2/deployments": self._payload("ServiceManager", "gg-legacy-01"),
+            "/services/v2/extracts": {"response": {"items": []}},
+            "/services/v2/replicats": {"response": {"items": []}},
+            "/services/v2/sources": {"response": {"items": []}},
+        }
+        requested = []
+
+        def _stub(url, opener, timeout=5):
+            requested.append(url)
+            return responses[url[len(self.BASE):]]
+        with mock.patch.object(core, "_http_json", side_effect=_stub):
+            discovery = core.discover_processes(self.BASE, MagicMock(), "gg-legacy-01")
+        self.assertEqual(discovery["registration"]["status"], "MATCH")
+        self.assertEqual(sorted(requested), sorted(self.BASE + p for p in responses))
+
 
 class AdminRestLivenessFailureTests(unittest.TestCase):
     """Admin REST /services/v2/deployments liveness failure: STATE#_deployment.processDiscovery must become UNAVAILABLE, and the failure log must be fully sanitized."""
 
     DEPLOYMENT = {
         "name": "gg-oracle-payments-01",
+        "oggDeploymentName": "gg-oracle-payments-01",
         "type": "oracle",
         "adminHost": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
         "adminPort": 8443,
@@ -1555,6 +1630,7 @@ class CriticalServiceCoverageTests(unittest.TestCase):
     def _run_tick(self, deployment_type, critical_services_config=_UNSET, cloudwatch_enabled=True):
         deployment = {
             "name": f"gg-{deployment_type}-payments-01",
+            "oggDeploymentName": f"gg-{deployment_type}-payments-01",
             "type": deployment_type,
             "adminHost": f"gg-{deployment_type}-payments-01.goldengate-dev.svc.cluster.local",
             "adminPort": 8443,
@@ -2684,6 +2760,7 @@ class PmsPollingLoopIntegrationTests(unittest.TestCase):
 
     DEPLOYMENT = {
         "name": "gg-oracle-payments-01",
+        "oggDeploymentName": "gg-oracle-payments-01",
         "type": "oracle",
         "adminHost": "gg-oracle-payments-01.goldengate-dev.svc.cluster.local",
         "adminPort": 8443,

@@ -174,6 +174,37 @@ deployments:
         self.assertEqual(doc["deployments"][0]["metricsPort"], 9999)
 
 
+class OggDeploymentNameConfigTests(unittest.TestCase):
+    def _load(self, extra_line=None):
+        content = VALID_DOC
+        if extra_line is not None:
+            content = content.replace("    ingressHost: gg-oracle-payments-01.goldengate-dev.adcbmis.local\n",
+                                      f"    ingressHost: gg-oracle-payments-01.goldengate-dev.adcbmis.local\n    {extra_line}\n")
+        target_dir = tempfile.mkdtemp()
+        write_deployments_yaml(target_dir, content)
+        return {d["name"]: d for d in cfgmod.load_deployments(target_dir)["deployments"]}
+
+    def test_absent_ogg_deployment_name_defaults_to_the_canonical_name(self):
+        self.assertEqual(self._load()["gg-oracle-payments-01"]["oggDeploymentName"], "gg-oracle-payments-01")
+
+    def test_explicit_retained_registration_name_is_carried(self):
+        loaded = self._load("oggDeploymentName: OracleSource")
+        self.assertEqual(loaded["gg-oracle-payments-01"]["oggDeploymentName"], "OracleSource")
+        self.assertEqual(loaded["gg-oracle-payments-01"]["adminHost"], "gg-oracle-payments-01.goldengate-dev.svc.cluster.local")
+
+    def test_invalid_ogg_deployment_name_fails(self):
+        for bad in ('"bad name"', '"1bad"', '"../x"', "ServiceManager", "7", "null", '""'):
+            with self.subTest(bad=bad), self.assertRaises(cfgmod.ConfigError):
+                self._load(f"oggDeploymentName: {bad}")
+
+    def test_real_registry_carries_the_model_resolved_names(self):
+        registry = yaml.safe_load(_generate_registry_document())
+        target_dir = tempfile.mkdtemp()
+        write_deployments_yaml(target_dir, yaml.safe_dump(registry))
+        loaded = {d["name"]: d["oggDeploymentName"] for d in cfgmod.load_deployments(target_dir)["deployments"]}
+        self.assertEqual(loaded, {e["name"]: e["oggDeploymentName"] for e in registry["deployments"]})
+
+
 class BuildLogicalPipelinesTests(unittest.TestCase):
     def test_groups_by_pipeline_and_role(self):
         deployments = [

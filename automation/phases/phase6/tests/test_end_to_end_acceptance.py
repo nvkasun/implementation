@@ -59,6 +59,7 @@ def _healthy_deployment_entry(name, deployment_type, has_processes=True, process
         "lease": {"holder": "gg-monitor-abc123", "expiresAt": 1_700_000_200, "fresh": True},
         "criticalServices": {"admin": True},
         "processDiscovery": process_discovery,
+        "registration": {"status": "MATCH", "expectedName": name, "registeredNames": [name]},
         "processes": processes if processes is not None else [],
     }
 
@@ -347,14 +348,14 @@ class EndToEndAcceptanceTests(unittest.TestCase):
         original_validate = gdm.validate
         try:
             fake_active = [{"deploymentId": SOURCE_ID, "deploymentType": "postgresql", "role": "source",
-                             "pipeline": "repltest-pg-to-mssql-001", "enabled": True}]
+                             "pipeline": "repltest-pg-to-mssql-001", "enabled": True, "oggDeploymentName": SOURCE_ID}]
             gdm.scan = lambda environment: (fake_active, [], [])
             gdm.validate = lambda environment: []
             result = e2e.load_active_deployments(ENVIRONMENT)
         finally:
             gdm.scan = original_scan
             gdm.validate = original_validate
-        self.assertEqual(result, [{"deploymentId": SOURCE_ID, "deploymentType": "postgresql"}])
+        self.assertEqual(result, [{"deploymentId": SOURCE_ID, "deploymentType": "postgresql", "oggDeploymentName": SOURCE_ID}])
         self.assertNotIn("replicationEnabled", result[0])
         self.assertNotIn("replication", result[0])
 
@@ -524,6 +525,57 @@ class MalformedSchemaFailClosedTests(unittest.TestCase):
         doc["deployments"][1]["processes"] = []
         result = e2e.classify(ENVIRONMENT, _active_deployments(), doc)
         self.assertEqual(result["state"], e2e.STATE_HEALTHY, result["reasons"])
+
+
+class RegistrationAcceptanceTests(unittest.TestCase):
+    """A runtime is only accepted when its live Service Manager registration matches the descriptor's GoldenGate deployment name."""
+
+    def _active(self, source_ogg=SOURCE_ID):
+        active = _active_deployments()
+        active[0]["oggDeploymentName"] = source_ogg
+        active[1]["oggDeploymentName"] = TARGET_ID
+        return active
+
+    def _doc(self, source_registration):
+        doc = _healthy_api_doc()
+        if source_registration is _MISSING:
+            del doc["deployments"][0]["registration"]
+        else:
+            doc["deployments"][0]["registration"] = source_registration
+        return doc
+
+    def test_retained_registration_name_matching_is_healthy(self):
+        registration = {"status": "MATCH", "expectedName": "LegacySource", "registeredNames": ["LegacySource"]}
+        result = e2e.classify(ENVIRONMENT, self._active("LegacySource"), self._doc(registration))
+        self.assertEqual(result["reasons"], [])
+
+    def test_mismatch_is_broken_and_names_both_sides(self):
+        registration = {"status": "MISMATCH", "expectedName": SOURCE_ID, "registeredNames": ["gg-postgresql-repltest-1"]}
+        result = e2e.classify(ENVIRONMENT, self._active(), self._doc(registration))
+        _assert_broken(self, result, "GoldenGate registration status='MISMATCH'")
+        self.assertTrue(any("gg-postgresql-repltest-1" in r for r in result["reasons"]))
+
+    def test_unavailable_registration_is_broken(self):
+        registration = {"status": "UNAVAILABLE", "expectedName": SOURCE_ID, "registeredNames": []}
+        _assert_broken(self, e2e.classify(ENVIRONMENT, self._active(), self._doc(registration)), "status='UNAVAILABLE'")
+
+    def test_registration_checked_against_a_different_expected_name_is_broken(self):
+        # The monitor's registry and the current descriptor disagree (e.g. a stale monitor rollout).
+        registration = {"status": "MATCH", "expectedName": SOURCE_ID, "registeredNames": [SOURCE_ID]}
+        _assert_broken(self, e2e.classify(ENVIRONMENT, self._active("LegacySource"), self._doc(registration)), "registration.expectedName")
+
+    def test_missing_or_malformed_registration_is_broken(self):
+        for raw in (_MISSING, None, "MATCH", ["MATCH"]):
+            with self.subTest(raw=raw):
+                _assert_broken(self, e2e.classify(ENVIRONMENT, self._active(), self._doc(raw)), "registration")
+
+    def test_load_active_deployments_carries_the_real_registered_names(self):
+        result = {d["deploymentId"]: d["oggDeploymentName"] for d in e2e.load_active_deployments(ENVIRONMENT)}
+        self.assertEqual(result.get("gg-postgresql-repltest-001"), "gg-postgresql-repltest-01")
+        self.assertEqual(result.get("gg-oracle-repltest-002"), "gg-oracle-repltest-01")
+
+
+_MISSING = object()
 
 
 class EndToEndAcceptanceNoIOTests(unittest.TestCase):

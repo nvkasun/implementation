@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets as _secrets
 import socket
 import ssl
@@ -246,6 +247,40 @@ _KNOWN_PROCESS_STATUSES = ("RUNNING", "STOPPED", "ABENDED")
 _INCOMPLETE_DISCOVERY_STATUSES = ("PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE")
 _VALID_ENDPOINT_STATUSES = ("OK", "EMPTY")
 
+# Service Manager registration check: the registered GoldenGate deployment name must equal the registry's oggDeploymentName.
+REGISTRATION_STATUSES = ("MATCH", "MISMATCH", "UNAVAILABLE")
+_OGG_DEPLOYMENT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}\Z")
+MAX_REPORTED_REGISTRATIONS = 10
+
+
+def registered_deployment_names(payload):
+    """Sorted registered deployment names from GET /services/v2/deployments (ServiceManager excluded); None when the payload is not a valid collection."""
+    response = payload.get("response") if isinstance(payload, dict) else None
+    items = response.get("items") if isinstance(response, dict) else None
+    if not isinstance(items, list):
+        return None
+    names = set()
+    for item in items:
+        name = item.get("name") if isinstance(item, dict) else None
+        if isinstance(name, str) and _OGG_DEPLOYMENT_NAME_RE.match(name) and name.lower() != "servicemanager":
+            names.add(name)
+    return sorted(names)
+
+
+def classify_registration(expected_name, payload):
+    names = registered_deployment_names(payload)
+    if names is None:
+        status, names = "UNAVAILABLE", []
+    elif expected_name in names:
+        status = "MATCH"
+    else:
+        status = "MISMATCH"
+    return {"status": status, "expectedName": expected_name, "registeredNames": names[:MAX_REPORTED_REGISTRATIONS]}
+
+
+def _unavailable_registration(expected_name):
+    return {"status": "UNAVAILABLE", "expectedName": expected_name, "registeredNames": []}
+
 MAX_PROCESS_NAME_LENGTH = 128
 _PROCESS_CONTROL_CHARS = frozenset(chr(c) for c in list(range(0x00, 0x20)) + [0x7f])
 
@@ -361,9 +396,9 @@ def discovery_counts(procs):
     return counts
 
 
-def discover_processes(base, opener):
+def discover_processes(base, opener, expected_ogg_deployment_name=None):
     """Structured Extract/Replicat/Distribution discovery that distinguishes a valid empty inventory from a failed one."""
-    _http_json(f"{base}/services/v2/deployments", opener)  # liveness probe; a failure aborts discovery for this tick
+    deployments_payload = _http_json(f"{base}/services/v2/deployments", opener)  # liveness probe; a failure aborts discovery for this tick
 
     seen = set()
     detail_failures = [0]
@@ -416,6 +451,7 @@ def discover_processes(base, opener):
         combined = "UNAVAILABLE"
 
     return {
+        "registration": classify_registration(expected_ogg_deployment_name, deployments_payload),
         "processes": processes,
         "status": combined,
         "collectedAt": cfgmod.now_epoch(),
@@ -979,6 +1015,9 @@ def write_process_state(table, mgr, pipeline, deployment_type, process, snapshot
     if "processDiscovery" in snapshot:
         sets.append("processDiscovery=:pd")
         vals[":pd"] = _ddb_safe(snapshot.get("processDiscovery") or {})
+    if "registration" in snapshot:
+        sets.append("registration=:reg")
+        vals[":reg"] = _ddb_safe(snapshot.get("registration") or {})
     if counters is not None:
         for key in ("consecutiveAbends", "lastAbendAt", "nextRecheckAt"):
             sets.append(f"{key}=:{key}")
@@ -1043,6 +1082,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
 
     base = f"https://{deployment['adminHost']}:{deployment['adminPort']}"
     tls_server_name = deployment["tlsServerName"]
+    expected_ogg_deployment_name = deployment["oggDeploymentName"]
     user_file, pwd_file = cfgmod.credential_paths(pipeline)
 
     def _guarded_write(proc, snap, counters=None):
@@ -1090,7 +1130,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             opener = _basic_opener(user, pwd, base, ssl_ctx, tls_server_name)
 
             try:
-                discovery = discover_processes(base, opener)
+                discovery = discover_processes(base, opener, expected_ogg_deployment_name)
             except Exception as e:
                 in_grace = (cfgmod.now_epoch() - started) < cfg["startupGraceSeconds"]
                 status = "STARTING" if in_grace else "DEPLOYMENT_DOWN"
@@ -1101,6 +1141,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 # PMS isn't attempted here; always overwrite any stale pms/processDiscovery map with a current UNAVAILABLE snapshot.
                 dep_snap["pms"] = _pms_unavailable_snapshot("ENDPOINT_UNAVAILABLE")
                 dep_snap["processDiscovery"] = _unavailable_discovery_snapshot()
+                dep_snap["registration"] = _unavailable_registration(expected_ogg_deployment_name)
                 if transitioned:
                     dep_snap["lastTransitionAt"] = cfgmod.now_epoch()
                 _guarded_write("_deployment", dep_snap)
@@ -1121,6 +1162,15 @@ def polling_loop(deployment, table, mgr, state, stop_event):
 
             procs = discovery["processes"]
             log_discovery_summary(pipeline, discovery)
+            registration = discovery.get("registration") or _unavailable_registration(expected_ogg_deployment_name)
+            if registration["status"] != "MATCH":
+                logger.warning(json.dumps({
+                    "event": "deployment_registration_mismatch",
+                    "deployment": pipeline,
+                    "registrationStatus": registration["status"],
+                    "expectedName": registration["expectedName"],
+                    "registeredNames": registration["registeredNames"],
+                }))
             process_inventory_complete = discovery["status"] in _VALID_ENDPOINT_STATUSES
             source_active = any(p["type"] == "extract" and p["status"] == "RUNNING" for p in procs)
 
@@ -1183,7 +1233,8 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             transitioned = ("UP" != last_dep_status)
             dep_snap = {"processType": "deployment", "status": "UP",
                         "recordedAt": cfgmod.now_epoch(), "criticalServices": cs_new,
-                        "pms": pms_result, "processDiscovery": discovery_snapshot}
+                        "pms": pms_result, "processDiscovery": discovery_snapshot,
+                        "registration": registration}
             if transitioned:
                 dep_snap["lastTransitionAt"] = cfgmod.now_epoch()
             _guarded_write("_deployment", dep_snap)

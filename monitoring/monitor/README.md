@@ -32,6 +32,24 @@ result. One structured, non-sensitive `process_discovery_summary` log line
 (deployment name + per-type counts only, never the raw payload) is emitted
 per deployment tick.
 
+## Deployment registration check
+
+The existing `/services/v2/deployments` liveness response is also compared
+with the registry's `oggDeploymentName` (the descriptor's
+`runtime.ogg.deploymentName`, else the canonical deployment ID). The result is
+stored as `STATE#_deployment.registration` and exposed by `/api/status` and
+`/api/processes` as `{status, expectedName, registeredNames}`:
+
+- `MATCH`: the Service Manager has that deployment registered.
+- `MISMATCH`: it does not. Service Manager links (`/services/<registered>/...`)
+  will not reach this runtime's services. A `deployment_registration_mismatch`
+  warning is logged.
+- `UNAVAILABLE`: the response was missing or malformed.
+
+Only `MATCH` passes Phase 6 end-to-end acceptance. No extra request is made,
+and alerts and CloudWatch metrics are unchanged. See
+"GoldenGate deployment identity" in the repository README.
+
 ## Production PMS collection
 
 Once per successful leader tick, `collector.collect_pms` reuses the same
@@ -341,6 +359,14 @@ metadata only (top-level keys, per-collection item count, field names,
 field JSON types) -- never a raw field value, process name, status value,
 ID, credential, or secret path. It never writes DynamoDB, never calls
 CloudWatch, and only accepts paths beginning with `/services/`.
+
+`--check-routing` (admin port only) requests
+`/services/<oggDeploymentName>/{adminsrvr,distsrvr,recvsrvr,pmsrvr}/v2/content/`
+and, when different, the same paths under the canonical deployment ID. Each
+result is `ROUTED` only for a 2xx response without `OGG-12031` that differs
+from the response for a random, unregistered deployment name. Response bodies
+are hashed or searched, never printed. The exit code is 0 only when every
+registered-name route is `ROUTED`.
 
 ### Confirmed secure PMS routes (live-environment verified)
 

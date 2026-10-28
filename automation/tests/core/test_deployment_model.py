@@ -1717,6 +1717,99 @@ class ChartOwnedVsExternalU02ClaimTests(ScratchEnvironmentTestCase):
         self.assertEqual(d["u02EffectivePvcName"], "external-claim-01")
 
 
+def _ogg_doc(deployment_type="oracle", pipeline="test-pipeline-001", role="source", ogg=None, existing_claim=None):
+    doc = _minimal_shape_doc()
+    doc["deployment"].update({"pipeline": pipeline, "role": role})
+    doc["runtime"].update({"deploymentType": deployment_type, "containerName": f"ogg-{deployment_type}",
+                           "image": {"repositoryName": f"ogg-{deployment_type}", "tag": "1.0.0"}})
+    if ogg is not None:
+        doc["runtime"]["ogg"] = ogg
+    if existing_claim is not None:
+        doc["runtime"]["storage"] = {"u02": {"type": "existingClaim", "existingClaim": existing_claim}}
+    return doc
+
+
+class OggDeploymentNameTests(ScratchEnvironmentTestCase):
+    """runtime.ogg.deploymentName: the GoldenGate Service Manager registered name, defaulting to the canonical deployment ID."""
+
+    def _scan(self, environment="dev"):
+        return gdm.scan(environment)
+
+    def _single(self, deployment_id, doc, environment="dev"):
+        write_doc(self._tmp.name, environment, deployment_id, doc)
+        active, inactive, invalid = self._scan(environment)
+        self.assertEqual(invalid, [])
+        return {d["deploymentId"]: d for d in active + inactive}[deployment_id]
+
+    def _reason(self, deployment_id, doc):
+        write_doc(self._tmp.name, "dev", deployment_id, doc)
+        _active, _inactive, invalid = self._scan()
+        self.assertEqual(len(invalid), 1)
+        return invalid[0][1]
+
+    def test_new_runtime_defaults_to_its_canonical_id(self):
+        d = self._single("gg-oracle-ledger-001", _ogg_doc())
+        self.assertEqual(d["oggDeploymentName"], "gg-oracle-ledger-001")
+
+    def test_explicit_name_equal_to_the_canonical_id_is_accepted_without_existing_claim(self):
+        d = self._single("gg-oracle-ledger-001", _ogg_doc(ogg={"deploymentName": "gg-oracle-ledger-001"}))
+        self.assertEqual(d["oggDeploymentName"], "gg-oracle-ledger-001")
+
+    def test_empty_or_null_name_means_the_canonical_id(self):
+        for value in ("", None):
+            with self.subTest(value=value):
+                d = self._single("gg-oracle-ledger-001", _ogg_doc(ogg={"deploymentName": value}))
+                self.assertEqual(d["oggDeploymentName"], "gg-oracle-ledger-001")
+
+    def test_retained_registration_name_is_accepted_with_existing_claim(self):
+        for legacy in ("gg-oracle-ledger-01", "LedgerSource", "Ledger_Source-A", "x"):
+            with self.subTest(legacy=legacy):
+                d = self._single("gg-oracle-ledger-001", _ogg_doc(ogg={"deploymentName": legacy}, existing_claim="retained-u02-claim"))
+                self.assertEqual(d["oggDeploymentName"], legacy)
+                self.assertEqual(d["u02EffectivePvcName"], "retained-u02-claim")
+
+    def test_differing_name_without_existing_claim_is_rejected(self):
+        reason = self._reason("gg-oracle-ledger-001", _ogg_doc(ogg={"deploymentName": "gg-oracle-ledger-01"}))
+        self.assertIn("existingClaim", reason)
+
+    def test_invalid_names_are_rejected_without_echoing_them(self):
+        bad = ("1ledger", "-ledger", "ledger source", "ledger/../x", "ledger;id", "$(id)", "${X}", "a" * 64, "ServiceManager", "servicemanager",
+               "ledger.source", 7, True, ["x"], {"x": 1})
+        for value in bad:
+            with self.subTest(value=value):
+                reason = self._reason("gg-oracle-ledger-001", _ogg_doc(ogg={"deploymentName": value}, existing_claim="retained-u02-claim"))
+                self.assertIn("runtime.ogg.deploymentName", reason)
+                if isinstance(value, str):
+                    self.assertNotIn(value, reason)
+
+    def test_non_mapping_ogg_is_rejected(self):
+        self.assertIn("runtime.ogg", self._reason("gg-oracle-ledger-001", _ogg_doc(ogg="gg-oracle-ledger-01")))
+
+    def test_multiple_independent_runtimes_resolve_independently(self):
+        write_doc(self._tmp.name, "dev", "gg-postgresql-ledger-007", _ogg_doc("postgresql", "ledger-sync-007", "source"))
+        write_doc(self._tmp.name, "dev", "gg-mssql-ledger-007", _ogg_doc("mssql", "ledger-sync-007", "target", ogg={"deploymentName": "LedgerTarget"}, existing_claim="retained-target-u02"))
+        self.assertEqual(gdm.validate("dev"), [])
+        registry = {e["name"]: e for e in gdm.build_registry("dev")["deployments"]}
+        self.assertEqual(registry["gg-postgresql-ledger-007"]["oggDeploymentName"], "gg-postgresql-ledger-007")
+        self.assertEqual(registry["gg-mssql-ledger-007"]["oggDeploymentName"], "LedgerTarget")
+
+    def test_colliding_registered_names_are_a_validation_problem(self):
+        write_doc(self._tmp.name, "dev", "gg-postgresql-ledger-007", _ogg_doc("postgresql", "ledger-sync-007", "source", ogg={"deploymentName": "Ledger"}, existing_claim="claim-a"))
+        write_doc(self._tmp.name, "dev", "gg-mssql-ledger-007", _ogg_doc("mssql", "ledger-sync-007", "target", ogg={"deploymentName": "LEDGER"}, existing_claim="claim-b"))
+        self.assertTrue(any("GoldenGate deployment name collision" in p for p in gdm.validate("dev")))
+
+    def test_registered_name_equal_to_another_runtime_id_is_a_validation_problem(self):
+        write_doc(self._tmp.name, "dev", "gg-postgresql-ledger-007", _ogg_doc("postgresql", "ledger-sync-007", "source"))
+        write_doc(self._tmp.name, "dev", "gg-mssql-ledger-007", _ogg_doc("mssql", "ledger-sync-007", "target", ogg={"deploymentName": "gg-postgresql-ledger-007"}, existing_claim="claim-b"))
+        self.assertTrue(any("equals another runtime's deployment ID" in p or "collision" in p for p in gdm.validate("dev")))
+
+    def test_future_environment_engine_and_pipeline_need_no_code_change(self):
+        ensure_scratch_environment_yaml(self._tmp.name, "uat2")
+        d = self._single("ogg-db2-settlement-123", _ogg_doc("db2", "settlement-feed-123", "source"), environment="uat2")
+        self.assertEqual(d["oggDeploymentName"], "ogg-db2-settlement-123")
+        self.assertEqual(d["environment"], "uat2")
+
+
 class RealRepositoryChartOwnedVsExternalU02ClaimTests(unittest.TestCase):
     """Exercised against the real, live envs/dev descriptors -- no scratch root (mirrors RealRepositoryDescriptorTests' own convention above)."""
 
@@ -1736,6 +1829,21 @@ class RealRepositoryChartOwnedVsExternalU02ClaimTests(unittest.TestCase):
             self.assertEqual(d["u02ExistingClaim"], expected_old_pvc, deployment_id)
             self.assertEqual(d["u02EffectivePvcName"], expected_old_pvc, deployment_id)
             self.assertFalse(d["u02ChartOwnsPvc"], deployment_id)
+
+    def test_the_four_real_migration_descriptors_keep_their_retained_goldengate_registration(self):
+        real_active, real_inactive, real_invalid = gdm.scan("dev")
+        self.assertEqual(real_invalid, [])
+        by_id = {d["deploymentId"]: d for d in real_active + real_inactive}
+        expected = {
+            "gg-postgresql-repltest-001": "gg-postgresql-repltest-01",
+            "gg-mssql-repltest-001": "gg-mssql-repltest-01",
+            "gg-oracle-repltest-002": "gg-oracle-repltest-01",
+            "gg-postgresql-repltest-002": "gg-postgresql-repltest-02",
+        }
+        for deployment_id, registered in expected.items():
+            self.assertEqual(by_id[deployment_id]["oggDeploymentName"], registered, deployment_id)
+        registry = {e["name"]: e["oggDeploymentName"] for e in gdm.build_registry("dev")["deployments"]}
+        self.assertEqual({k: registry[k] for k in expected}, expected)
 
 
 if __name__ == "__main__":

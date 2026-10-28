@@ -70,6 +70,23 @@ is only an escape hatch, never required.
 {{- end }}
 {{- end }}
 
+{{- /*
+GoldenGate registered deployment name (OGG_DEPLOYMENT): runtime.ogg.deploymentName
+when set, else the runtime name. A different name is only accepted on retained /u02
+state (existingClaim) registered before the current runtime identity.
+*/ -}}
+{{- define "goldengate.oggDeploymentName" -}}
+{{- $runtimeName := include "goldengate.runtimeName" . -}}
+{{- $name := (.Values.runtime.ogg).deploymentName | default $runtimeName | toString -}}
+{{- if or (not (regexMatch "^[A-Za-z][A-Za-z0-9_-]{0,62}$" $name)) (eq (lower $name) "servicemanager") -}}
+{{- fail "runtime.ogg.deploymentName must start with a letter, contain only letters, digits, '-' or '_', be at most 63 characters, and not be a reserved GoldenGate name." -}}
+{{- end -}}
+{{- if and (ne $name $runtimeName) (not .Values.runtime.storage.u02.existingClaim) -}}
+{{- fail "runtime.ogg.deploymentName may differ from the runtime name only when runtime.storage.u02.existingClaim attaches retained /u02 state registered under that name." -}}
+{{- end -}}
+{{- $name -}}
+{{- end }}
+
 {{- define "goldengate.runtimeIngressHost" -}}
 {{- if .Values.ingress.host }}
 {{- .Values.ingress.host -}}

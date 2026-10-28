@@ -354,6 +354,9 @@ def _check_statefulset_and_pod_shape(run, reasons, deployment_id, runtime_namesp
             set(descriptor.get("extraVolumeMountNames") or []),
         )
         _check_container_ports(reasons, f"statefulset/{deployment_id} container {descriptor['containerName']!r}", container, expected_container_ports)
+        ogg_deployment_values = [e.get("value") for e in (container.get("env") or []) if isinstance(e, dict) and e.get("name") == "OGG_DEPLOYMENT"]
+        if ogg_deployment_values != [descriptor["oggDeploymentName"]]:
+            reasons.append(f"statefulset/{deployment_id} container {descriptor['containerName']!r} OGG_DEPLOYMENT={ogg_deployment_values!r}, expected exactly [{descriptor['oggDeploymentName']!r}] (the GoldenGate registered deployment name)")
 
     if descriptor["initPermissionsEnabled"]:
         if len(init_containers) != 1:

@@ -4149,6 +4149,7 @@ def make_existing_fixture(src_path, dst_path, fs_id):
     data['persistence']['efs']['mode'] = 'existing'
     data['persistence']['efs']['fileSystemId'] = fs_id
     data['runtime']['storage']['u02']['existingClaim'] = ''
+    data['runtime'].pop('ogg', None)  # a chart-owned /u02 starts a fresh GoldenGate registration under the runtime ID
     with open(dst_path, 'w') as f:
         yaml.dump(data, f)
 
@@ -4256,6 +4257,7 @@ with open('envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-00
 default_doc = yaml.safe_load(yaml.dump(base))
 default_doc['runtime']['storage']['u02']['claimName'] = ''
 default_doc['runtime']['storage']['u02']['existingClaim'] = ''
+default_doc['runtime'].pop('ogg', None)  # a chart-owned /u02 starts a fresh GoldenGate registration under the runtime ID
 with open('${CLAIM_WORKDIR}/values/default.yaml', 'w') as f:
     yaml.dump(default_doc, f)
 
@@ -4263,6 +4265,7 @@ with open('${CLAIM_WORKDIR}/values/default.yaml', 'w') as f:
 custom_claim_doc = yaml.safe_load(yaml.dump(base))
 custom_claim_doc['runtime']['storage']['u02']['claimName'] = 'custom-owned-claim-for-render-test'
 custom_claim_doc['runtime']['storage']['u02']['existingClaim'] = ''
+custom_claim_doc['runtime'].pop('ogg', None)  # a chart-owned /u02 starts a fresh GoldenGate registration under the runtime ID
 with open('${CLAIM_WORKDIR}/values/custom-claim.yaml', 'w') as f:
     yaml.dump(custom_claim_doc, f)
 
@@ -18167,7 +18170,7 @@ DESCRIPTOR = {
     "tlsSecretName": "dev/goldengate/tls-certificate", "runtimeServiceAccountName": "gg-runtime-sa",
     "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
     "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
-    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
+    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None, "oggDeploymentName": DEPLOYMENT_ID_VALUE,
     "valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
 }
 
@@ -18991,7 +18994,7 @@ DESCRIPTOR = {
     "tlsSecretName": "dev/goldengate/tls-certificate", "runtimeServiceAccountName": "gg-runtime-sa",
     "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
     "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
-    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
+    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None, "oggDeploymentName": DEPLOYMENT_ID_VALUE,
     "valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
 }
 
@@ -19235,7 +19238,7 @@ DESCRIPTOR = {
     "tlsSecretName": "dev/goldengate/tls-certificate", "runtimeServiceAccountName": "gg-runtime-sa",
     "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
     "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
-    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
+    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None, "oggDeploymentName": DEPLOYMENT_ID_VALUE,
     "valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
 }
 

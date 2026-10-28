@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import posixpath
+import secrets
 import socket
 import ssl
 import sys
@@ -535,6 +537,88 @@ def follow_processes(deployment, detail, timeout=PROBE_TIMEOUT_SECONDS,
     }
 
 
+# --check-routing: Service Manager links are /services/<registered deployment name>/<service>/...; each must reach that deployment's own service.
+ROUTED_SERVICES = ("adminsrvr", "distsrvr", "recvsrvr", "pmsrvr")
+ROUTE_CONTENT_SUFFIX = "v2/content/"
+OGG_RESOURCE_NOT_FOUND = b"OGG-12031"
+ROUTE_RESULTS = ("ROUTED", "WRONG_RESOURCE", "INDISTINGUISHABLE", "AUTH_FAILED", "TLS_FAILED", "NOT_FOUND", "ENDPOINT_UNAVAILABLE", "UNEXPECTED_RESPONSE", "UNKNOWN")
+
+
+def route_path(ogg_deployment_name, service):
+    if not collector._OGG_DEPLOYMENT_NAME_RE.match(ogg_deployment_name or "") or service not in ROUTED_SERVICES:
+        raise ProbeValidationError("invalid GoldenGate deployment name or service for a route check")
+    return f"/services/{ogg_deployment_name}/{service}/{ROUTE_CONTENT_SUFFIX}"
+
+
+def _fetch_bounded(deployment, path, timeout=PROBE_TIMEOUT_SECONDS):
+    """One authenticated read-only GET through the admin listener; returns (http_status, body_bytes) for any HTTP response, raises ProbeRequestError otherwise. The body is only ever hashed or searched, never printed."""
+    base = _port_and_base(deployment, "admin")
+    user_file, pwd_file = cfgmod.credential_paths(deployment["name"])
+    user = collector._read_secret_file(user_file)
+    pwd = collector._read_secret_file(pwd_file)
+    if not user or not pwd:
+        raise ProbeValidationError("admin credentials unavailable")
+    try:
+        ssl_ctx = collector._build_ssl_context()
+    except RuntimeError:
+        raise ProbeValidationError("TLS trust bundle unavailable")
+    opener = collector._basic_opener(user, pwd, base, ssl_ctx, deployment["tlsServerName"])
+    try:
+        with opener.open(f"{base}{path}", timeout=timeout) as resp:
+            return resp.status, resp.read(MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(MAX_RESPONSE_BYTES + 1)
+        except Exception:
+            body = b""
+        return e.code, body
+    except Exception as e:
+        raise ProbeRequestError(_classify_request_error(e))
+
+
+def classify_route(http_status, body, control_status, control_body):
+    """ROUTED only for a 2xx, non-oversized response without OGG-12031 that differs from the response for a deliberately unregistered deployment name."""
+    if len(body) > MAX_RESPONSE_BYTES:
+        return "UNEXPECTED_RESPONSE"
+    if OGG_RESOURCE_NOT_FOUND in body:
+        return "WRONG_RESOURCE"
+    if http_status in (401, 403):
+        return "AUTH_FAILED"
+    if http_status == 404:
+        return "NOT_FOUND"
+    if http_status is None or not 200 <= http_status < 300:
+        return "ENDPOINT_UNAVAILABLE" if (http_status or 0) >= 500 else "UNKNOWN"
+    if control_status == http_status and hashlib.sha256(control_body).digest() == hashlib.sha256(body).digest():
+        return "INDISTINGUISHABLE"
+    return "ROUTED"
+
+
+def check_routing(deployment, fetch=None):
+    """Probes every service under the registered GoldenGate name (must route) and, when different, the canonical runtime name (reported for comparison only)."""
+    fetch = fetch or _fetch_bounded
+    registered = deployment["oggDeploymentName"]
+    names = [("registered", registered)]
+    if deployment["name"] != registered:
+        names.append(("canonical", deployment["name"]))
+    control_name = f"route-probe-unregistered-{secrets.token_hex(6)}"
+    results = []
+    for service in ROUTED_SERVICES:
+        try:
+            control_status, control_body = fetch(deployment, route_path(control_name, service))
+        except ProbeRequestError:
+            control_status, control_body = None, b""
+        for kind, name in names:
+            path = route_path(name, service)
+            try:
+                status, body = fetch(deployment, path)
+                result = classify_route(status, body, control_status, control_body)
+            except ProbeRequestError as e:
+                status, result = e.http_status, e.category
+            results.append({"service": service, "nameKind": kind, "oggDeploymentName": name, "path": path, "httpStatus": status, "result": result})
+    routed = all(r["result"] == "ROUTED" for r in results if r["nameKind"] == "registered")
+    return {"deploymentName": deployment["name"], "oggDeploymentName": registered, "allRegisteredRoutesRouted": routed, "routes": results}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Read-only GoldenGate Admin/Metrics REST contract probe (structural metadata only).")
@@ -554,7 +638,24 @@ def main(argv=None):
                                  MAX_FOLLOWED_PROCESSES))
     parser.add_argument("--detail", choices=DETAIL_ENDPOINTS,
                         help="required with --follow-processes: fixed detail endpoint to capture")
+    parser.add_argument("--check-routing", action="store_true", dest="check_routing",
+                        help="verify /services/<registered name>/{%s}/%s routes to this deployment's own services "
+                             "(read-only; requires --port admin; never prints response bodies)" % (
+                                 ",".join(ROUTED_SERVICES), ROUTE_CONTENT_SUFFIX))
     args = parser.parse_args(argv)
+
+    if args.check_routing:
+        if args.path or args.follow_processes or args.port != "admin":
+            print(json.dumps({"error": "INVALID_ARGUMENT",
+                              "reason": "--check-routing requires --port admin and is not used with --path/--follow-processes"}), file=sys.stderr)
+            return 2
+        try:
+            result = check_routing(resolve_deployment(args.deployment))
+        except ProbeValidationError as e:
+            print(json.dumps({"error": "INVALID_ARGUMENT", "reason": str(e)}), file=sys.stderr)
+            return 2
+        print(json.dumps(result, indent=2))
+        return 0 if result["allRegisteredRoutesRouted"] else 1
 
     if args.follow_processes:
         if args.path:

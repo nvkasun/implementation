@@ -936,6 +936,50 @@ class CriticalServiceNormalizationTests(unittest.TestCase):
 DISCOVERY_STATUSES_UNDER_TEST = ("OK", "EMPTY", "PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE", "MADE_UP")
 
 
+class RegistrationViewTests(unittest.TestCase):
+    """STATE#_deployment.registration exposed by /api/status and /api/processes, always re-checked against the current registry name."""
+
+    NOW = 1780000010
+    META = {"name": "gg-oracle-payments-001", "type": "oracle", "enabled": True, "oggDeploymentName": "gg-oracle-payments-01"}
+
+    def _registration(self, raw):
+        item = make_deployment_state_item(pipeline="gg-oracle-payments-001", recorded_at=self.NOW - 5)
+        if raw is not None:
+            item["registration"] = raw
+        table = FakeTable([item])
+        status_view = monitor.read_runtime_view(table, "source", "gg-oracle-payments-001", self.META, now=self.NOW, stale_after_seconds=120)
+        processes_view = monitor.read_deployment_processes_view(table, self.META, now=self.NOW, stale_after_seconds=120)
+        self.assertEqual(status_view["registration"], processes_view["registration"])
+        return status_view["registration"]
+
+    def test_match_passes_through(self):
+        raw = {"status": "MATCH", "expectedName": "gg-oracle-payments-01", "registeredNames": ["gg-oracle-payments-01"]}
+        self.assertEqual(self._registration(raw), raw)
+
+    def test_mismatch_passes_through(self):
+        raw = {"status": "MISMATCH", "expectedName": "gg-oracle-payments-01", "registeredNames": ["Other"]}
+        self.assertEqual(self._registration(raw)["status"], "MISMATCH")
+
+    def test_stale_match_for_a_different_expected_name_is_a_mismatch(self):
+        raw = {"status": "MATCH", "expectedName": "gg-oracle-payments-001", "registeredNames": ["gg-oracle-payments-001"]}
+        out = self._registration(raw)
+        self.assertEqual(out["status"], "MISMATCH")
+        self.assertEqual(out["expectedName"], "gg-oracle-payments-01")
+
+    def test_missing_or_malformed_registration_is_unavailable(self):
+        for raw in (None, "MATCH", [], {"status": "BOGUS"}, {"status": None}):
+            with self.subTest(raw=raw):
+                self.assertEqual(self._registration(raw)["status"], "UNAVAILABLE")
+
+    def test_unsafe_registered_names_are_dropped(self):
+        raw = {"status": "MISMATCH", "expectedName": "gg-oracle-payments-01", "registeredNames": ["<script>", 7, None, "Good_Name"]}
+        self.assertEqual(self._registration(raw)["registeredNames"], ["Good_Name"])
+
+    def test_missing_state_record_reports_unavailable(self):
+        out = monitor.read_runtime_view(FakeTable([]), "source", "gg-oracle-payments-001", self.META, now=self.NOW, stale_after_seconds=120)
+        self.assertEqual(out["registration"], {"status": "UNAVAILABLE", "expectedName": "gg-oracle-payments-01", "registeredNames": []})
+
+
 class NormalizeProcessDiscoveryTests(unittest.TestCase):
     """normalize_process_discovery: strict, additive, fail-closed normalization of STATE#_deployment.processDiscovery."""
 

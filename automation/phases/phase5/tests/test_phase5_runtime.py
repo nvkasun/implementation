@@ -158,6 +158,7 @@ DESCRIPTOR = {
     "efsMode": None,
     "efsFileSystemId": None,
     "efsCreationToken": None,
+    "oggDeploymentName": DEPLOYMENT_ID,
 }
 
 
@@ -566,8 +567,10 @@ TARGET_NAMESPACE = "goldengate-dev"
 
 def _statefulset(container_name="goldengate", image=EXPECTED_IMAGE, init_names=(phase5_runtime.INIT_CONTAINER_NAME,),
                   init_image=EXPECTED_IMAGE, sa_name="gg-runtime-sa", namespace=TARGET_NAMESPACE, extra_containers=None,
-                  init_script='rm -f -- "$SERVICE_MANAGER_PID_FILE" # ServiceManager.pid cleanup'):
-    containers = [{"name": container_name, "image": image}]
+                  init_script='rm -f -- "$SERVICE_MANAGER_PID_FILE" # ServiceManager.pid cleanup', ogg_deployment=DEPLOYMENT_ID):
+    containers = [{"name": container_name, "image": image, "env": [
+        {"name": "OGG_DEPLOYMENT", "value": ogg_deployment},
+        {"name": "OGG_DOMAIN", "value": f"{DEPLOYMENT_ID}.{namespace}.svc.cluster.local"}]}]
     if extra_containers:
         containers.extend(extra_containers)
     init_containers = []
@@ -847,6 +850,146 @@ class RealRuntimeInitContainerRenderTests(unittest.TestCase):
                 proc = self._render(values_file, ("--set-string", f"runtime.initPermissions.mode={mode}"))
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("runtime.initPermissions.mode", proc.stderr)
+
+
+class OggDeploymentIdentityValidationTests(unittest.TestCase):
+    def _docs(self, env):
+        sts = _statefulset()
+        sts["spec"]["template"]["spec"]["containers"][0]["env"] = env
+        return [sts]
+
+    def _domain(self):
+        return {"name": "OGG_DOMAIN", "value": f"{DEPLOYMENT_ID}.{TARGET_NAMESPACE}.svc.cluster.local"}
+
+    def test_matching_registered_name_passes(self):
+        with redirect_stdout(io.StringIO()):
+            phase5_runtime._validate_ogg_deployment_identity([_statefulset(ogg_deployment="LegacyName")], DEPLOYMENT_ID, TARGET_NAMESPACE, "LegacyName")
+
+    def test_mismatched_missing_or_duplicated_ogg_deployment_fails(self):
+        cases = {
+            "mismatch": [{"name": "OGG_DEPLOYMENT", "value": DEPLOYMENT_ID}, self._domain()],
+            "missing": [self._domain()],
+            "duplicated": [{"name": "OGG_DEPLOYMENT", "value": "LegacyName"}, {"name": "OGG_DEPLOYMENT", "value": "LegacyName"}, self._domain()],
+        }
+        for label, env in cases.items():
+            with self.subTest(label=label), self.assertRaises(phase5_runtime.Phase5Error):
+                phase5_runtime._validate_ogg_deployment_identity(self._docs(env), DEPLOYMENT_ID, TARGET_NAMESPACE, "LegacyName")
+
+    def test_non_canonical_ogg_domain_fails(self):
+        env = [{"name": "OGG_DEPLOYMENT", "value": DEPLOYMENT_ID}, {"name": "OGG_DOMAIN", "value": "legacy-name.goldengate-dev.svc.cluster.local"}]
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_ogg_deployment_identity(self._docs(env), DEPLOYMENT_ID, TARGET_NAMESPACE, DEPLOYMENT_ID)
+
+    def test_resolved_inputs_carry_the_descriptor_ogg_deployment_name(self):
+        resolved = _resolved_inputs(_resolved_state_fixture(), descriptor=_descriptor(oggDeploymentName="LegacyName"))
+        self.assertEqual(resolved["ogg_deployment_name"], "LegacyName")
+
+    def test_resolved_inputs_require_a_descriptor_ogg_deployment_name(self):
+        for value in (None, ""):
+            with self.subTest(value=value), self.assertRaises(phase5_runtime.Phase5Error):
+                _resolved_inputs(_resolved_state_fixture(), descriptor=_descriptor(oggDeploymentName=value))
+
+    def test_retained_registrations_are_exactly_the_identities_that_initialised_the_retained_volumes(self):
+        # Each retained /u02 was first booted by its pre-migration runtime, whose OGG_DEPLOYMENT was its release name.
+        for (environment, new_id), old_id in phase5_runtime.RUNTIME_IDENTITY_MIGRATIONS.items():
+            with self.subTest(new_id=new_id):
+                values_file = next((REPO_ROOT / "envs" / environment / "pipelines").glob(f"*/{new_id}/values.yaml"))
+                values = yaml.safe_load(values_file.read_text())
+                self.assertEqual(values["runtime"]["ogg"]["deploymentName"], old_id)
+                self.assertEqual(values["runtime"]["storage"]["u02"]["existingClaim"], f"{old_id}-u02")
+
+
+def _rendered_pod_spec(docs):
+    return next(d for d in docs if d["kind"] == "StatefulSet")["spec"]["template"]["spec"]
+
+
+def _env(container):
+    return {e["name"]: e.get("value") for e in container.get("env") or []}
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm not available")
+class RealRuntimeIdentityRenderTests(unittest.TestCase):
+    """Real Helm renders: GoldenGate registered name vs canonical Kubernetes identity."""
+
+    _render = RealRuntimeInitContainerRenderTests._render
+
+    def _render_values(self, deployment_id, values):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "values.yaml"
+            path.write_text(yaml.safe_dump(values))
+            overrides = phase5_runtime._helm_set_overrides(
+                "dev", IMAGE_REPOSITORY, "goldengate-dev.example.internal", "gg-test-alb",
+                "arn:aws:acm:eu-west-1:000000000000:certificate/00000000-0000-0000-0000-000000000000",
+                "dev/goldengate/source/admin", "dev/goldengate/tls", "eu-west-1", "gg-runtime-sa", phase5_runtime.EFS_DRY_RUN_PLACEHOLDER)
+            return subprocess.run(["helm", "template", deployment_id, str(REPO_ROOT / "helm" / "goldengate"), "--namespace", TARGET_NAMESPACE,
+                                   "--values", str(path), *overrides], capture_output=True, text=True)
+
+    def test_real_descriptors_keep_canonical_kubernetes_identity_and_retained_registration(self):
+        for values_file, retained_claim in REAL_DEV_RUNTIME_RETAINED_CLAIMS.items():
+            with self.subTest(values_file=values_file):
+                deployment_id = Path(values_file).parent.name
+                registered = yaml.safe_load((REPO_ROOT / values_file).read_text())["runtime"]["ogg"]["deploymentName"]
+                proc = self._render(values_file)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                docs = phase5_runtime._parse_rendered_documents(proc.stdout)
+                with redirect_stdout(io.StringIO()):
+                    phase5_runtime._validate_ogg_deployment_identity(docs, deployment_id, TARGET_NAMESPACE, registered)
+                env = _env(_rendered_pod_spec(docs)["containers"][0])
+                self.assertEqual(env["OGG_DEPLOYMENT"], registered)
+                self.assertNotEqual(registered, deployment_id)
+                self.assertEqual(env["OGG_DOMAIN"], f"{deployment_id}.{TARGET_NAMESPACE}.svc.cluster.local")
+                names = {(d["kind"], d["metadata"]["name"]) for d in docs}
+                for kind, name in (("StatefulSet", deployment_id), ("Service", deployment_id), ("Service", f"{deployment_id}-headless"), ("Ingress", f"{deployment_id}-ingress")):
+                    self.assertIn((kind, name), names)
+                self.assertFalse(any(registered in name for _kind, name in names), "registered name must never leak into Kubernetes resource names")
+                ingress = next(d for d in docs if d["kind"] == "Ingress")
+                self.assertEqual(ingress["spec"]["rules"][0]["host"], f"{deployment_id}.goldengate-dev.example.internal")
+                u02 = next(v for v in _rendered_pod_spec(docs)["volumes"] if v["name"] == "u02")
+                self.assertEqual(u02["persistentVolumeClaim"]["claimName"], retained_claim)
+
+    def test_new_runtime_registers_under_its_canonical_id_without_overrides(self):
+        values = yaml.safe_load((REPO_ROOT / next(iter(REAL_DEV_RUNTIME_RETAINED_CLAIMS))).read_text())
+        values["runtime"].pop("ogg")
+        values["runtime"]["storage"]["u02"]["existingClaim"] = ""
+        for new_id in ("gg-postgresql-ledger-001", "ogg-db2-settlement-123", "gg-x-9"):
+            with self.subTest(new_id=new_id):
+                proc = self._render_values(new_id, values)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                docs = phase5_runtime._parse_rendered_documents(proc.stdout)
+                self.assertEqual(_env(_rendered_pod_spec(docs)["containers"][0])["OGG_DEPLOYMENT"], new_id)
+                pvc = next(d for d in docs if d["kind"] == "PersistentVolumeClaim")
+                self.assertEqual(pvc["metadata"]["name"], f"{new_id}-u02")
+
+    def test_chart_rejects_unsafe_or_unbacked_registration_overrides(self):
+        values = yaml.safe_load((REPO_ROOT / next(iter(REAL_DEV_RUNTIME_RETAINED_CLAIMS))).read_text())
+        for name in ("1bad", "bad name", "bad;id", "$(id)", "ServiceManager", "a" * 64):
+            with self.subTest(name=name):
+                values["runtime"]["ogg"]["deploymentName"] = name
+                proc = self._render_values("gg-postgresql-repltest-001", values)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("runtime.ogg.deploymentName", proc.stderr)
+        values["runtime"]["ogg"]["deploymentName"] = "gg-postgresql-repltest-01"
+        values["runtime"]["storage"]["u02"]["existingClaim"] = ""
+        proc = self._render_values("gg-postgresql-repltest-001", values)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("existingClaim", proc.stderr)
+
+    def test_repeated_renders_are_byte_identical(self):
+        # Argo CD re-syncs, restarts and pod replacement all reuse this exact pod template; nothing in it varies between renders.
+        for values_file in REAL_DEV_RUNTIME_RETAINED_CLAIMS:
+            with self.subTest(values_file=values_file):
+                first, second = self._render(values_file), self._render(values_file)
+                self.assertEqual(first.returncode, 0, first.stderr)
+                self.assertEqual(first.stdout, second.stdout)
+
+    def test_init_container_never_touches_goldengate_registration_state(self):
+        for values_file in REAL_DEV_RUNTIME_RETAINED_CLAIMS:
+            with self.subTest(values_file=values_file):
+                docs = phase5_runtime._parse_rendered_documents(self._render(values_file).stdout)
+                script = phase5_runtime._init_script_text(_rendered_pod_spec(docs)["initContainers"][0])
+                self.assertNotIn("OGG_DEPLOYMENT", script)
+                for path in ("/u02/ServiceManager/etc", "deploymentRegistry", "/u02/Deployment"):
+                    self.assertNotIn(path, script)
 
 
 # ==== EFS RENDER TESTS ====

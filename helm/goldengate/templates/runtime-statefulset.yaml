@@ -127,7 +127,7 @@ spec:
                   key: {{ .Values.runtime.admin.passwordKey | default "OGG_ADMIN_PWD" }}
 
             - name: OGG_DEPLOYMENT
-              value: {{ include "goldengate.runtimeName" . | quote }}
+              value: {{ include "goldengate.oggDeploymentName" . | quote }}
 
             - name: OGG_DOMAIN
               value: {{ printf "%s.%s.svc.cluster.local" (include "goldengate.runtimeName" .) .Release.Namespace | quote }}

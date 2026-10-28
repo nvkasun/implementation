@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import yaml
@@ -83,6 +84,7 @@ _FROZEN_CHART_OWNED_DESCRIPTOR = {
     "ingressHost": DNS_DOMAIN,
     "initPermissionsEnabled": True,
     "monitoringNamespace": "goldengate-monitoring",
+    "oggDeploymentName": DEPLOYMENT_ID,
     "pipeline": "repltest-pg-to-mssql-001",
     "pvcClaimName": "",
     "u02ClaimName": "",
@@ -275,10 +277,11 @@ def _init_container_mounts(include_u02=True, include_u03=True, include_admin_csi
     return mounts
 
 
-def _main_container(name=CONTAINER_NAME, image=EXPECTED_IMAGE, mounts="default", ports="default"):
+def _main_container(name=CONTAINER_NAME, image=EXPECTED_IMAGE, mounts="default", ports="default", ogg_deployment=DEPLOYMENT_ID):
     return {
         "name": name,
         "image": image,
+        "env": [{"name": "OGG_DEPLOYMENT", "value": ogg_deployment}],
         "volumeMounts": _main_container_mounts() if mounts == "default" else mounts,
         "ports": list(MAIN_CONTAINER_PORTS) if ports == "default" else ports,
     }
@@ -548,6 +551,25 @@ class RuntimeAcceptanceClassifierTests(unittest.TestCase):
         result = _classify(cluster)
         self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
         self.assertTrue(any("image=" in r for r in result["reasons"]))
+
+    def test_11b_ogg_deployment_drift_is_broken(self):
+        for ogg_deployment in ("gg-postgresql-repltest-01", "", None):
+            with self.subTest(ogg_deployment=ogg_deployment):
+                cluster = _populate_healthy_cluster(FakeCluster())
+                container = _main_container(ogg_deployment=ogg_deployment)
+                if ogg_deployment is None:
+                    container.pop("env")
+                cluster.put("statefulset", DEPLOYMENT_ID, RUNTIME_NAMESPACE, _sts_obj(containers=[container]))
+                result = _classify(cluster)
+                self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
+                self.assertTrue(any("OGG_DEPLOYMENT" in r for r in result["reasons"]))
+
+    def test_11c_retained_registration_name_is_healthy_when_declared(self):
+        cluster = _populate_healthy_cluster(FakeCluster())
+        cluster.put("statefulset", DEPLOYMENT_ID, RUNTIME_NAMESPACE, _sts_obj(containers=[_main_container(ogg_deployment="gg-postgresql-repltest-01")]))
+        with mock.patch.object(runtime_acceptance, "describe_deployment", return_value={**_FROZEN_CHART_OWNED_DESCRIPTOR, "oggDeploymentName": "gg-postgresql-repltest-01"}):
+            result = _classify(cluster)
+        self.assertEqual(result["reasons"], [])
 
     def test_12_unexpected_init_container_is_broken(self):
         cluster = _populate_healthy_cluster(FakeCluster())
@@ -1144,6 +1166,7 @@ class RuntimeAcceptanceExternalClaimTests(unittest.TestCase):
                         "containers": [{
                             "name": EXTERNAL_CLAIM_CONTAINER_NAME,
                             "image": EXTERNAL_CLAIM_IMAGE,
+                            "env": [{"name": "OGG_DEPLOYMENT", "value": EXTERNAL_CLAIM_DEPLOYMENT_ID}],
                             "volumeMounts": [
                                 {"name": "u02", "mountPath": "/u02"},
                                 {"name": "u03", "mountPath": "/u03"},

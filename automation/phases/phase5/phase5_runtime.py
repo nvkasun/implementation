@@ -608,13 +608,17 @@ def _validate_resolved_runtime_inputs(state, environment, deployment_id, *, veri
                     raise Phase5Error(f"freshly re-resolved managed EFS filesystem ID {fresh_resolved_efs_id!r} does not match the persisted resolved_efs_id={resolved_efs_id!r} -- refusing to reconcile with a stale/mismatched EFS filesystem ID.")
                 resolved_efs_id = fresh_resolved_efs_id
 
+    ogg_deployment_name = descriptor.get("oggDeploymentName")
+    if not isinstance(ogg_deployment_name, str) or not ogg_deployment_name:
+        raise Phase5Error(f"the canonical descriptor for {deployment_id!r} did not resolve a GoldenGate deployment name (oggDeploymentName).")
+
     return {
         "admin_secret_name": admin_secret_name, "tls_secret_name": tls_secret_name,
         "runtime_service_account_name": runtime_service_account_name, "image_repository": image_repository,
         "image_repository_name": image_repository_name, "image_tag": image_tag, "image_digest": image_digest,
         "efs_mode": efs_mode, "efs_file_system_id_declared": efs_file_system_id_declared, "efs_creation_token": efs_creation_token,
         "dns_domain": dns_domain, "alb_group_name": alb_group_name, "certificate_arn": certificate_arn,
-        "resolved_efs_id": resolved_efs_id,
+        "resolved_efs_id": resolved_efs_id, "ogg_deployment_name": ogg_deployment_name,
     }
 
 
@@ -1055,6 +1059,29 @@ def _init_script_text(container):
     return "\n".join(parts)
 
 
+def _container_env_value(container, name):
+    values = [e.get("value") for e in (container.get("env") or []) if isinstance(e, dict) and e.get("name") == name]
+    return values[0] if len(values) == 1 else None
+
+
+def _validate_ogg_deployment_identity(docs, deployment_id, target_namespace, expected_ogg_deployment_name):
+    """The rendered runtime container must carry the descriptor's resolved GoldenGate registered name and the canonical in-cluster domain."""
+    statefulsets = [d for d in docs if d.get("kind") == "StatefulSet"]
+    if len(statefulsets) != 1:
+        raise Phase5Error(f"expected exactly one StatefulSet, found {len(statefulsets)}.")
+    containers = ((statefulsets[0].get("spec") or {}).get("template") or {}).get("spec", {}).get("containers") or []
+    if len(containers) != 1:
+        raise Phase5Error(f"expected exactly one regular application container, found {len(containers)}.")
+    ogg_deployment = _container_env_value(containers[0], "OGG_DEPLOYMENT")
+    if ogg_deployment != expected_ogg_deployment_name:
+        raise Phase5Error(f"rendered OGG_DEPLOYMENT={ogg_deployment!r} does not match the descriptor's GoldenGate deployment name {expected_ogg_deployment_name!r}.")
+    expected_domain = f"{deployment_id}.{target_namespace}.svc.cluster.local"
+    ogg_domain = _container_env_value(containers[0], "OGG_DOMAIN")
+    if ogg_domain != expected_domain:
+        raise Phase5Error(f"rendered OGG_DOMAIN={ogg_domain!r} does not match the canonical runtime domain {expected_domain!r}.")
+    print(f"OK: OGG_DEPLOYMENT={ogg_deployment!r} (GoldenGate registered name), OGG_DOMAIN={ogg_domain!r}.")
+
+
 def _validate_singleruntime_manifest_contract(docs, values, deployment_id, target_namespace, image_repository, image_tag, image_digest):
     """Structural runtime-manifest contract (Python/PyYAML, duplicate-key-safe) -- never indentation-based grep for Kubernetes object structure or field values."""
     expected_image = f"{image_repository}:{image_tag}"
@@ -1380,6 +1407,7 @@ def cmd_validate_local(args):
     _validate_runtime_service_account_used(docs, runtime_service_account_name)
     _validate_admin_secret_csi_isolation(docs, admin_secret_name, environment, deployment_id)
     _validate_singleruntime_manifest_contract(docs, values, deployment_id, target_namespace, image_repository, image_tag, image_digest)
+    _validate_ogg_deployment_identity(docs, deployment_id, target_namespace, resolved["ogg_deployment_name"])
     _validate_efs_render_contract(values, docs, environment, deployment_id, deployment_model, resolved_efs_id, efs_mode, efs_file_system_id_declared)
 
     temp_chart_path, package_path = _package_runtime_chart(deployment_id, values_file, chart_version)
