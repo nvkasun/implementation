@@ -1,27 +1,31 @@
 
--- PostgreSQL admin replication permissions
+-- SQL Server admin target permissions
 -- READ ONLY
 
 SELECT
-    current_database() AS database_name,
-    current_user AS username,
-    pg_has_role(
-        current_user,
-        'rds_replication',
-        'MEMBER'
-    ) AS has_rds_replication_role,
-    has_database_privilege(
-        current_user,
-        current_database(),
-        'CONNECT'
-    ) AS has_connect_permission,
-    has_schema_privilege(
-        current_user,
-        'gg_poc',
-        'USAGE'
-    ) AS has_schema_usage,
-    has_table_privilege(
-        current_user,
+    DB_NAME() AS database_name,
+    SUSER_SNAME() AS connected_login,
+    USER_NAME() AS database_user,
+    IS_MEMBER('db_owner') AS is_db_owner,
+    HAS_PERMS_BY_NAME(
         'gg_poc.replication_test',
-        'SELECT'
-    ) AS has_table_select;
+        'OBJECT',
+        'INSERT'
+    ) AS can_insert,
+    HAS_PERMS_BY_NAME(
+        'gg_poc.replication_test',
+        'OBJECT',
+        'UPDATE'
+    ) AS can_update,
+    HAS_PERMS_BY_NAME(
+        'gg_poc.replication_test',
+        'OBJECT',
+        'DELETE'
+    ) AS can_delete;
+
+-- Check SQL Server Agent role in msdb
+SELECT
+    IS_ROLEMEMBER(
+        'SQLAgentUserRole',
+        SUSER_SNAME()
+    ) AS is_sql_agent_user;
