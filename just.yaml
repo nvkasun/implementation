@@ -1,20 +1,15 @@
 
--- GoldenGate POC - MSSQL target verification
--- No database changes
-
-SELECT DB_NAME() AS current_database;
+-- GoldenGate POC: MSSQL target final verification
 
 SELECT
+    DB_NAME() AS database_name,
     s.name AS schema_name,
     t.name AS table_name
 FROM sys.tables t
-JOIN sys.schemas s ON t.schema_id = s.schema_id
+JOIN sys.schemas s
+    ON t.schema_id = s.schema_id
 WHERE s.name = 'gg_poc'
   AND t.name = 'replication_test';
 
-SELECT
-    CASE
-        WHEN OBJECT_ID('gg_poc.replication_test', 'U') IS NOT NULL
-        THEN 'TABLE EXISTS'
-        ELSE 'TABLE MISSING'
-    END AS table_status;
+SELECT COUNT(*) AS initial_row_count
+FROM gg_poc.replication_test;
