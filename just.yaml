@@ -1,57 +1,20 @@
 
--- ==========================================
--- GoldenGate POC - MSSQL Target Table
--- Pipeline: repltest-pg-to-mssql-001
--- Target database: goldengate_poc
--- ==========================================
+-- GoldenGate POC - MSSQL target verification
+-- No database changes
 
--- 1. Database verification
 SELECT DB_NAME() AS current_database;
 
--- 2. Create POC schema if missing
-IF SCHEMA_ID(N'gg_poc') IS NULL
-BEGIN
-    EXEC(N'CREATE SCHEMA gg_poc AUTHORIZATION dbo');
-END;
-
--- 3. Create replication target table
-IF OBJECT_ID(N'gg_poc.replication_test', N'U') IS NULL
-BEGIN
-    CREATE TABLE gg_poc.replication_test (
-        id              INT NOT NULL PRIMARY KEY,
-        customer_name   VARCHAR(100) NOT NULL,
-        transaction_ref VARCHAR(50) NOT NULL,
-        amount          DECIMAL(15,2) NOT NULL,
-        status          VARCHAR(20) NOT NULL,
-        created_at      DATETIME2(3) NOT NULL
-    );
-END;
-
--- 4. Validate initial row count
-SELECT COUNT(*) AS initial_row_count
-FROM gg_poc.replication_test;
-
--- 5. Verify table structure
 SELECT
-    COLUMN_NAME,
-    DATA_TYPE,
-    IS_NULLABLE
-FROM INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_SCHEMA = 'gg_poc'
-  AND TABLE_NAME = 'replication_test'
-ORDER BY ORDINAL_POSITION;
+    s.name AS schema_name,
+    t.name AS table_name
+FROM sys.tables t
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+WHERE s.name = 'gg_poc'
+  AND t.name = 'replication_test';
 
--- 6. Verify primary key
 SELECT
-    kc.name AS constraint_name,
-    c.name AS primary_key_column
-FROM sys.key_constraints kc
-JOIN sys.index_columns ic
-    ON kc.parent_object_id = ic.object_id
-   AND kc.unique_index_id = ic.index_id
-JOIN sys.columns c
-    ON ic.object_id = c.object_id
-   AND ic.column_id = c.column_id
-WHERE kc.parent_object_id =
-      OBJECT_ID(N'gg_poc.replication_test')
-  AND kc.type = 'PK';
+    CASE
+        WHEN OBJECT_ID('gg_poc.replication_test', 'U') IS NOT NULL
+        THEN 'TABLE EXISTS'
+        ELSE 'TABLE MISSING'
+    END AS table_status;
