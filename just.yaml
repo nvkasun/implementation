@@ -1,31 +1,58 @@
 
--- GoldenGate POC - RDS SQL Server msdb audit
--- READ ONLY
+#!/usr/bin/env bash
 
-SELECT
-    SUSER_SNAME() AS connected_login,
-    USER_NAME() AS current_database_user,
-    DB_NAME() AS current_database;
+set -u
 
--- Check the login's mapping in msdb
-SELECT
-    dp.name AS msdb_user,
-    dp.type_desc AS user_type,
-    rp.name AS assigned_role
-FROM msdb.sys.database_principals dp
-LEFT JOIN msdb.sys.database_role_members drm
-    ON dp.principal_id = drm.member_principal_id
-LEFT JOIN msdb.sys.database_principals rp
-    ON drm.role_principal_id = rp.principal_id
-WHERE dp.sid = SUSER_SID()
-ORDER BY dp.name, rp.name;
+NS="goldengate-dev"
+POD="gg-postgresql-repltest-001-0"
+DEPLOY="gg-postgresql-repltest-01"
 
--- Check role membership in the msdb context
-EXEC(N'
-USE msdb;
-SELECT
-    DB_NAME() AS database_name,
-    USER_NAME() AS database_user,
-    IS_ROLEMEMBER(''SQLAgentUserRole'') AS is_sql_agent_user,
-    IS_MEMBER(''db_owner'') AS is_db_owner;
-');
+echo "=== GOLDENGATE ADMIN SERVICE DIAGNOSTICS ==="
+
+echo
+echo "[1] Kubernetes pod status"
+kubectl get pod "$POD" -n "$NS" \
+  -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount
+
+echo
+echo "[2] GoldenGate service processes"
+kubectl exec -n "$NS" "$POD" -- sh -c '
+ps -ef | grep -E "[S]erviceManager|[a]dminsrvr|[n]ginx"
+' | awk '{print $1,$2,$3,$8,$9}' | head -20
+
+echo
+echo "[3] Internal Administration API and UI responses"
+kubectl exec -n "$NS" "$POD" -- sh -c '
+for port in 8443 9012; do
+  for path in \
+    "/services/v2/content/" \
+    "/services/v2/content/index.html" \
+    "/services/v2/deployments" \
+    "/services/'"$DEPLOY"'/adminsrvr/v2/content/" \
+    "/services/'"$DEPLOY"'/adminsrvr/v2/content/index.html" \
+    "/services/'"$DEPLOY"'/adminsrvr/v2/extracts"
+  do
+    code=$(curl -sk --max-time 5 \
+      -o /dev/null -w "%{http_code}" \
+      "https://127.0.0.1:${port}${path}" \
+      2>/dev/null || true)
+    echo "port=${port} path=${path} HTTP=${code}"
+  done
+done
+'
+
+echo
+echo "[4] Recent Administration Service lifecycle events"
+kubectl exec -n "$NS" "$POD" -- sh -c '
+LOG="/u02/ServiceManager/var/log/ServiceManager.log"
+if [ -r "$LOG" ]; then
+  grep -Ei "adminsrvr|restart|stopped|started|failed" "$LOG" \
+    | tail -15 \
+    | cut -c 1-220
+else
+  echo "Service Manager log unavailable"
+fi
+'
+
+echo
+echo "=== DIAGNOSTICS COMPLETE ==="
