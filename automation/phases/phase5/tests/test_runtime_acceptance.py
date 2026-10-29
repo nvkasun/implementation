@@ -84,7 +84,6 @@ _FROZEN_CHART_OWNED_DESCRIPTOR = {
     "ingressHost": DNS_DOMAIN,
     "initPermissionsEnabled": True,
     "monitoringNamespace": "goldengate-monitoring",
-    "oggDeploymentName": DEPLOYMENT_ID,
     "pipeline": "repltest-pg-to-mssql-001",
     "pvcClaimName": "",
     "u02ClaimName": "",
@@ -220,7 +219,7 @@ def _appset_obj(app_name=APP_NAME, environment=ENVIRONMENT, deployment_id=DEPLOY
 def _pod_volumes(u02_claim_name="default", u02_empty_dir=False, u03_empty_dir=True,
                   include_admin_csi=True, admin_driver="secrets-store.csi.k8s.io", admin_spc="default", admin_read_only=True,
                   include_certificate_csi=True, certificate_driver="secrets-store.csi.k8s.io", certificate_spc="default", certificate_read_only=True,
-                  extra_volumes=None, omit_u02=False, omit_u03=False):
+                  extra_volumes=None, omit_u02=False, omit_u03=False, identity_volumes="default"):
     """Exact expected spec.template.spec.volumes shape rendered by helm/goldengate/templates/runtime-statefulset.yaml for this deployment's real descriptor (u02Type=efs, both CSI secrets enabled)."""
     volumes = []
     if not omit_u02:
@@ -240,6 +239,7 @@ def _pod_volumes(u02_claim_name="default", u02_empty_dir=False, u03_empty_dir=Tr
     if include_certificate_csi:
         spc = f"{DEPLOYMENT_ID}-certificate" if certificate_spc == "default" else certificate_spc
         volumes.append({"name": "ogg-nginx-cert-csi", "csi": {"driver": certificate_driver, "readOnly": certificate_read_only, "volumeAttributes": {"secretProviderClass": spc}}})
+    volumes.extend(_identity_volumes() if identity_volumes == "default" else identity_volumes)
     if extra_volumes:
         volumes.extend(extra_volumes)
     return volumes
@@ -277,12 +277,27 @@ def _init_container_mounts(include_u02=True, include_u03=True, include_admin_csi
     return mounts
 
 
-def _main_container(name=CONTAINER_NAME, image=EXPECTED_IMAGE, mounts="default", ports="default", ogg_deployment=DEPLOYMENT_ID):
+IDENTITY_KEYS = {"goldengate-identity": "resolve_deployment.py", "goldengate-identity-setup": "00-goldengate-identity.sh", "goldengate-identity-startup": "99-goldengate-identity.sh"}
+
+
+def _identity_volumes(deployment_id=DEPLOYMENT_ID):
+    return [{"name": name, "configMap": {"name": f"{deployment_id}-goldengate-identity", "items": [{"key": key, "path": key}]}} for name, key in IDENTITY_KEYS.items()]
+
+
+def _identity_mounts(scripts_path="/u01/ogg/scripts"):
+    return [
+        {"name": "goldengate-identity", "mountPath": "/opt/goldengate-identity", "readOnly": True},
+        {"name": "goldengate-identity-setup", "mountPath": f"{scripts_path}/setup/00-goldengate-identity.sh", "subPath": "00-goldengate-identity.sh", "readOnly": True},
+        {"name": "goldengate-identity-startup", "mountPath": f"{scripts_path}/startup/99-goldengate-identity.sh", "subPath": "99-goldengate-identity.sh", "readOnly": True},
+    ]
+
+
+def _main_container(name=CONTAINER_NAME, image=EXPECTED_IMAGE, mounts="default", ports="default", ogg_deployment=DEPLOYMENT_ID, identity_mounts="default"):
     return {
         "name": name,
         "image": image,
-        "env": [{"name": "OGG_DEPLOYMENT", "value": ogg_deployment}],
-        "volumeMounts": _main_container_mounts() if mounts == "default" else mounts,
+        "env": [{"name": "OGG_DEPLOYMENT", "value": ogg_deployment}, {"name": "OGG_DEPLOYMENT_SCRIPTS", "value": "/u01/ogg/scripts"}],
+        "volumeMounts": (_main_container_mounts() if mounts == "default" else mounts) + (_identity_mounts() if identity_mounts == "default" else identity_mounts),
         "ports": list(MAIN_CONTAINER_PORTS) if ports == "default" else ports,
     }
 
@@ -564,12 +579,32 @@ class RuntimeAcceptanceClassifierTests(unittest.TestCase):
                 self.assertEqual(result["state"], runtime_acceptance.STATE_BROKEN)
                 self.assertTrue(any("OGG_DEPLOYMENT" in r for r in result["reasons"]))
 
-    def test_11c_retained_registration_name_is_healthy_when_declared(self):
+    def test_11c_runtime_id_bootstrap_is_healthy_whatever_name_is_registered(self):
+        # The registered name lives only in Service Manager; the StatefulSet always carries the runtime ID.
         cluster = _populate_healthy_cluster(FakeCluster())
-        cluster.put("statefulset", DEPLOYMENT_ID, RUNTIME_NAMESPACE, _sts_obj(containers=[_main_container(ogg_deployment="gg-postgresql-repltest-01")]))
-        with mock.patch.object(runtime_acceptance, "describe_deployment", return_value={**_FROZEN_CHART_OWNED_DESCRIPTOR, "oggDeploymentName": "gg-postgresql-repltest-01"}):
-            result = _classify(cluster)
+        result = _classify(cluster)
         self.assertEqual(result["reasons"], [])
+
+    def test_11d_identity_hook_wiring_drift_is_broken(self):
+        bad_mounts = [
+            [m for m in _identity_mounts() if m["name"] != "goldengate-identity-setup"],
+            [{**m, "subPath": None} if m["name"] == "goldengate-identity-setup" else m for m in _identity_mounts()],
+            [{**m, "mountPath": "/u01/ogg/scripts/setup"} if m["name"] == "goldengate-identity-setup" else m for m in _identity_mounts()],
+            [{**m, "readOnly": False} if m["name"] == "goldengate-identity-startup" else m for m in _identity_mounts()],
+        ]
+        for mounts in bad_mounts:
+            with self.subTest(mounts=mounts):
+                cluster = _populate_healthy_cluster(FakeCluster())
+                cluster.put("statefulset", DEPLOYMENT_ID, RUNTIME_NAMESPACE, _sts_obj(containers=[_main_container(identity_mounts=mounts)]))
+                self.assertEqual(_classify(cluster)["state"], runtime_acceptance.STATE_BROKEN)
+
+    def test_11e_identity_volume_projecting_the_wrong_configmap_is_broken(self):
+        for volumes in ([v for v in _identity_volumes() if v["name"] != "goldengate-identity"],
+                        _identity_volumes("some-other-runtime")):
+            with self.subTest(volumes=volumes):
+                cluster = _populate_healthy_cluster(FakeCluster())
+                cluster.put("statefulset", DEPLOYMENT_ID, RUNTIME_NAMESPACE, _sts_obj(volumes=_pod_volumes(identity_volumes=volumes)))
+                self.assertEqual(_classify(cluster)["state"], runtime_acceptance.STATE_BROKEN)
 
     def test_12_unexpected_init_container_is_broken(self):
         cluster = _populate_healthy_cluster(FakeCluster())
@@ -1166,12 +1201,13 @@ class RuntimeAcceptanceExternalClaimTests(unittest.TestCase):
                         "containers": [{
                             "name": EXTERNAL_CLAIM_CONTAINER_NAME,
                             "image": EXTERNAL_CLAIM_IMAGE,
-                            "env": [{"name": "OGG_DEPLOYMENT", "value": EXTERNAL_CLAIM_DEPLOYMENT_ID}],
+                            "env": [{"name": "OGG_DEPLOYMENT", "value": EXTERNAL_CLAIM_DEPLOYMENT_ID}, {"name": "OGG_DEPLOYMENT_SCRIPTS", "value": "/u01/ogg/scripts"}],
                             "volumeMounts": [
                                 {"name": "u02", "mountPath": "/u02"},
                                 {"name": "u03", "mountPath": "/u03"},
                                 {"name": "ogg-admin-csi", "mountPath": ADMIN_MOUNT_PATH, "readOnly": True},
                                 {"name": "ogg-nginx-cert-csi", "mountPath": CERTIFICATE_MOUNT_PATH, "readOnly": True},
+                                *_identity_mounts(),
                             ],
                             "ports": [{"name": "https", "containerPort": 8443, "protocol": "TCP"}, {"name": "receiver", "containerPort": 9014, "protocol": "TCP"}, {"name": "metrics", "containerPort": 9015, "protocol": "TCP"}],
                         }],
@@ -1189,6 +1225,7 @@ class RuntimeAcceptanceExternalClaimTests(unittest.TestCase):
                             {"name": "u03", "emptyDir": {}},
                             {"name": "ogg-admin-csi", "csi": {"driver": "secrets-store.csi.k8s.io", "readOnly": True, "volumeAttributes": {"secretProviderClass": f"{EXTERNAL_CLAIM_DEPLOYMENT_ID}-admin"}}},
                             {"name": "ogg-nginx-cert-csi", "csi": {"driver": "secrets-store.csi.k8s.io", "readOnly": True, "volumeAttributes": {"secretProviderClass": f"{EXTERNAL_CLAIM_DEPLOYMENT_ID}-certificate"}}},
+                            *_identity_volumes(EXTERNAL_CLAIM_DEPLOYMENT_ID),
                         ],
                     },
                 },

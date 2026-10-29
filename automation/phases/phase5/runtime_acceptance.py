@@ -82,6 +82,13 @@ INIT_CONTAINER_NAME = "prepare-u02-permissions"
 # helm/goldengate/templates/runtime-statefulset.yaml's fixed CSI volume names and driver -- never guessed, never a second desired shape.
 ADMIN_CSI_VOLUME_NAME = "ogg-admin-csi"
 CERTIFICATE_CSI_VOLUME_NAME = "ogg-nginx-cert-csi"
+
+# Registered-identity hooks (mirrors helm/goldengate runtime-statefulset.yaml): volume name -> (ConfigMap key, mount path relative to OGG_DEPLOYMENT_SCRIPTS or absolute, subPath).
+IDENTITY_VOLUMES = {
+    "goldengate-identity": ("resolve_deployment.py", "/opt/goldengate-identity", None),
+    "goldengate-identity-setup": ("00-goldengate-identity.sh", "setup/00-goldengate-identity.sh", "00-goldengate-identity.sh"),
+    "goldengate-identity-startup": ("99-goldengate-identity.sh", "startup/99-goldengate-identity.sh", "99-goldengate-identity.sh"),
+}
 SECRETS_STORE_CSI_DRIVER = "secrets-store.csi.k8s.io"
 
 
@@ -220,6 +227,9 @@ def _expected_pod_volumes(descriptor, deployment_id):
     if descriptor["csiEnabled"] and descriptor["csiCertificateEnabled"]:
         volumes[CERTIFICATE_CSI_VOLUME_NAME] = {"kind": "csi", "secretProviderClass": f"{deployment_id}-certificate"}
 
+    for name, (key, _path, _sub_path) in IDENTITY_VOLUMES.items():
+        volumes[name] = {"kind": "configMap", "configMapName": f"{deployment_id}-goldengate-identity", "key": key}
+
     return volumes
 
 
@@ -255,6 +265,11 @@ def _check_pod_volumes(reasons, deployment_id, pod_spec, descriptor):
                 actual_spc = (csi.get("volumeAttributes") or {}).get("secretProviderClass")
                 if actual_spc != spec["secretProviderClass"]:
                     reasons.append(f"statefulset/{deployment_id} volume {name!r} csi.volumeAttributes.secretProviderClass={actual_spc!r}, expected {spec['secretProviderClass']!r}")
+        elif spec["kind"] == "configMap":
+            config_map = actual.get("configMap") or {}
+            keys = [item.get("key") for item in config_map.get("items") or [] if isinstance(item, dict)]
+            if config_map.get("name") != spec["configMapName"] or keys != [spec["key"]]:
+                reasons.append(f"statefulset/{deployment_id} volume {name!r} must project only key {spec['key']!r} from ConfigMap {spec['configMapName']!r}")
 
     unexpected = set(actual_by_name) - set(expected) - extra_allowed
     if unexpected:
@@ -268,6 +283,23 @@ def _expected_container_mounts(descriptor, include_certificate):
     if include_certificate and descriptor["csiEnabled"] and descriptor["csiCertificateEnabled"]:
         mounts[CERTIFICATE_CSI_VOLUME_NAME] = descriptor["csiCertificateMountPath"]
     return mounts
+
+
+def _identity_mounts(container):
+    """Expected registered-identity mounts for the main container, anchored at its own OGG_DEPLOYMENT_SCRIPTS."""
+    scripts = [e.get("value") for e in (container.get("env") or []) if isinstance(e, dict) and e.get("name") == "OGG_DEPLOYMENT_SCRIPTS"]
+    scripts_path = scripts[0] if len(scripts) == 1 and isinstance(scripts[0], str) else ""
+    return {name: (path if path.startswith("/") else f"{scripts_path}/{path}", sub_path) for name, (_key, path, sub_path) in IDENTITY_VOLUMES.items()}
+
+
+def _check_identity_mounts(reasons, label, container):
+    by_name = {}
+    for m in container.get("volumeMounts") or []:
+        by_name.setdefault(m.get("name"), []).append(m)
+    for name, (mount_path, sub_path) in _identity_mounts(container).items():
+        actual = by_name.get(name) or []
+        if len(actual) != 1 or actual[0].get("subPath") != sub_path or actual[0].get("readOnly") is not True:
+            reasons.append(f"{label} must mount {name!r} read-only exactly once at {mount_path!r} (subPath={sub_path!r})")
 
 
 def _check_container_mounts(reasons, label, container, expected_mounts, extra_allowed):
@@ -350,13 +382,14 @@ def _check_statefulset_and_pod_shape(run, reasons, deployment_id, runtime_namesp
             reasons.append(f"statefulset/{deployment_id} container {descriptor['containerName']!r} image={container.get('image')!r}, expected {expected_image!r}")
         _check_container_mounts(
             reasons, f"statefulset/{deployment_id} container {descriptor['containerName']!r}",
-            container, _expected_container_mounts(descriptor, include_certificate=True),
+            container, {**_expected_container_mounts(descriptor, include_certificate=True), **{name: path for name, (path, _sub) in _identity_mounts(container).items()}},
             set(descriptor.get("extraVolumeMountNames") or []),
         )
         _check_container_ports(reasons, f"statefulset/{deployment_id} container {descriptor['containerName']!r}", container, expected_container_ports)
         ogg_deployment_values = [e.get("value") for e in (container.get("env") or []) if isinstance(e, dict) and e.get("name") == "OGG_DEPLOYMENT"]
-        if ogg_deployment_values != [descriptor["oggDeploymentName"]]:
-            reasons.append(f"statefulset/{deployment_id} container {descriptor['containerName']!r} OGG_DEPLOYMENT={ogg_deployment_values!r}, expected exactly [{descriptor['oggDeploymentName']!r}] (the GoldenGate registered deployment name)")
+        if ogg_deployment_values != [deployment_id]:
+            reasons.append(f"statefulset/{deployment_id} container {descriptor['containerName']!r} OGG_DEPLOYMENT={ogg_deployment_values!r}, expected exactly [{deployment_id!r}] (the bootstrap name; the registered name is resolved at startup)")
+        _check_identity_mounts(reasons, f"statefulset/{deployment_id} container {descriptor['containerName']!r}", container)
 
     if descriptor["initPermissionsEnabled"]:
         if len(init_containers) != 1:

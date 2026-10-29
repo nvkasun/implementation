@@ -45,11 +45,13 @@ runtime:
     tag: ""
     pullPolicy: IfNotPresent
 
-  # OGG_DOMAIN and the admin Secret name derive from the runtime name (Release.Name); OGG_DEPLOYMENT from runtime.ogg.deploymentName -- see _helpers.tpl.
+  # OGG_DEPLOYMENT (bootstrap name; the registered name is resolved at startup), OGG_DOMAIN and the admin Secret name derive from the runtime name -- see _helpers.tpl.
   ogg:
     secureDeployment: false
-    # GoldenGate registered deployment name; empty means the runtime name. Set only for retained /u02 state registered under an earlier name.
-    deploymentName: ""
+
+  # Image setup/startup hook root (OGG_DEPLOYMENT_SCRIPTS); the identity hooks are mounted under it.
+  identity:
+    deploymentScriptsPath: /u01/ogg/scripts
 
   admin:
     usernameKey: OGG_ADMIN

@@ -71,20 +71,22 @@ is only an escape hatch, never required.
 {{- end }}
 
 {{- /*
-GoldenGate registered deployment name (OGG_DEPLOYMENT): runtime.ogg.deploymentName
-when set, else the runtime name. A different name is only accepted on retained /u02
-state (existingClaim) registered before the current runtime identity.
+GoldenGate registered deployment identity: OGG_DEPLOYMENT carries the runtime name as the
+bootstrap name; the startup hooks (files/goldengate-identity) resolve the name actually
+registered in Service Manager before NGINX routes are rendered.
 */ -}}
-{{- define "goldengate.oggDeploymentName" -}}
-{{- $runtimeName := include "goldengate.runtimeName" . -}}
-{{- $name := (.Values.runtime.ogg).deploymentName | default $runtimeName | toString -}}
-{{- if or (not (regexMatch "^[A-Za-z][A-Za-z0-9_-]{0,62}$" $name)) (eq (lower $name) "servicemanager") -}}
-{{- fail "runtime.ogg.deploymentName must start with a letter, contain only letters, digits, '-' or '_', be at most 63 characters, and not be a reserved GoldenGate name." -}}
-{{- end -}}
-{{- if and (ne $name $runtimeName) (not .Values.runtime.storage.u02.existingClaim) -}}
-{{- fail "runtime.ogg.deploymentName may differ from the runtime name only when runtime.storage.u02.existingClaim attaches retained /u02 state registered under that name." -}}
-{{- end -}}
-{{- $name -}}
+{{- define "goldengate.runtimeIdentityConfigMapName" -}}
+{{- printf "%s-goldengate-identity" (include "goldengate.runtimeName" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "goldengate.runtimeIdentityFiles" -}}
+{{- (.Files.Glob "files/goldengate-identity/*").AsConfig -}}
+{{- end }}
+
+{{- define "goldengate.assertNoRegisteredNameOverride" -}}
+{{- if (.Values.runtime.ogg).deploymentName }}
+{{- fail "runtime.ogg.deploymentName is retired: the registered GoldenGate deployment is resolved from Service Manager at startup." }}
+{{- end }}
 {{- end }}
 
 {{- define "goldengate.runtimeIngressHost" -}}

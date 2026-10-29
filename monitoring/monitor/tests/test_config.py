@@ -174,35 +174,25 @@ deployments:
         self.assertEqual(doc["deployments"][0]["metricsPort"], 9999)
 
 
-class OggDeploymentNameConfigTests(unittest.TestCase):
-    def _load(self, extra_line=None):
-        content = VALID_DOC
-        if extra_line is not None:
-            content = content.replace("    ingressHost: gg-oracle-payments-01.goldengate-dev.adcbmis.local\n",
-                                      f"    ingressHost: gg-oracle-payments-01.goldengate-dev.adcbmis.local\n    {extra_line}\n")
-        target_dir = tempfile.mkdtemp()
-        write_deployments_yaml(target_dir, content)
-        return {d["name"]: d for d in cfgmod.load_deployments(target_dir)["deployments"]}
+class RegisteredNameNotConfiguredTests(unittest.TestCase):
+    """Registered GoldenGate names are discovered from Service Manager at runtime, never carried by the registry."""
 
-    def test_absent_ogg_deployment_name_defaults_to_the_canonical_name(self):
-        self.assertEqual(self._load()["gg-oracle-payments-01"]["oggDeploymentName"], "gg-oracle-payments-01")
-
-    def test_explicit_retained_registration_name_is_carried(self):
-        loaded = self._load("oggDeploymentName: OracleSource")
-        self.assertEqual(loaded["gg-oracle-payments-01"]["oggDeploymentName"], "OracleSource")
-        self.assertEqual(loaded["gg-oracle-payments-01"]["adminHost"], "gg-oracle-payments-01.goldengate-dev.svc.cluster.local")
-
-    def test_invalid_ogg_deployment_name_fails(self):
-        for bad in ('"bad name"', '"1bad"', '"../x"', "ServiceManager", "7", "null", '""'):
-            with self.subTest(bad=bad), self.assertRaises(cfgmod.ConfigError):
-                self._load(f"oggDeploymentName: {bad}")
-
-    def test_real_registry_carries_the_model_resolved_names(self):
+    def test_real_registry_has_no_registered_name_field(self):
         registry = yaml.safe_load(_generate_registry_document())
         target_dir = tempfile.mkdtemp()
         write_deployments_yaml(target_dir, yaml.safe_dump(registry))
-        loaded = {d["name"]: d["oggDeploymentName"] for d in cfgmod.load_deployments(target_dir)["deployments"]}
-        self.assertEqual(loaded, {e["name"]: e["oggDeploymentName"] for e in registry["deployments"]})
+        for entry in registry["deployments"]:
+            self.assertNotIn("oggDeploymentName", entry)
+        for d in cfgmod.load_deployments(target_dir)["deployments"]:
+            self.assertNotIn("oggDeploymentName", d)
+
+    def test_a_previous_registry_field_is_ignored(self):
+        content = VALID_DOC.replace("    ingressHost: gg-oracle-payments-01.goldengate-dev.adcbmis.local\n",
+                                    "    ingressHost: gg-oracle-payments-01.goldengate-dev.adcbmis.local\n    oggDeploymentName: gg-oracle-payments-1\n")
+        target_dir = tempfile.mkdtemp()
+        write_deployments_yaml(target_dir, content)
+        loaded = {d["name"]: d for d in cfgmod.load_deployments(target_dir)["deployments"]}
+        self.assertNotIn("oggDeploymentName", loaded["gg-oracle-payments-01"])
 
 
 class BuildLogicalPipelinesTests(unittest.TestCase):

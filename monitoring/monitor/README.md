@@ -34,21 +34,24 @@ per deployment tick.
 
 ## Deployment registration check
 
-The existing `/services/v2/deployments` liveness response is also compared
-with the registry's `oggDeploymentName` (the descriptor's
-`runtime.ogg.deploymentName`, else the canonical deployment ID). The result is
-stored as `STATE#_deployment.registration` and exposed by `/api/status` and
-`/api/processes` as `{status, expectedName, registeredNames}`:
+The existing `/services/v2/deployments` liveness response also identifies the
+registered GoldenGate deployment: the single entry other than `ServiceManager`.
+Each critical service is then requested through that name,
+`/services/<registered>/<service>/v2/<resource>` (extracts, sources or targets).
+These are the same REST resources the collector already reads, routed by the
+image's NGINX deployment-scoped locations. The result is stored as
+`STATE#_deployment.registration` and exposed by `/api/status` and
+`/api/processes` as `{status, registeredName, registeredNames, routes}`:
 
-- `MATCH`: the Service Manager has that deployment registered.
-- `MISMATCH`: it does not. Service Manager links (`/services/<registered>/...`)
-  will not reach this runtime's services. A `deployment_registration_mismatch`
-  warning is logged.
+- `OK`: exactly one registered deployment, and every probed route answered 200.
+- `UNROUTED`: one registered deployment, but at least one route failed.
+  Service Manager links will not reach that service.
+- `MISSING` / `AMBIGUOUS`: zero, or more than one, registered deployments.
 - `UNAVAILABLE`: the response was missing or malformed.
 
-Only `MATCH` passes Phase 6 end-to-end acceptance. No extra request is made,
-and alerts and CloudWatch metrics are unchanged. See
-"GoldenGate deployment identity" in the repository README.
+Any status other than `OK` logs `deployment_registration_unverified`. Only `OK`
+passes Phase 6 end-to-end acceptance. Alerts and CloudWatch metrics are
+unchanged. See "GoldenGate deployment identity" in the repository README.
 
 ## Production PMS collection
 
@@ -360,9 +363,10 @@ field JSON types) -- never a raw field value, process name, status value,
 ID, credential, or secret path. It never writes DynamoDB, never calls
 CloudWatch, and only accepts paths beginning with `/services/`.
 
-`--check-routing` (admin port only) requests
-`/services/<oggDeploymentName>/{adminsrvr,distsrvr,recvsrvr,pmsrvr}/v2/content/`
-and, when different, the same paths under the canonical deployment ID. Each
+`--check-routing` (admin port only) first discovers the registered deployment
+from `/services/v2/deployments`, then requests
+`/services/<registered>/{adminsrvr,distsrvr,recvsrvr,pmsrvr}/v2/content/`
+and, when different, the same paths under the runtime ID. Each
 result is `ROUTED` only for a 2xx response without `OGG-12031` that differs
 from the response for a random, unregistered deployment name. Response bodies
 are hashed or searched, never printed. The exit code is 0 only when every

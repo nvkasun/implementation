@@ -32,7 +32,7 @@ def load_active_deployments(environment):
     active, _inactive, invalid, problems = gdm._run_full_validation(environment)
     if invalid or problems:
         raise ValueError(f"the folder-driven deployment model for {environment!r} has validation problems -- refusing to accept end-to-end runtime health against an inconsistent model")
-    return [{"deploymentId": d["deploymentId"], "deploymentType": d["deploymentType"], "oggDeploymentName": d["oggDeploymentName"]} for d in active]
+    return [{"deploymentId": d["deploymentId"], "deploymentType": d["deploymentType"]} for d in active]
 
 
 STATE_HEALTHY = "HEALTHY"
@@ -138,18 +138,14 @@ def classify(environment, active_deployments, api_processes_doc):
             if unreachable:
                 reasons.append(f"deployment {name!r}: critical service(s) not reachable: {unreachable!r}")
 
-        # The live Service Manager must have the descriptor's GoldenGate deployment registered, or its generated /services/<name>/... links route nowhere.
+        # The Service Manager must report exactly one registered deployment whose /services/<name>/... routes reach its services.
         registration = entry.get("registration")
-        expected_ogg_name = expected.get("oggDeploymentName", name)
         if not isinstance(registration, dict):
             reasons.append(f"deployment {name!r}: registration must be an object per the monitor API contract, got {_describe_malformed_value(registration)}")
-        else:
-            if registration.get("expectedName") != expected_ogg_name:
-                reasons.append(f"deployment {name!r}: registration.expectedName={registration.get('expectedName')!r}, expected {expected_ogg_name!r}")
-            if registration.get("status") != "MATCH":
-                registered = registration.get("registeredNames")
-                registered = registered if isinstance(registered, list) else _describe_malformed_value(registered)
-                reasons.append(f"deployment {name!r}: GoldenGate registration status={registration.get('status')!r} (expected deployment {expected_ogg_name!r}, Service Manager reports {registered!r})")
+        elif registration.get("status") != "OK" or not isinstance(registration.get("registeredName"), str) or not registration.get("registeredName"):
+            registered = registration.get("registeredNames")
+            registered = registered if isinstance(registered, list) else _describe_malformed_value(registered)
+            reasons.append(f"deployment {name!r}: GoldenGate registration status={registration.get('status')!r} (registered {registered!r}, routes {registration.get('routes')!r})")
 
         process_discovery = entry.get("processDiscovery")
         # The monitor API contract (normalize_process_discovery()) only ever emits null or an object -- a non-dict, non-null value (a string/list/number/bool) is itself a malformed-schema condition and must never be silently coerced into "absent" (None), or a malformed value would be indistinguishable from a legitimately absent discovery result.

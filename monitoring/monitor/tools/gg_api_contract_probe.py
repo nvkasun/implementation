@@ -593,13 +593,22 @@ def classify_route(http_status, body, control_status, control_body):
     return "ROUTED"
 
 
-def check_routing(deployment, fetch=None):
-    """Probes every service under the registered GoldenGate name (must route) and, when different, the canonical runtime name (reported for comparison only)."""
+def _registered_name(deployment, fetch_json):
+    """The single application deployment the Service Manager reports; ProbeValidationError if it is missing, ambiguous or malformed."""
+    _status, _content_type, payload = fetch_json(deployment, "admin", "/services/v2/deployments")
+    registration = collector.classify_registration(payload)
+    if registration["status"] != "RESOLVED":
+        raise ProbeValidationError(f"registered deployment is {registration['status']} (registered: {registration['registeredNames']})")
+    return registration["registeredName"]
+
+
+def check_routing(deployment, fetch=None, fetch_json=None):
+    """Probes every service under the registered GoldenGate name (must route) and, when different, the runtime name (reported for comparison only)."""
     fetch = fetch or _fetch_bounded
-    registered = deployment["oggDeploymentName"]
+    registered = _registered_name(deployment, fetch_json or _fetch_json)
     names = [("registered", registered)]
     if deployment["name"] != registered:
-        names.append(("canonical", deployment["name"]))
+        names.append(("runtime", deployment["name"]))
     control_name = f"route-probe-unregistered-{secrets.token_hex(6)}"
     results = []
     for service in ROUTED_SERVICES:
@@ -651,6 +660,9 @@ def main(argv=None):
             return 2
         try:
             result = check_routing(resolve_deployment(args.deployment))
+        except ProbeRequestError as e:
+            print(json.dumps({"deploymentName": args.deployment, "path": "/services/v2/deployments", "httpStatus": e.http_status, "error": e.category}))
+            return 1
         except ProbeValidationError as e:
             print(json.dumps({"error": "INVALID_ARGUMENT", "reason": str(e)}), file=sys.stderr)
             return 2

@@ -61,10 +61,6 @@ _EFS_FILESYSTEM_ID_RE = re.compile(r"^fs-[0-9a-f]+\Z")
 # Owner rwx, group any, others none; mirrored by helm/goldengate/templates/runtime-statefulset.yaml.
 _INIT_PERMISSIONS_MODE_RE = re.compile(r"^07[0-7]0\Z")
 
-# GoldenGate registered deployment name: used verbatim in Service Manager links (/services/<name>/<service>/...) and in-pod reverse-proxy routes.
-_OGG_DEPLOYMENT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}\Z")
-_RESERVED_OGG_DEPLOYMENT_NAMES = ("servicemanager",)
-
 _VALID_EFS_MODES = ("managed", "existing")
 _EFS_CREATION_TOKEN_MAX_LENGTH = 64
 
@@ -214,23 +210,6 @@ def _parse_image(environment, runtime):
     return {"repository": full_repository, "repositoryName": repository_name, "tag": tag}
 
 
-def _resolve_ogg_deployment_name(deployment_id, runtime, u02_existing_claim):
-    """GoldenGate registered deployment name: runtime.ogg.deploymentName when set, else the canonical deployment ID. A name different from the deployment ID is only valid on retained /u02 state (existingClaim), whose Service Manager registration predates the current runtime identity and cannot be renamed in place."""
-    ogg = runtime.get("ogg")
-    if ogg is None:
-        ogg = {}
-    if not isinstance(ogg, dict):
-        raise DescriptorError("invalid deployment metadata: runtime.ogg must be a mapping")
-    if "deploymentName" not in ogg or ogg["deploymentName"] in (None, ""):
-        return deployment_id
-    name = ogg["deploymentName"]
-    if not (isinstance(name, str) and _OGG_DEPLOYMENT_NAME_RE.match(name)) or name.lower() in _RESERVED_OGG_DEPLOYMENT_NAMES:
-        raise DescriptorError("invalid deployment metadata: runtime.ogg.deploymentName must start with a letter, contain only letters, digits, '-' or '_', be at most 63 characters, and not be a reserved GoldenGate name")
-    if name != deployment_id and not u02_existing_claim:
-        raise DescriptorError("invalid deployment metadata: runtime.ogg.deploymentName may differ from the deployment ID only when runtime.storage.u02.existingClaim attaches retained /u02 state registered under that name")
-    return name
-
-
 def _reject_forbidden_overrides(doc):
     """These identities are shared platform invariants, derived once and injected by the deploy workflow; an operator descriptor must never define them."""
     deployment = doc.get("deployment") or {}
@@ -249,6 +228,9 @@ def _reject_forbidden_overrides(doc):
     certificate = csi.get("certificate") or {}
     if "objectName" in certificate:
         raise DescriptorError("forbidden override: runtime.csi.certificate.objectName is a shared platform invariant and must not be set")
+    ogg = runtime.get("ogg") or {}
+    if isinstance(ogg, dict) and "deploymentName" in ogg:
+        raise DescriptorError("retired override: runtime.ogg.deploymentName is no longer supported; the registered GoldenGate deployment is resolved from Service Manager at startup")
     image = runtime.get("image") or {}
     if "repository" in image:
         raise DescriptorError("forbidden override: runtime.image.repository is shared environment identity (derived from ECR_REGISTRY + runtime.image.repositoryName) and must not be set")
@@ -504,7 +486,6 @@ def parse_descriptor(deployment_id, environment, doc, shared=None, pipeline_fold
     u02_existing_claim = efs["u02ExistingClaim"]
     u02_chart_owns_pvc = not u02_existing_claim
     u02_effective_pvc_name = _resolve_u02_effective_pvc_name(u02_type, deployment_id, u02_existing_claim, u02_claim_name)
-    ogg_deployment_name = _resolve_ogg_deployment_name(deployment_id, runtime, u02_existing_claim)
 
     return {
         "deploymentId": deployment_id,
@@ -534,8 +515,6 @@ def parse_descriptor(deployment_id, environment, doc, shared=None, pipeline_fold
         "u02ExistingClaim": u02_existing_claim,
         "u02ChartOwnsPvc": u02_chart_owns_pvc,
         "u02EffectivePvcName": u02_effective_pvc_name,
-        # GoldenGate Service Manager registered deployment name (OGG_DEPLOYMENT); equals deploymentId unless retained /u02 state was registered under an earlier name.
-        "oggDeploymentName": ogg_deployment_name,
         "albGroupOrder": alb_group_order,
         "replicas": replicas,
         "serviceType": service_type,
@@ -619,16 +598,6 @@ def validate(environment):
 
     # Automated Replication Implementation Removal: the former cross-runtime replication pipeline contract (_validate_replication_pipelines) and derived-database-credential-alias collision check are retired along with the declarative replication schema itself -- only the general logical-topology checks below (deployment.pipeline safety, deployment.role source/target cardinality) remain, since deployment.pipeline/deployment.role continue to serve identity/monitor-grouping/UI-topology purposes independent of any automated replication provisioning.
 
-    ogg_name_owners = {}
-    for d in active:
-        ogg_name = d["oggDeploymentName"].lower()
-        if ogg_name in ogg_name_owners and ogg_name_owners[ogg_name] != d["deploymentId"]:
-            problems.append(f"GoldenGate deployment name collision between {ogg_name_owners[ogg_name]!r} and {d['deploymentId']!r}")
-        ogg_name_owners[ogg_name] = d["deploymentId"]
-    for d in active:
-        if d["oggDeploymentName"] != d["deploymentId"] and d["oggDeploymentName"] in seen_ids:
-            problems.append(f"deployment {d['deploymentId']!r}: runtime.ogg.deploymentName equals another runtime's deployment ID")
-
     roles_by_pipeline = {}
     alb_orders_seen = {}
     for d in active:
@@ -678,7 +647,6 @@ def build_registry(environment, platform_values_path=None, monitor_values_path=N
             # Monitoring portal "Open GoldenGate UI" external link: ingressHost is this runtime's own resolved Ingress hostname (parse_descriptor's runtimeIngressHost -- explicit ingress.host override, or the "<deploymentId>.<dnsDomain>" default; the SAME precedence helm/goldengate.runtimeIngressHost implements, never a duplicated rule). Always present regardless of ingressEnabled (a hostname string is not sensitive and is cheap to derive) -- ingressEnabled alone is the single gate the monitor uses to decide whether to render a clickable link at all.
             "ingressEnabled": d["ingressEnabled"],
             "ingressHost": d["runtimeIngressHost"],
-            "oggDeploymentName": d["oggDeploymentName"],
         }
         for d in active_sorted
     ]

@@ -20,9 +20,6 @@ _DEPLOYMENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
 # Mirrors automation/goldengate-deployment-model.py's own _INGRESS_HOST_RE / automation/goldengate-environment.py's own _DNS_DOMAIN_RE -- re-validates the registry's already-canonically-resolved ingressHost here, defensively, rather than trusting it blindly (see _is_valid_ingress_host below); never re-derives it from name+dnsDomain (that rule now lives solely in automation/goldengate-deployment-model.py).
 _DNS_DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\Z")
 
-# Mirrors automation/goldengate-deployment-model.py _OGG_DEPLOYMENT_NAME_RE.
-_OGG_DEPLOYMENT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}\Z")
-
 
 def is_safe_deployment_type(value):
     """Generic safe-token check, never a fixed engine allowlist; oracle/postgresql/sqlserver/mysql/distributed and future types are all accepted equally."""
@@ -174,14 +171,8 @@ def load_deployments(repo_root=None):
             raise ConfigError(f"{name}: ingressHost must be a valid hostname, got {raw_ingress_host!r}")
         ingress_host = raw_ingress_host
 
-        # GoldenGate registered deployment name (Service Manager registration); defaults to the canonical name exactly as the deployment model does.
-        raw_ogg_name = entry.get("oggDeploymentName", name)
-        if not (isinstance(raw_ogg_name, str) and _OGG_DEPLOYMENT_NAME_RE.match(raw_ogg_name)) or raw_ogg_name.lower() == "servicemanager":
-            raise ConfigError(f"{name}: oggDeploymentName must be a valid GoldenGate deployment name, got {raw_ogg_name!r}")
-
         deployments.append({
             "name": name,
-            "oggDeploymentName": raw_ogg_name,
             "type": entry["type"],
             "pipeline": entry["pipeline"],
             "role": entry["role"],

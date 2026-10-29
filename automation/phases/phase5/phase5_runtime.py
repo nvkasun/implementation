@@ -608,17 +608,13 @@ def _validate_resolved_runtime_inputs(state, environment, deployment_id, *, veri
                     raise Phase5Error(f"freshly re-resolved managed EFS filesystem ID {fresh_resolved_efs_id!r} does not match the persisted resolved_efs_id={resolved_efs_id!r} -- refusing to reconcile with a stale/mismatched EFS filesystem ID.")
                 resolved_efs_id = fresh_resolved_efs_id
 
-    ogg_deployment_name = descriptor.get("oggDeploymentName")
-    if not isinstance(ogg_deployment_name, str) or not ogg_deployment_name:
-        raise Phase5Error(f"the canonical descriptor for {deployment_id!r} did not resolve a GoldenGate deployment name (oggDeploymentName).")
-
     return {
         "admin_secret_name": admin_secret_name, "tls_secret_name": tls_secret_name,
         "runtime_service_account_name": runtime_service_account_name, "image_repository": image_repository,
         "image_repository_name": image_repository_name, "image_tag": image_tag, "image_digest": image_digest,
         "efs_mode": efs_mode, "efs_file_system_id_declared": efs_file_system_id_declared, "efs_creation_token": efs_creation_token,
         "dns_domain": dns_domain, "alb_group_name": alb_group_name, "certificate_arn": certificate_arn,
-        "resolved_efs_id": resolved_efs_id, "ogg_deployment_name": ogg_deployment_name,
+        "resolved_efs_id": resolved_efs_id,
     }
 
 
@@ -1064,22 +1060,60 @@ def _container_env_value(container, name):
     return values[0] if len(values) == 1 else None
 
 
-def _validate_ogg_deployment_identity(docs, deployment_id, target_namespace, expected_ogg_deployment_name):
-    """The rendered runtime container must carry the descriptor's resolved GoldenGate registered name and the canonical in-cluster domain."""
+# Registered-identity startup hooks (helm/goldengate/files/goldengate-identity): mounted file names and the ConfigMap keys they come from.
+IDENTITY_CONFIGMAP_KEYS = ("00-goldengate-identity.sh", "99-goldengate-identity.sh", "resolve_deployment.py")
+IDENTITY_RESOLVER_HOME = "/opt/goldengate-identity"
+
+
+def expected_identity_mounts(deployment_scripts_path):
+    """volume name -> (mountPath, subPath or None) for the registered-identity hooks."""
+    return {
+        "goldengate-identity": (IDENTITY_RESOLVER_HOME, None),
+        "goldengate-identity-setup": (f"{deployment_scripts_path}/setup/00-goldengate-identity.sh", "00-goldengate-identity.sh"),
+        "goldengate-identity-startup": (f"{deployment_scripts_path}/startup/99-goldengate-identity.sh", "99-goldengate-identity.sh"),
+    }
+
+
+def _validate_ogg_deployment_identity(docs, deployment_id, target_namespace):
+    """OGG_DEPLOYMENT is the runtime ID (bootstrap name); the identity hooks resolving the registered name must be rendered and mounted without hiding existing image hooks."""
     statefulsets = [d for d in docs if d.get("kind") == "StatefulSet"]
     if len(statefulsets) != 1:
         raise Phase5Error(f"expected exactly one StatefulSet, found {len(statefulsets)}.")
-    containers = ((statefulsets[0].get("spec") or {}).get("template") or {}).get("spec", {}).get("containers") or []
+    pod_spec = ((statefulsets[0].get("spec") or {}).get("template") or {}).get("spec") or {}
+    containers = pod_spec.get("containers") or []
     if len(containers) != 1:
         raise Phase5Error(f"expected exactly one regular application container, found {len(containers)}.")
-    ogg_deployment = _container_env_value(containers[0], "OGG_DEPLOYMENT")
-    if ogg_deployment != expected_ogg_deployment_name:
-        raise Phase5Error(f"rendered OGG_DEPLOYMENT={ogg_deployment!r} does not match the descriptor's GoldenGate deployment name {expected_ogg_deployment_name!r}.")
+    container = containers[0]
+    ogg_deployment = _container_env_value(container, "OGG_DEPLOYMENT")
+    if ogg_deployment != deployment_id:
+        raise Phase5Error(f"rendered OGG_DEPLOYMENT={ogg_deployment!r} must be the runtime ID {deployment_id!r} (the bootstrap name).")
     expected_domain = f"{deployment_id}.{target_namespace}.svc.cluster.local"
-    ogg_domain = _container_env_value(containers[0], "OGG_DOMAIN")
+    ogg_domain = _container_env_value(container, "OGG_DOMAIN")
     if ogg_domain != expected_domain:
         raise Phase5Error(f"rendered OGG_DOMAIN={ogg_domain!r} does not match the canonical runtime domain {expected_domain!r}.")
-    print(f"OK: OGG_DEPLOYMENT={ogg_deployment!r} (GoldenGate registered name), OGG_DOMAIN={ogg_domain!r}.")
+    scripts_path = _container_env_value(container, "OGG_DEPLOYMENT_SCRIPTS")
+    if not isinstance(scripts_path, str) or not scripts_path.startswith("/"):
+        raise Phase5Error(f"rendered OGG_DEPLOYMENT_SCRIPTS={scripts_path!r} must be an absolute path.")
+
+    configmap_name = f"{deployment_id}-goldengate-identity"
+    configmaps = [d for d in docs if d.get("kind") == "ConfigMap" and (d.get("metadata") or {}).get("name") == configmap_name]
+    if len(configmaps) != 1 or sorted((configmaps[0].get("data") or {})) != sorted(IDENTITY_CONFIGMAP_KEYS):
+        raise Phase5Error(f"expected exactly one ConfigMap {configmap_name!r} with keys {list(IDENTITY_CONFIGMAP_KEYS)}.")
+
+    volumes = {v.get("name"): v for v in pod_spec.get("volumes") or [] if isinstance(v, dict)}
+    mounts = {}
+    for m in container.get("volumeMounts") or []:
+        mounts.setdefault(m.get("name"), []).append(m)
+    for name, (mount_path, sub_path) in expected_identity_mounts(scripts_path).items():
+        if ((volumes.get(name) or {}).get("configMap") or {}).get("name") != configmap_name:
+            raise Phase5Error(f"volume {name!r} must reference ConfigMap {configmap_name!r}.")
+        actual = mounts.get(name) or []
+        if len(actual) != 1 or actual[0].get("mountPath") != mount_path or actual[0].get("subPath") != sub_path or actual[0].get("readOnly") is not True:
+            raise Phase5Error(f"volume {name!r} must be mounted read-only exactly once at {mount_path!r} (subPath={sub_path!r}).")
+    hidden = sorted(m.get("mountPath") for ms in mounts.values() for m in ms if m.get("mountPath") in (scripts_path, f"{scripts_path}/setup", f"{scripts_path}/startup"))
+    if hidden:
+        raise Phase5Error(f"a volume is mounted over image hook directories {hidden}; only single-file subPath mounts are allowed there.")
+    print(f"OK: OGG_DEPLOYMENT={ogg_deployment!r} (bootstrap name); registered-identity hooks mounted under {scripts_path!r}; OGG_DOMAIN={ogg_domain!r}.")
 
 
 def _validate_singleruntime_manifest_contract(docs, values, deployment_id, target_namespace, image_repository, image_tag, image_digest):
@@ -1407,7 +1441,7 @@ def cmd_validate_local(args):
     _validate_runtime_service_account_used(docs, runtime_service_account_name)
     _validate_admin_secret_csi_isolation(docs, admin_secret_name, environment, deployment_id)
     _validate_singleruntime_manifest_contract(docs, values, deployment_id, target_namespace, image_repository, image_tag, image_digest)
-    _validate_ogg_deployment_identity(docs, deployment_id, target_namespace, resolved["ogg_deployment_name"])
+    _validate_ogg_deployment_identity(docs, deployment_id, target_namespace)
     _validate_efs_render_contract(values, docs, environment, deployment_id, deployment_model, resolved_efs_id, efs_mode, efs_file_system_id_declared)
 
     temp_chart_path, package_path = _package_runtime_chart(deployment_id, values_file, chart_version)

@@ -59,7 +59,7 @@ def _healthy_deployment_entry(name, deployment_type, has_processes=True, process
         "lease": {"holder": "gg-monitor-abc123", "expiresAt": 1_700_000_200, "fresh": True},
         "criticalServices": {"admin": True},
         "processDiscovery": process_discovery,
-        "registration": {"status": "MATCH", "expectedName": name, "registeredNames": [name]},
+        "registration": {"status": "OK", "registeredName": name, "registeredNames": [name], "routes": {"adminsrvr": True}},
         "processes": processes if processes is not None else [],
     }
 
@@ -348,14 +348,14 @@ class EndToEndAcceptanceTests(unittest.TestCase):
         original_validate = gdm.validate
         try:
             fake_active = [{"deploymentId": SOURCE_ID, "deploymentType": "postgresql", "role": "source",
-                             "pipeline": "repltest-pg-to-mssql-001", "enabled": True, "oggDeploymentName": SOURCE_ID}]
+                             "pipeline": "repltest-pg-to-mssql-001", "enabled": True}]
             gdm.scan = lambda environment: (fake_active, [], [])
             gdm.validate = lambda environment: []
             result = e2e.load_active_deployments(ENVIRONMENT)
         finally:
             gdm.scan = original_scan
             gdm.validate = original_validate
-        self.assertEqual(result, [{"deploymentId": SOURCE_ID, "deploymentType": "postgresql", "oggDeploymentName": SOURCE_ID}])
+        self.assertEqual(result, [{"deploymentId": SOURCE_ID, "deploymentType": "postgresql"}])
         self.assertNotIn("replicationEnabled", result[0])
         self.assertNotIn("replication", result[0])
 
@@ -528,13 +528,7 @@ class MalformedSchemaFailClosedTests(unittest.TestCase):
 
 
 class RegistrationAcceptanceTests(unittest.TestCase):
-    """A runtime is only accepted when its live Service Manager registration matches the descriptor's GoldenGate deployment name."""
-
-    def _active(self, source_ogg=SOURCE_ID):
-        active = _active_deployments()
-        active[0]["oggDeploymentName"] = source_ogg
-        active[1]["oggDeploymentName"] = TARGET_ID
-        return active
+    """A runtime is accepted only when the monitor discovered exactly one registered deployment whose routes reach its services."""
 
     def _doc(self, source_registration):
         doc = _healthy_api_doc()
@@ -544,35 +538,28 @@ class RegistrationAcceptanceTests(unittest.TestCase):
             doc["deployments"][0]["registration"] = source_registration
         return doc
 
-    def test_retained_registration_name_matching_is_healthy(self):
-        registration = {"status": "MATCH", "expectedName": "LegacySource", "registeredNames": ["LegacySource"]}
-        result = e2e.classify(ENVIRONMENT, self._active("LegacySource"), self._doc(registration))
+    def test_retained_registration_with_a_different_name_is_healthy(self):
+        registration = {"status": "OK", "registeredName": "gg-postgresql-repltest-01", "registeredNames": ["gg-postgresql-repltest-01"],
+                        "routes": {"adminsrvr": True, "distsrvr": True}}
+        result = e2e.classify(ENVIRONMENT, _active_deployments(), self._doc(registration))
         self.assertEqual(result["reasons"], [])
 
-    def test_mismatch_is_broken_and_names_both_sides(self):
-        registration = {"status": "MISMATCH", "expectedName": SOURCE_ID, "registeredNames": ["gg-postgresql-repltest-1"]}
-        result = e2e.classify(ENVIRONMENT, self._active(), self._doc(registration))
-        _assert_broken(self, result, "GoldenGate registration status='MISMATCH'")
-        self.assertTrue(any("gg-postgresql-repltest-1" in r for r in result["reasons"]))
+    def test_unverified_registration_is_broken(self):
+        for status, names in (("UNROUTED", ["gg-x-01"]), ("AMBIGUOUS", ["a", "b"]), ("MISSING", []), ("UNAVAILABLE", [])):
+            with self.subTest(status=status):
+                registration = {"status": status, "registeredName": names[0] if status == "UNROUTED" else None, "registeredNames": names, "routes": {}}
+                _assert_broken(self, e2e.classify(ENVIRONMENT, _active_deployments(), self._doc(registration)), f"status={status!r}")
 
-    def test_unavailable_registration_is_broken(self):
-        registration = {"status": "UNAVAILABLE", "expectedName": SOURCE_ID, "registeredNames": []}
-        _assert_broken(self, e2e.classify(ENVIRONMENT, self._active(), self._doc(registration)), "status='UNAVAILABLE'")
-
-    def test_registration_checked_against_a_different_expected_name_is_broken(self):
-        # The monitor's registry and the current descriptor disagree (e.g. a stale monitor rollout).
-        registration = {"status": "MATCH", "expectedName": SOURCE_ID, "registeredNames": [SOURCE_ID]}
-        _assert_broken(self, e2e.classify(ENVIRONMENT, self._active("LegacySource"), self._doc(registration)), "registration.expectedName")
+    def test_ok_without_a_registered_name_is_broken(self):
+        for name in (None, "", 7):
+            with self.subTest(name=name):
+                registration = {"status": "OK", "registeredName": name, "registeredNames": [], "routes": {"adminsrvr": True}}
+                _assert_broken(self, e2e.classify(ENVIRONMENT, _active_deployments(), self._doc(registration)), "registration status")
 
     def test_missing_or_malformed_registration_is_broken(self):
-        for raw in (_MISSING, None, "MATCH", ["MATCH"]):
+        for raw in (_MISSING, None, "OK", ["OK"]):
             with self.subTest(raw=raw):
-                _assert_broken(self, e2e.classify(ENVIRONMENT, self._active(), self._doc(raw)), "registration")
-
-    def test_load_active_deployments_carries_the_real_registered_names(self):
-        result = {d["deploymentId"]: d["oggDeploymentName"] for d in e2e.load_active_deployments(ENVIRONMENT)}
-        self.assertEqual(result.get("gg-postgresql-repltest-001"), "gg-postgresql-repltest-01")
-        self.assertEqual(result.get("gg-oracle-repltest-002"), "gg-oracle-repltest-01")
+                _assert_broken(self, e2e.classify(ENVIRONMENT, _active_deployments(), self._doc(raw)), "registration")
 
 
 _MISSING = object()

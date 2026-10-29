@@ -247,14 +247,14 @@ _KNOWN_PROCESS_STATUSES = ("RUNNING", "STOPPED", "ABENDED")
 _INCOMPLETE_DISCOVERY_STATUSES = ("PARTIAL", "UNAVAILABLE", "INVALID_RESPONSE")
 _VALID_ENDPOINT_STATUSES = ("OK", "EMPTY")
 
-# Service Manager registration check: the registered GoldenGate deployment name must equal the registry's oggDeploymentName.
-REGISTRATION_STATUSES = ("MATCH", "MISMATCH", "UNAVAILABLE")
+# Registered GoldenGate deployment: discovered from GET /services/v2/deployments, then verified through the /services/<name>/<service>/ routes.
+REGISTRATION_STATUSES = ("OK", "UNROUTED", "MISSING", "AMBIGUOUS", "UNAVAILABLE")
 _OGG_DEPLOYMENT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}\Z")
 MAX_REPORTED_REGISTRATIONS = 10
 
 
 def registered_deployment_names(payload):
-    """Sorted registered deployment names from GET /services/v2/deployments (ServiceManager excluded); None when the payload is not a valid collection."""
+    """Sorted application deployment names (ServiceManager excluded); None when the payload or any entry is malformed."""
     response = payload.get("response") if isinstance(payload, dict) else None
     items = response.get("items") if isinstance(response, dict) else None
     if not isinstance(items, list):
@@ -262,24 +262,43 @@ def registered_deployment_names(payload):
     names = set()
     for item in items:
         name = item.get("name") if isinstance(item, dict) else None
-        if isinstance(name, str) and _OGG_DEPLOYMENT_NAME_RE.match(name) and name.lower() != "servicemanager":
-            names.add(name)
+        if not isinstance(name, str):
+            return None
+        if name.lower() == "servicemanager":
+            continue
+        if not _OGG_DEPLOYMENT_NAME_RE.match(name):
+            return None
+        names.add(name)
     return sorted(names)
 
 
-def classify_registration(expected_name, payload):
+def classify_registration(payload):
     names = registered_deployment_names(payload)
     if names is None:
         status, names = "UNAVAILABLE", []
-    elif expected_name in names:
-        status = "MATCH"
+    elif not names:
+        status = "MISSING"
+    elif len(names) > 1:
+        status = "AMBIGUOUS"
     else:
-        status = "MISMATCH"
-    return {"status": status, "expectedName": expected_name, "registeredNames": names[:MAX_REPORTED_REGISTRATIONS]}
+        status = "RESOLVED"
+    return {"status": status, "registeredName": names[0] if status == "RESOLVED" else None,
+            "registeredNames": names[:MAX_REPORTED_REGISTRATIONS], "routes": {}}
 
 
-def _unavailable_registration(expected_name):
-    return {"status": "UNAVAILABLE", "expectedName": expected_name, "registeredNames": []}
+def verify_registered_routes(base, opener, registration, critical):
+    """RESOLVED -> OK only when every critical service answers 200 through /services/<registered>/<service>/."""
+    if registration.get("status") != "RESOLVED":
+        return registration
+    name = registration["registeredName"]
+    services = [svc for svc in critical if svc in _SVC_PROBE_PATH] or ["adminsrvr"]
+    routes = {svc: _http_status(f"{base}/services/{name}/{svc}/v2/{_SVC_PROBE_PATH[svc]}", opener) == 200 for svc in services}
+    return {**registration, "status": "OK" if all(routes.values()) else "UNROUTED", "routes": routes}
+
+
+def _unavailable_registration():
+    return {"status": "UNAVAILABLE", "registeredName": None, "registeredNames": [], "routes": {}}
+
 
 MAX_PROCESS_NAME_LENGTH = 128
 _PROCESS_CONTROL_CHARS = frozenset(chr(c) for c in list(range(0x00, 0x20)) + [0x7f])
@@ -396,7 +415,7 @@ def discovery_counts(procs):
     return counts
 
 
-def discover_processes(base, opener, expected_ogg_deployment_name=None):
+def discover_processes(base, opener):
     """Structured Extract/Replicat/Distribution discovery that distinguishes a valid empty inventory from a failed one."""
     deployments_payload = _http_json(f"{base}/services/v2/deployments", opener)  # liveness probe; a failure aborts discovery for this tick
 
@@ -451,7 +470,7 @@ def discover_processes(base, opener, expected_ogg_deployment_name=None):
         combined = "UNAVAILABLE"
 
     return {
-        "registration": classify_registration(expected_ogg_deployment_name, deployments_payload),
+        "registration": classify_registration(deployments_payload),
         "processes": processes,
         "status": combined,
         "collectedAt": cfgmod.now_epoch(),
@@ -1082,7 +1101,6 @@ def polling_loop(deployment, table, mgr, state, stop_event):
 
     base = f"https://{deployment['adminHost']}:{deployment['adminPort']}"
     tls_server_name = deployment["tlsServerName"]
-    expected_ogg_deployment_name = deployment["oggDeploymentName"]
     user_file, pwd_file = cfgmod.credential_paths(pipeline)
 
     def _guarded_write(proc, snap, counters=None):
@@ -1130,7 +1148,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             opener = _basic_opener(user, pwd, base, ssl_ctx, tls_server_name)
 
             try:
-                discovery = discover_processes(base, opener, expected_ogg_deployment_name)
+                discovery = discover_processes(base, opener)
             except Exception as e:
                 in_grace = (cfgmod.now_epoch() - started) < cfg["startupGraceSeconds"]
                 status = "STARTING" if in_grace else "DEPLOYMENT_DOWN"
@@ -1141,7 +1159,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
                 # PMS isn't attempted here; always overwrite any stale pms/processDiscovery map with a current UNAVAILABLE snapshot.
                 dep_snap["pms"] = _pms_unavailable_snapshot("ENDPOINT_UNAVAILABLE")
                 dep_snap["processDiscovery"] = _unavailable_discovery_snapshot()
-                dep_snap["registration"] = _unavailable_registration(expected_ogg_deployment_name)
+                dep_snap["registration"] = _unavailable_registration()
                 if transitioned:
                     dep_snap["lastTransitionAt"] = cfgmod.now_epoch()
                 _guarded_write("_deployment", dep_snap)
@@ -1162,15 +1180,7 @@ def polling_loop(deployment, table, mgr, state, stop_event):
 
             procs = discovery["processes"]
             log_discovery_summary(pipeline, discovery)
-            registration = discovery.get("registration") or _unavailable_registration(expected_ogg_deployment_name)
-            if registration["status"] != "MATCH":
-                logger.warning(json.dumps({
-                    "event": "deployment_registration_mismatch",
-                    "deployment": pipeline,
-                    "registrationStatus": registration["status"],
-                    "expectedName": registration["expectedName"],
-                    "registeredNames": registration["registeredNames"],
-                }))
+            registration = discovery.get("registration") or _unavailable_registration()
             process_inventory_complete = discovery["status"] in _VALID_ENDPOINT_STATUSES
             source_active = any(p["type"] == "extract" and p["status"] == "RUNNING" for p in procs)
 
@@ -1216,6 +1226,15 @@ def polling_loop(deployment, table, mgr, state, stop_event):
             # cfg["criticalServices"] already resolved any CONFIG override -- see resolve_critical_services.
             critical = cfg["criticalServices"]
             svc_up = probe_critical_services(base, opener, critical)
+            registration = verify_registered_routes(base, opener, registration, critical)
+            if registration["status"] != "OK":
+                logger.warning(json.dumps({
+                    "event": "deployment_registration_unverified",
+                    "deployment": pipeline,
+                    "registrationStatus": registration["status"],
+                    "registeredNames": registration["registeredNames"],
+                    "routes": registration["routes"],
+                }))
             cs_new = {svc: {"reachable": bool(up)} for svc, up in svc_up.items()}
 
             # PMS is additional observability only; a PMS failure must never mark the deployment DOWN.

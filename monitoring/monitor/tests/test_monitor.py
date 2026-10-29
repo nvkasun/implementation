@@ -937,47 +937,45 @@ DISCOVERY_STATUSES_UNDER_TEST = ("OK", "EMPTY", "PARTIAL", "UNAVAILABLE", "INVAL
 
 
 class RegistrationViewTests(unittest.TestCase):
-    """STATE#_deployment.registration exposed by /api/status and /api/processes, always re-checked against the current registry name."""
+    """STATE#_deployment.registration exposed identically by /api/status and /api/processes."""
 
     NOW = 1780000010
-    META = {"name": "gg-oracle-payments-001", "type": "oracle", "enabled": True, "oggDeploymentName": "gg-oracle-payments-01"}
+    META = {"name": "gg-oracle-repltest-002", "type": "oracle", "enabled": True}
 
     def _registration(self, raw):
-        item = make_deployment_state_item(pipeline="gg-oracle-payments-001", recorded_at=self.NOW - 5)
+        item = make_deployment_state_item(pipeline="gg-oracle-repltest-002", recorded_at=self.NOW - 5)
         if raw is not None:
             item["registration"] = raw
         table = FakeTable([item])
-        status_view = monitor.read_runtime_view(table, "source", "gg-oracle-payments-001", self.META, now=self.NOW, stale_after_seconds=120)
+        status_view = monitor.read_runtime_view(table, "source", "gg-oracle-repltest-002", self.META, now=self.NOW, stale_after_seconds=120)
         processes_view = monitor.read_deployment_processes_view(table, self.META, now=self.NOW, stale_after_seconds=120)
         self.assertEqual(status_view["registration"], processes_view["registration"])
         return status_view["registration"]
 
-    def test_match_passes_through(self):
-        raw = {"status": "MATCH", "expectedName": "gg-oracle-payments-01", "registeredNames": ["gg-oracle-payments-01"]}
+    def test_verified_retained_registration_passes_through(self):
+        raw = {"status": "OK", "registeredName": "gg-oracle-repltest-01", "registeredNames": ["gg-oracle-repltest-01"],
+               "routes": {"adminsrvr": True, "distsrvr": True}}
         self.assertEqual(self._registration(raw), raw)
 
-    def test_mismatch_passes_through(self):
-        raw = {"status": "MISMATCH", "expectedName": "gg-oracle-payments-01", "registeredNames": ["Other"]}
-        self.assertEqual(self._registration(raw)["status"], "MISMATCH")
+    def test_non_ok_statuses_pass_through(self):
+        for status in ("UNROUTED", "MISSING", "AMBIGUOUS", "UNAVAILABLE"):
+            with self.subTest(status=status):
+                self.assertEqual(self._registration({"status": status, "registeredName": None, "registeredNames": [], "routes": {}})["status"], status)
 
-    def test_stale_match_for_a_different_expected_name_is_a_mismatch(self):
-        raw = {"status": "MATCH", "expectedName": "gg-oracle-payments-001", "registeredNames": ["gg-oracle-payments-001"]}
-        out = self._registration(raw)
-        self.assertEqual(out["status"], "MISMATCH")
-        self.assertEqual(out["expectedName"], "gg-oracle-payments-01")
+    def test_ok_without_a_valid_name_or_with_a_failed_route_is_downgraded(self):
+        self.assertEqual(self._registration({"status": "OK", "registeredName": "x", "registeredNames": ["x"], "routes": {"adminsrvr": False}})["status"], "UNROUTED")
+        self.assertEqual(self._registration({"status": "OK", "registeredName": "x", "registeredNames": ["x"], "routes": {}})["status"], "UNROUTED")
+        self.assertEqual(self._registration({"status": "OK", "registeredName": "bad name", "registeredNames": [], "routes": {"adminsrvr": True}})["status"], "UNAVAILABLE")
+        self.assertEqual(self._registration({"status": "OK", "registeredName": "x", "registeredNames": ["x"], "routes": {"adminsrvr": "yes"}})["status"], "UNROUTED")
 
     def test_missing_or_malformed_registration_is_unavailable(self):
-        for raw in (None, "MATCH", [], {"status": "BOGUS"}, {"status": None}):
+        for raw in (None, "OK", [], {"status": "BOGUS"}, {"status": None}, {"status": "MATCH"}):
             with self.subTest(raw=raw):
-                self.assertEqual(self._registration(raw)["status"], "UNAVAILABLE")
+                self.assertEqual(self._registration(raw), {"status": "UNAVAILABLE", "registeredName": None, "registeredNames": [], "routes": {}})
 
-    def test_unsafe_registered_names_are_dropped(self):
-        raw = {"status": "MISMATCH", "expectedName": "gg-oracle-payments-01", "registeredNames": ["<script>", 7, None, "Good_Name"]}
+    def test_unsafe_names_are_dropped(self):
+        raw = {"status": "AMBIGUOUS", "registeredName": None, "registeredNames": ["<script>", 7, None, "Good_Name"], "routes": {}}
         self.assertEqual(self._registration(raw)["registeredNames"], ["Good_Name"])
-
-    def test_missing_state_record_reports_unavailable(self):
-        out = monitor.read_runtime_view(FakeTable([]), "source", "gg-oracle-payments-001", self.META, now=self.NOW, stale_after_seconds=120)
-        self.assertEqual(out["registration"], {"status": "UNAVAILABLE", "expectedName": "gg-oracle-payments-01", "registeredNames": []})
 
 
 class NormalizeProcessDiscoveryTests(unittest.TestCase):

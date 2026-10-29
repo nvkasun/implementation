@@ -4149,7 +4149,6 @@ def make_existing_fixture(src_path, dst_path, fs_id):
     data['persistence']['efs']['mode'] = 'existing'
     data['persistence']['efs']['fileSystemId'] = fs_id
     data['runtime']['storage']['u02']['existingClaim'] = ''
-    data['runtime'].pop('ogg', None)  # a chart-owned /u02 starts a fresh GoldenGate registration under the runtime ID
     with open(dst_path, 'w') as f:
         yaml.dump(data, f)
 
@@ -4257,7 +4256,6 @@ with open('envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-00
 default_doc = yaml.safe_load(yaml.dump(base))
 default_doc['runtime']['storage']['u02']['claimName'] = ''
 default_doc['runtime']['storage']['u02']['existingClaim'] = ''
-default_doc['runtime'].pop('ogg', None)  # a chart-owned /u02 starts a fresh GoldenGate registration under the runtime ID
 with open('${CLAIM_WORKDIR}/values/default.yaml', 'w') as f:
     yaml.dump(default_doc, f)
 
@@ -4265,7 +4263,6 @@ with open('${CLAIM_WORKDIR}/values/default.yaml', 'w') as f:
 custom_claim_doc = yaml.safe_load(yaml.dump(base))
 custom_claim_doc['runtime']['storage']['u02']['claimName'] = 'custom-owned-claim-for-render-test'
 custom_claim_doc['runtime']['storage']['u02']['existingClaim'] = ''
-custom_claim_doc['runtime'].pop('ogg', None)  # a chart-owned /u02 starts a fresh GoldenGate registration under the runtime ID
 with open('${CLAIM_WORKDIR}/values/custom-claim.yaml', 'w') as f:
     yaml.dump(custom_claim_doc, f)
 
@@ -18170,7 +18167,7 @@ DESCRIPTOR = {
     "tlsSecretName": "dev/goldengate/tls-certificate", "runtimeServiceAccountName": "gg-runtime-sa",
     "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
     "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
-    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None, "oggDeploymentName": DEPLOYMENT_ID_VALUE,
+    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
     "valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
 }
 
@@ -18608,13 +18605,15 @@ expected_members_src = fn_source("_expected_chart_package_members")
 results.append(("A: _expected_chart_package_members() derives its member set via _validate_canonical_chart_source_tree() (never a hard-coded template filename list, never a second independent .rglob(...) walk)", "_validate_canonical_chart_source_tree()" in expected_members_src))
 results.append(("A: production code contains no independent hard-coded 'runtime-statefulset.yaml' template list outside the real chart source/tests", tool_source.count("runtime-statefulset.yaml") == 0))
 real_expected = phase5_runtime._expected_chart_package_members()
-results.append(("A: the derived expected set currently matches the real helm/goldengate/ source tree contents (10 chart files + values-deployment.yaml)", real_expected == {
+results.append(("A: the derived expected set currently matches the real helm/goldengate/ source tree contents (14 chart files + values-deployment.yaml)", real_expected == {
     "goldengate/Chart.yaml", "goldengate/values.yaml", "goldengate/values-deployment.yaml",
     "goldengate/templates/_helpers.tpl", "goldengate/templates/efs-storageclass.yaml",
     "goldengate/templates/runtime-headless-service.yaml", "goldengate/templates/runtime-ingress.yaml",
     "goldengate/templates/runtime-pvc.yaml", "goldengate/templates/runtime-secretproviderclass.yaml",
     "goldengate/templates/runtime-service.yaml", "goldengate/templates/runtime-serviceaccount.yaml",
-    "goldengate/templates/runtime-statefulset.yaml",
+    "goldengate/templates/runtime-statefulset.yaml", "goldengate/templates/runtime-identity-configmap.yaml",
+    "goldengate/files/goldengate-identity/00-goldengate-identity.sh", "goldengate/files/goldengate-identity/99-goldengate-identity.sh",
+    "goldengate/files/goldengate-identity/resolve_deployment.py",
 }))
 
 # B: archive regular-file set must exactly equal the canonical expected set -- never subset-based.
@@ -18994,7 +18993,7 @@ DESCRIPTOR = {
     "tlsSecretName": "dev/goldengate/tls-certificate", "runtimeServiceAccountName": "gg-runtime-sa",
     "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
     "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
-    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None, "oggDeploymentName": DEPLOYMENT_ID_VALUE,
+    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
     "valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
 }
 
@@ -19238,7 +19237,7 @@ DESCRIPTOR = {
     "tlsSecretName": "dev/goldengate/tls-certificate", "runtimeServiceAccountName": "gg-runtime-sa",
     "imageRepository": f"{ECR_REGISTRY_VALUE}/aws-cloud-factory-goldengate-oracle",
     "imageRepositoryName": "aws-cloud-factory-goldengate-oracle", "imageTag": "23.4.0.0",
-    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None, "oggDeploymentName": DEPLOYMENT_ID_VALUE,
+    "efsMode": None, "efsFileSystemId": None, "efsCreationToken": None,
     "valuesFile": f"envs/{ENVIRONMENT_VALUE}/{DEPLOYMENT_ID_VALUE}/values.yaml",
 }
 

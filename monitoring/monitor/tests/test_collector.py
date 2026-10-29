@@ -1391,27 +1391,42 @@ class ProcessDiscoveryPersistenceTests(unittest.TestCase):
         table = self._run_tick(discovery)
         table.scan.assert_not_called()
 
-    def test_registration_persisted_into_state_deployment(self):
-        for status, registered in (("MATCH", ["gg-oracle-payments-01"]), ("MISMATCH", ["gg-oracle-payments-1"])):
-            with self.subTest(status=status):
-                registration = {"status": status, "expectedName": "gg-oracle-payments-01", "registeredNames": registered}
-                write = self._deployment_write(self._run_tick(_discovery(status="EMPTY", registration=registration)))
-                self.assertIn("registration=:reg", write["UpdateExpression"])
-                self.assertEqual(write["ExpressionAttributeValues"][":reg"], registration)
+    def _run_tick_with_routes(self, discovery, route_status):
+        with mock.patch.object(core, "_http_status", side_effect=lambda url, opener, timeout=5: route_status(url)) as status_mock:
+            table = self._run_tick(discovery)
+        return table, [c.args[0] for c in status_mock.call_args_list]
 
-    def test_missing_registration_is_persisted_as_unavailable_never_match(self):
-        write = self._deployment_write(self._run_tick(_discovery(status="EMPTY")))
-        self.assertEqual(write["ExpressionAttributeValues"][":reg"]["status"], "UNAVAILABLE")
+    def test_registered_routes_are_verified_and_persisted(self):
+        registration = core.classify_registration({"response": {"items": [{"name": "ServiceManager"}, {"name": "gg-oracle-payments-1"}]}})
+        table, urls = self._run_tick_with_routes(_discovery(status="EMPTY", registration=registration), lambda url: 200)
+        reg = self._deployment_write(table)["ExpressionAttributeValues"][":reg"]
+        self.assertEqual(reg["status"], "OK")
+        self.assertEqual(reg["registeredName"], "gg-oracle-payments-1")
+        self.assertTrue(urls and all("/services/gg-oracle-payments-1/" in u for u in urls))
 
-    def test_registration_mismatch_is_logged(self):
-        registration = {"status": "MISMATCH", "expectedName": "gg-oracle-payments-01", "registeredNames": ["OldName"]}
+    def test_unrouted_registration_is_persisted_and_logged(self):
+        registration = core.classify_registration({"response": {"items": [{"name": "OldName"}]}})
         with self.assertLogs(core.logger, level="WARNING") as log_ctx:
-            self._run_tick(_discovery(status="EMPTY", registration=registration))
-        self.assertTrue(any("deployment_registration_mismatch" in r.getMessage() and "OldName" in r.getMessage() for r in log_ctx.records))
+            table, _urls = self._run_tick_with_routes(_discovery(status="EMPTY", registration=registration), lambda url: 404)
+        self.assertEqual(self._deployment_write(table)["ExpressionAttributeValues"][":reg"]["status"], "UNROUTED")
+        self.assertTrue(any("deployment_registration_unverified" in r.getMessage() and "OldName" in r.getMessage() for r in log_ctx.records))
+
+    def test_ambiguous_or_missing_registration_is_never_route_checked(self):
+        for items in ([{"name": "a"}, {"name": "b"}], [{"name": "ServiceManager"}]):
+            with self.subTest(items=items):
+                registration = core.classify_registration({"response": {"items": items}})
+                table, urls = self._run_tick_with_routes(_discovery(status="EMPTY", registration=registration), lambda url: 200)
+                self.assertEqual(urls, [])
+                self.assertIn(self._deployment_write(table)["ExpressionAttributeValues"][":reg"]["status"], ("AMBIGUOUS", "MISSING"))
+
+    def test_missing_registration_is_persisted_as_unavailable(self):
+        table, urls = self._run_tick_with_routes(_discovery(status="EMPTY"), lambda url: 200)
+        self.assertEqual(self._deployment_write(table)["ExpressionAttributeValues"][":reg"]["status"], "UNAVAILABLE")
+        self.assertEqual(urls, [])
 
 
 class RegistrationClassificationTests(unittest.TestCase):
-    """Service Manager registration vs the registry's oggDeploymentName, from the existing GET /services/v2/deployments liveness call."""
+    """Registered deployment discovered from the existing GET /services/v2/deployments liveness call."""
 
     BASE = "https://gg-test:8443"
 
@@ -1419,33 +1434,55 @@ class RegistrationClassificationTests(unittest.TestCase):
     def _payload(*names):
         return {"response": {"items": [{"name": n} for n in names]}}
 
-    def test_match_mismatch_and_unavailable(self):
+    def test_classification(self):
         cases = [
-            ("gg-ledger-001", self._payload("ServiceManager", "gg-ledger-001"), "MATCH", ["gg-ledger-001"]),
-            ("gg-ledger-01", self._payload("ServiceManager", "gg-ledger-01"), "MATCH", ["gg-ledger-01"]),
-            ("gg-ledger-001", self._payload("ServiceManager", "gg-ledger-01"), "MISMATCH", ["gg-ledger-01"]),
-            ("gg-ledger-001", self._payload("ServiceManager"), "MISMATCH", []),
-            ("gg-ledger-001", self._payload("GG-LEDGER-001"), "MISMATCH", ["GG-LEDGER-001"]),
-            ("gg-ledger-001", self._payload("gg-ledger-01", "gg-ledger-001"), "MATCH", ["gg-ledger-001", "gg-ledger-01"]),
-            ("gg-ledger-001", {}, "UNAVAILABLE", []),
-            ("gg-ledger-001", {"response": {"items": "nope"}}, "UNAVAILABLE", []),
-            ("gg-ledger-001", None, "UNAVAILABLE", []),
+            (self._payload("ServiceManager", "gg-oracle-repltest-01"), "RESOLVED", "gg-oracle-repltest-01", ["gg-oracle-repltest-01"]),
+            (self._payload("ServiceManager", "gg-postgresql-demo-003"), "RESOLVED", "gg-postgresql-demo-003", ["gg-postgresql-demo-003"]),
+            (self._payload("Ledger_Source"), "RESOLVED", "Ledger_Source", ["Ledger_Source"]),
+            (self._payload("ServiceManager"), "MISSING", None, []),
+            (self._payload(), "MISSING", None, []),
+            (self._payload("ServiceManager", "gg-x-01", "gg-x-02"), "AMBIGUOUS", None, ["gg-x-01", "gg-x-02"]),
+            ({}, "UNAVAILABLE", None, []),
+            (None, "UNAVAILABLE", None, []),
+            ({"response": {"items": "nope"}}, "UNAVAILABLE", None, []),
+            ({"response": {"items": [{"name": "ok"}, {"name": None}]}}, "UNAVAILABLE", None, []),
+            ({"response": {"items": [{"name": "../etc"}]}}, "UNAVAILABLE", None, []),
+            ({"response": {"items": ["x"]}}, "UNAVAILABLE", None, []),
         ]
-        for expected, payload, status, names in cases:
-            with self.subTest(expected=expected, payload=payload):
-                result = core.classify_registration(expected, payload)
-                self.assertEqual(result, {"status": status, "expectedName": expected, "registeredNames": names})
-
-    def test_malformed_or_unsafe_items_are_ignored(self):
-        payload = {"response": {"items": [None, "x", {"name": None}, {"name": 7}, {"name": "../etc"}, {"name": "a b"}, {"name": "gg-ledger-001"}]}}
-        self.assertEqual(core.classify_registration("gg-ledger-001", payload)["registeredNames"], ["gg-ledger-001"])
+        for payload, status, name, names in cases:
+            with self.subTest(payload=payload):
+                self.assertEqual(core.classify_registration(payload),
+                                 {"status": status, "registeredName": name, "registeredNames": names, "routes": {}})
 
     def test_reported_names_are_bounded(self):
-        payload = self._payload(*[f"dep{i:02d}" for i in range(30)])
-        self.assertEqual(len(core.classify_registration("dep29", payload)["registeredNames"]), core.MAX_REPORTED_REGISTRATIONS)
-        self.assertEqual(core.classify_registration("dep29", payload)["status"], "MATCH")
+        result = core.classify_registration(self._payload(*[f"dep{i:02d}" for i in range(30)]))
+        self.assertEqual((result["status"], len(result["registeredNames"])), ("AMBIGUOUS", core.MAX_REPORTED_REGISTRATIONS))
 
-    def test_discover_processes_reuses_the_liveness_response_without_extra_requests(self):
+    def test_route_verification_uses_the_registered_name_for_each_critical_service(self):
+        registration = core.classify_registration(self._payload("ServiceManager", "gg-oracle-repltest-01"))
+        with mock.patch.object(core, "_http_status", return_value=200) as status_mock:
+            result = core.verify_registered_routes(self.BASE, MagicMock(), registration, ["adminsrvr", "distsrvr", "recvsrvr"])
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(sorted(c.args[0] for c in status_mock.call_args_list), sorted([
+            f"{self.BASE}/services/gg-oracle-repltest-01/adminsrvr/v2/extracts",
+            f"{self.BASE}/services/gg-oracle-repltest-01/distsrvr/v2/sources",
+            f"{self.BASE}/services/gg-oracle-repltest-01/recvsrvr/v2/targets",
+        ]))
+
+    def test_any_failed_route_is_unrouted(self):
+        registration = core.classify_registration(self._payload("gg-x-01"))
+        for code in (404, 401, 500, None):
+            with self.subTest(code=code), mock.patch.object(core, "_http_status", side_effect=lambda url, opener, timeout=5: code if "distsrvr" in url else 200):
+                result = core.verify_registered_routes(self.BASE, MagicMock(), registration, ["adminsrvr", "distsrvr"])
+                self.assertEqual((result["status"], result["routes"]), ("UNROUTED", {"adminsrvr": True, "distsrvr": False}))
+
+    def test_empty_critical_list_still_verifies_the_administration_route(self):
+        with mock.patch.object(core, "_http_status", return_value=200) as status_mock:
+            result = core.verify_registered_routes(self.BASE, MagicMock(), core.classify_registration(self._payload("gg-x-01")), [])
+        self.assertEqual(result["routes"], {"adminsrvr": True})
+        self.assertEqual(status_mock.call_count, 1)
+
+    def test_discover_processes_reuses_the_liveness_response(self):
         responses = {
             "/services/v2/deployments": self._payload("ServiceManager", "gg-legacy-01"),
             "/services/v2/extracts": {"response": {"items": []}},
@@ -1458,8 +1495,8 @@ class RegistrationClassificationTests(unittest.TestCase):
             requested.append(url)
             return responses[url[len(self.BASE):]]
         with mock.patch.object(core, "_http_json", side_effect=_stub):
-            discovery = core.discover_processes(self.BASE, MagicMock(), "gg-legacy-01")
-        self.assertEqual(discovery["registration"]["status"], "MATCH")
+            discovery = core.discover_processes(self.BASE, MagicMock())
+        self.assertEqual(discovery["registration"]["registeredName"], "gg-legacy-01")
         self.assertEqual(sorted(requested), sorted(self.BASE + p for p in responses))
 
 

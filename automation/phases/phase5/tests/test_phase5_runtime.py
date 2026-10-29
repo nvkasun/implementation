@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -158,7 +159,6 @@ DESCRIPTOR = {
     "efsMode": None,
     "efsFileSystemId": None,
     "efsCreationToken": None,
-    "oggDeploymentName": DEPLOYMENT_ID,
 }
 
 
@@ -570,7 +570,9 @@ def _statefulset(container_name="goldengate", image=EXPECTED_IMAGE, init_names=(
                   init_script='rm -f -- "$SERVICE_MANAGER_PID_FILE" # ServiceManager.pid cleanup', ogg_deployment=DEPLOYMENT_ID):
     containers = [{"name": container_name, "image": image, "env": [
         {"name": "OGG_DEPLOYMENT", "value": ogg_deployment},
-        {"name": "OGG_DOMAIN", "value": f"{DEPLOYMENT_ID}.{namespace}.svc.cluster.local"}]}]
+        {"name": "OGG_DEPLOYMENT_SCRIPTS", "value": IDENTITY_SCRIPTS_PATH},
+        {"name": "OGG_DOMAIN", "value": f"{DEPLOYMENT_ID}.{namespace}.svc.cluster.local"}],
+        "volumeMounts": _identity_volume_mounts()}]
     if extra_containers:
         containers.extend(extra_containers)
     init_containers = []
@@ -579,8 +581,28 @@ def _statefulset(container_name="goldengate", image=EXPECTED_IMAGE, init_names=(
     return {
         "kind": "StatefulSet", "metadata": {"name": DEPLOYMENT_ID, "namespace": namespace},
         "spec": {"template": {"spec": {"serviceAccountName": sa_name, "containers": containers, "initContainers": init_containers,
-                                        "volumes": [{"name": "u02", "persistentVolumeClaim": {"claimName": f"{DEPLOYMENT_ID}-u02"}}, {"name": "u03", "emptyDir": {}}]}}},
+                                        "volumes": [{"name": "u02", "persistentVolumeClaim": {"claimName": f"{DEPLOYMENT_ID}-u02"}}, {"name": "u03", "emptyDir": {}},
+                                                    *_identity_volumes()]}}},
     }
+
+
+IDENTITY_SCRIPTS_PATH = "/u01/ogg/scripts"
+IDENTITY_FILES_DIR = REPO_ROOT / "helm" / "goldengate" / "files" / "goldengate-identity"
+
+
+def _identity_volume_mounts(scripts_path=IDENTITY_SCRIPTS_PATH):
+    return [{"name": name, "mountPath": path, **({"subPath": sub} if sub else {}), "readOnly": True}
+            for name, (path, sub) in phase5_runtime.expected_identity_mounts(scripts_path).items()]
+
+
+def _identity_volumes(configmap=f"{DEPLOYMENT_ID}-goldengate-identity"):
+    keys = {"goldengate-identity": "resolve_deployment.py", "goldengate-identity-setup": "00-goldengate-identity.sh", "goldengate-identity-startup": "99-goldengate-identity.sh"}
+    return [{"name": name, "configMap": {"name": configmap, "items": [{"key": key, "path": key}]}} for name, key in keys.items()]
+
+
+def _identity_configmap(namespace=TARGET_NAMESPACE):
+    return {"kind": "ConfigMap", "metadata": {"name": f"{DEPLOYMENT_ID}-goldengate-identity", "namespace": namespace},
+            "data": {key: "x" for key in phase5_runtime.IDENTITY_CONFIGMAP_KEYS}}
 
 
 def _service(name, namespace=TARGET_NAMESPACE, headless=False):
@@ -853,50 +875,403 @@ class RealRuntimeInitContainerRenderTests(unittest.TestCase):
 
 
 class OggDeploymentIdentityValidationTests(unittest.TestCase):
-    def _docs(self, env):
-        sts = _statefulset()
-        sts["spec"]["template"]["spec"]["containers"][0]["env"] = env
-        return [sts]
+    """Render-time contract: OGG_DEPLOYMENT is the runtime ID (bootstrap name) and the registered-identity hooks are wired."""
 
-    def _domain(self):
-        return {"name": "OGG_DOMAIN", "value": f"{DEPLOYMENT_ID}.{TARGET_NAMESPACE}.svc.cluster.local"}
+    def _docs(self, **sts_overrides):
+        sts = _statefulset(**sts_overrides)
+        return [sts, _identity_configmap()]
 
-    def test_matching_registered_name_passes(self):
+    def _container(self, docs):
+        return docs[0]["spec"]["template"]["spec"]["containers"][0]
+
+    def _assert_fails(self, docs):
+        with self.assertRaises(phase5_runtime.Phase5Error):
+            phase5_runtime._validate_ogg_deployment_identity(docs, DEPLOYMENT_ID, TARGET_NAMESPACE)
+
+    def test_canonical_wiring_passes(self):
         with redirect_stdout(io.StringIO()):
-            phase5_runtime._validate_ogg_deployment_identity([_statefulset(ogg_deployment="LegacyName")], DEPLOYMENT_ID, TARGET_NAMESPACE, "LegacyName")
+            phase5_runtime._validate_ogg_deployment_identity(self._docs(), DEPLOYMENT_ID, TARGET_NAMESPACE)
 
-    def test_mismatched_missing_or_duplicated_ogg_deployment_fails(self):
-        cases = {
-            "mismatch": [{"name": "OGG_DEPLOYMENT", "value": DEPLOYMENT_ID}, self._domain()],
-            "missing": [self._domain()],
-            "duplicated": [{"name": "OGG_DEPLOYMENT", "value": "LegacyName"}, {"name": "OGG_DEPLOYMENT", "value": "LegacyName"}, self._domain()],
-        }
-        for label, env in cases.items():
-            with self.subTest(label=label), self.assertRaises(phase5_runtime.Phase5Error):
-                phase5_runtime._validate_ogg_deployment_identity(self._docs(env), DEPLOYMENT_ID, TARGET_NAMESPACE, "LegacyName")
+    def test_ogg_deployment_other_than_the_runtime_id_fails(self):
+        for value in ("gg-oracle-payments-1", "Local", "", None):
+            with self.subTest(value=value):
+                self._assert_fails(self._docs(ogg_deployment=value))
+
+    def test_missing_or_incomplete_identity_configmap_fails(self):
+        docs = self._docs()
+        self._assert_fails(docs[:1])
+        docs[1]["data"].pop("resolve_deployment.py")
+        self._assert_fails(docs)
+
+    def test_hook_mount_without_subpath_or_over_hook_directory_fails(self):
+        for mutate in (
+            lambda m: m.pop("subPath"),
+            lambda m: m.update(mountPath=f"{IDENTITY_SCRIPTS_PATH}/setup"),
+            lambda m: m.update(readOnly=False),
+        ):
+            with self.subTest(mutate=mutate):
+                docs = self._docs()
+                mount = next(m for m in self._container(docs)["volumeMounts"] if m["name"] == "goldengate-identity-setup")
+                mutate(mount)
+                self._assert_fails(docs)
+
+    def test_volume_projecting_another_configmap_fails(self):
+        docs = self._docs()
+        volume = next(v for v in docs[0]["spec"]["template"]["spec"]["volumes"] if v["name"] == "goldengate-identity")
+        volume["configMap"]["name"] = "some-other-configmap"
+        self._assert_fails(docs)
 
     def test_non_canonical_ogg_domain_fails(self):
-        env = [{"name": "OGG_DEPLOYMENT", "value": DEPLOYMENT_ID}, {"name": "OGG_DOMAIN", "value": "legacy-name.goldengate-dev.svc.cluster.local"}]
-        with self.assertRaises(phase5_runtime.Phase5Error):
-            phase5_runtime._validate_ogg_deployment_identity(self._docs(env), DEPLOYMENT_ID, TARGET_NAMESPACE, DEPLOYMENT_ID)
+        docs = self._docs()
+        env = self._container(docs)["env"]
+        next(e for e in env if e["name"] == "OGG_DOMAIN")["value"] = "legacy-name.goldengate-dev.svc.cluster.local"
+        self._assert_fails(docs)
 
-    def test_resolved_inputs_carry_the_descriptor_ogg_deployment_name(self):
-        resolved = _resolved_inputs(_resolved_state_fixture(), descriptor=_descriptor(oggDeploymentName="LegacyName"))
-        self.assertEqual(resolved["ogg_deployment_name"], "LegacyName")
 
-    def test_resolved_inputs_require_a_descriptor_ogg_deployment_name(self):
-        for value in (None, ""):
-            with self.subTest(value=value), self.assertRaises(phase5_runtime.Phase5Error):
-                _resolved_inputs(_resolved_state_fixture(), descriptor=_descriptor(oggDeploymentName=value))
+def _load_identity_resolver():
+    spec = importlib.util.spec_from_file_location("goldengate_identity_resolver", IDENTITY_FILES_DIR / "resolve_deployment.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    def test_retained_registrations_are_exactly_the_identities_that_initialised_the_retained_volumes(self):
-        # Each retained /u02 was first booted by its pre-migration runtime, whose OGG_DEPLOYMENT was its release name.
-        for (environment, new_id), old_id in phase5_runtime.RUNTIME_IDENTITY_MIGRATIONS.items():
-            with self.subTest(new_id=new_id):
-                values_file = next((REPO_ROOT / "envs" / environment / "pipelines").glob(f"*/{new_id}/values.yaml"))
-                values = yaml.safe_load(values_file.read_text())
-                self.assertEqual(values["runtime"]["ogg"]["deploymentName"], old_id)
-                self.assertEqual(values["runtime"]["storage"]["u02"]["existingClaim"], f"{old_id}-u02")
+
+identity_resolver = _load_identity_resolver()
+
+
+def _deployments_body(*names, include_service_manager=True):
+    items = ([{"name": "ServiceManager", "status": "running"}] if include_service_manager else []) + [{"name": n, "status": "running"} for n in names]
+    return json.dumps({"$schema": "api:standardResponse", "response": {"$schema": "ogg:collection", "items": items}}).encode()
+
+
+class IdentityResolverUnitTests(unittest.TestCase):
+    def test_parses_the_application_deployment_and_excludes_service_manager(self):
+        self.assertEqual(identity_resolver.parse_registered_names(_deployments_body("gg-oracle-repltest-01")), ["gg-oracle-repltest-01"])
+        self.assertEqual(identity_resolver.parse_registered_names(_deployments_body("Ledger", include_service_manager=False)), ["Ledger"])
+        self.assertEqual(identity_resolver.parse_registered_names(json.dumps({"response": {"items": [{"name": "servicemanager"}]}}).encode()), [])
+
+    def test_malformed_payloads_are_errors(self):
+        for body in (b"not json", b"\xff\xfe", b"[]", b"{}", b'{"response": {}}', b'{"response": {"items": {}}}',
+                     b'{"response": {"items": ["x"]}}', b'{"response": {"items": [{"name": 7}]}}', b'{"response": {"items": [{}]}}',
+                     _deployments_body("bad name"), _deployments_body("../etc"), _deployments_body("1bad"), _deployments_body("a" * 64)):
+            with self.subTest(body=body[:40]), self.assertRaises(identity_resolver.ResolutionError):
+                identity_resolver.parse_registered_names(body)
+
+    def test_selection_rules(self):
+        with self.assertRaises(identity_resolver.RetryableError):
+            identity_resolver.select_registered_name([], "gg-x-001", False)
+        with self.assertRaises(identity_resolver.ResolutionError):
+            identity_resolver.select_registered_name(["a", "b"], "a", False)
+        with self.assertRaises(identity_resolver.ResolutionError):
+            identity_resolver.select_registered_name(["gg-x-01"], "gg-x-001", True)
+        self.assertEqual(identity_resolver.select_registered_name(["gg-x-01"], "gg-x-001", False), "gg-x-01")
+        self.assertEqual(identity_resolver.select_registered_name(["gg-x-001"], "gg-x-001", True), "gg-x-001")
+
+    def test_resolve_retries_only_retryable_conditions_within_the_bound(self):
+        calls, sleeps = [], []
+
+        def fetch(url, user, password, timeout):
+            calls.append(url)
+            if len(calls) < 3:
+                raise identity_resolver.RetryableError("starting")
+            return _deployments_body("gg-x-01")
+        name = identity_resolver.resolve("u", "admin", "pw", "gg-x-001", False, 5, 0.5, 1, fetch=fetch, sleep=sleeps.append)
+        self.assertEqual((name, len(calls), sleeps), ("gg-x-01", 3, [0.5, 0.5]))
+
+        calls.clear()
+        with self.assertRaises(identity_resolver.ResolutionError):
+            identity_resolver.resolve("u", "admin", "pw", "gg-x-001", False, 4, 0, 1, fetch=lambda *a: (calls.append(1), _deployments_body())[1], sleep=lambda s: None)
+        self.assertEqual(len(calls), 4)
+
+        calls.clear()
+        with self.assertRaises(identity_resolver.ResolutionError):
+            identity_resolver.resolve("u", "admin", "pw", "gg-x-001", False, 4, 0, 1, fetch=lambda *a: (calls.append(1), _deployments_body("a", "b"))[1], sleep=lambda s: None)
+        self.assertEqual(len(calls), 1)
+
+    def test_resolve_rejects_unusable_inputs_without_requests(self):
+        def fetch(*a):
+            raise AssertionError("no request expected")
+        for bootstrap, user, password in (("bad name", "a", "p"), ("ServiceManager", "a", "p"), ("gg-x-001", "", "p"), ("gg-x-001", "a", "")):
+            with self.subTest(bootstrap=bootstrap, user=user), self.assertRaises(identity_resolver.ResolutionError):
+                identity_resolver.resolve("u", user, password, bootstrap, False, 3, 0, 1, fetch=fetch, sleep=lambda s: None)
+
+    def test_unresponsive_service_manager_times_out_as_retryable(self):
+        import socket
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        try:
+            url = f"http://127.0.0.1:{listener.getsockname()[1]}/services/v2/deployments"
+            with self.assertRaises(identity_resolver.RetryableError):
+                identity_resolver.fetch_deployments(url, "admin", "pw", 0.3)
+        finally:
+            listener.close()
+
+    def test_verify_nginx(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "ogg.conf"
+            conf.write_text(_render_template("gg-x-01"))
+            identity_resolver.verify_nginx(f"{tmp}/*.conf", "gg-x-01")
+            for content, expected in ((_render_template("gg-x-001"), "gg-x-01"), (OGG_CONF_TEMPLATE, "gg-x-01"),
+                                      ("location / { return 302; }\n", "gg-x-01"), (_render_template("gg-x-01") + _render_template("other"), "gg-x-01")):
+                with self.subTest(content=content[:60]), self.assertRaises(identity_resolver.ResolutionError):
+                    conf.write_text(content)
+                    identity_resolver.verify_nginx(f"{tmp}/*.conf", expected)
+            with self.assertRaises(identity_resolver.ResolutionError):
+                identity_resolver.verify_nginx(f"{tmp}/missing/*.conf", "gg-x-01")
+
+
+# NGINX template with the same ${OGG_DEPLOYMENT} location shape as the image's /etc/nginx/ogg.conf.
+OGG_CONF_TEMPLATE = "".join(
+    f"location ~ ^/services/${{OGG_DEPLOYMENT}}/{svc}(/(?<version>[^/]*)(/(?<resource>.*))?)?$ {{\n"
+    f"    proxy_set_header    X-OGG-Deployment            ${{OGG_DEPLOYMENT}};\n"
+    f"    proxy_pass          http://http_{svc};\n"
+    f"    rewrite ^/services/${{OGG_DEPLOYMENT}}/{svc}(.*) /services$1 break;\n}}\n"
+    f"location ~ ^/services/{svc}(/(?<version>[^/]*)(/(?<resource>.*))?)?$ {{\n    proxy_pass          http://http_{svc};\n}}\n"
+    for svc in ("adminsrvr", "distsrvr", "pmsrvr", "recvsrvr")
+) + "location ~ ^/services(/(?<version>[^/]*)(/(?<resource>.*))?)?$ {\n    proxy_pass          http://http_ServiceManager;\n}\nlocation / {\n    return 302 /services/v2/content/index.html;\n}\n"
+
+
+def _render_template(name):
+    return OGG_CONF_TEMPLATE.replace("${OGG_DEPLOYMENT}", name)
+
+
+def _nginx_upstream_for(conf_text, uri):
+    """First matching regex location's proxy_pass upstream, mirroring NGINX regex-location order."""
+    for match in re.finditer(r"location ~ (\S+) \{(.*?)\n\}", conf_text, re.S):
+        if re.search(match.group(1).replace("(?<", "(?P<"), uri):
+            upstream = re.search(r"proxy_pass\s+http://(\S+);", match.group(2))
+            return upstream.group(1) if upstream else None
+    return None
+
+
+# Confirmed live registrations retained on the four DEV volumes (runtime ID -> registered GoldenGate deployment).
+OBSERVED_REGISTRATIONS = {
+    "gg-postgresql-repltest-001": "gg-postgresql-repltest-01",
+    "gg-mssql-repltest-001": "gg-mssql-repltest-01",
+    "gg-oracle-repltest-002": "gg-oracle-repltest-01",
+    "gg-postgresql-repltest-002": "gg-postgresql-repltest-02",
+}
+
+SYNTHETIC_ADMIN = "synthetic-oggadmin"
+SYNTHETIC_PASSWORD = "Synthetic-P@ssw0rd-42"
+
+# Mirrors the ordering and shell semantics of the image's /usr/local/bin/deployment-main.sh (setup hooks sourced, start_ogg, start_nginx, startup hooks).
+ENTRYPOINT_SIMULATION = r"""#!/bin/bash
+set -e
+: "${OGG_DEPLOYMENT:=Local}"
+export OGG_DEPLOYMENT
+function run_user_scripts {
+	local scripts="${1}"
+	while read -r script; do
+		case "${script}" in
+		*.sh) source "${script}" ;;
+		*.py) python3 "${script}" ;;
+		esac
+	done < <(find "${scripts}" -type f | sort)
+}
+function start_ogg() {
+	if [[ ! -d "${OGG_DEPLOYMENT_HOME}/Deployment/etc" ]]; then
+		mkdir -p "${OGG_DEPLOYMENT_HOME}/Deployment/etc"
+		python3 -c 'import json,sys; json.dump([sys.argv[2]], open(sys.argv[1], "w"))' "${SIM_REGISTRY}" "${SIM_INIT_REGISTERS:-${OGG_DEPLOYMENT}}"
+	fi
+}
+function start_nginx() {
+	RENDER_CALL "${SIM_NGINX_DIR}"/*.conf
+	echo "SIM: nginx started"
+}
+run_user_scripts "${OGG_DEPLOYMENT_SCRIPTS}/setup"
+start_ogg
+start_nginx
+run_user_scripts "${OGG_DEPLOYMENT_SCRIPTS}/startup"
+echo "SIM: entrypoint completed"
+"""
+
+
+class _FakeServiceManager:
+    """Local stand-in for GET /services/v2/deployments; registrations come from a JSON list file the simulated init writes on fresh volumes."""
+
+    def __init__(self, registry_path, fail_first=0, status=200):
+        import http.server
+        import threading
+        outer = self
+        self.requests = 0
+        self.fail_first = fail_first
+        self.status = status
+        expected = "Basic " + __import__("base64").b64encode(f"{SYNTHETIC_ADMIN}:{SYNTHETIC_PASSWORD}".encode()).decode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.requests += 1
+                if self.path != "/services/v2/deployments":
+                    return self._send(404, b"{}")
+                if self.headers.get("Authorization") != expected:
+                    return self._send(401, b"{}")
+                if outer.requests <= outer.fail_first:
+                    return self._send(503, b"{}")
+                if outer.status != 200:
+                    return self._send(outer.status, b"{}")
+                names = json.loads(Path(registry_path).read_text()) if Path(registry_path).exists() else []
+                return self._send(200, _deployments_body(*names))
+
+            def _send(self, code, body):
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/services/v2/deployments"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("perl"), "bash and perl are required for the entrypoint simulation")
+class IdentityEntrypointSimulationTests(unittest.TestCase):
+    """Runs the real hook files inside a bash entrypoint with the image's startup ordering and replace-variables.sh semantics."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.registry = self.root / "sm-registrations.json"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _boot(self, runtime_id, registered=None, existing_volume=True, setup_hook=True, startup_hook=True, extra_setup=None,
+              render_call="replace-variables.sh", password=SYNTHETIC_PASSWORD, url=None, attempts="3", fail_first=0, status=200, init_registers=None):
+        u02, scripts, nginx_dir, bin_dir = (self.root / d for d in ("u02", "scripts", "nginx", "bin"))
+        for d in (u02, scripts / "setup", scripts / "startup", nginx_dir, bin_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        if existing_volume:
+            (u02 / "Deployment" / "etc").mkdir(parents=True, exist_ok=True)
+        if registered is not None:
+            self.registry.write_text(json.dumps(registered))
+        (nginx_dir / "ogg.conf").write_text(OGG_CONF_TEMPLATE)
+        replace = bin_dir / "replace-variables.sh"
+        replace.write_text("#!/bin/bash\nperl -pi -e 'foreach $key(sort keys %ENV){ s/\\$\\{$key\\}/$ENV{$key}/g}' \"$@\"\n")
+        replace.chmod(0o755)
+        for name, wanted, folder in (("00-goldengate-identity.sh", setup_hook, "setup"), ("99-goldengate-identity.sh", startup_hook, "startup")):
+            target = scripts / folder / name
+            if wanted:
+                shutil.copyfile(IDENTITY_FILES_DIR / name, target)
+            elif target.exists():
+                target.unlink()
+        for name, content in (extra_setup or {}).items():
+            (scripts / "setup" / name).write_text(content)
+        entry = self.root / "deployment-main.sh"
+        entry.write_text(ENTRYPOINT_SIMULATION.replace("RENDER_CALL", render_call.replace("BIN", str(bin_dir))))
+        sm = _FakeServiceManager(self.registry, fail_first=fail_first, status=status)
+        try:
+            env = {**{k: v for k, v in os.environ.items() if not k.startswith(("OGG_", "GOLDENGATE_"))},
+                   "PATH": f"{bin_dir}:{os.environ['PATH']}", "OGG_DEPLOYMENT": runtime_id, "OGG_DEPLOYMENT_HOME": str(u02),
+                   "OGG_DEPLOYMENT_SCRIPTS": str(scripts), "OGG_ADMIN": SYNTHETIC_ADMIN, "OGG_ADMIN_PWD": password,
+                   "GOLDENGATE_IDENTITY_HOME": str(IDENTITY_FILES_DIR), "GOLDENGATE_IDENTITY_SM_URL": url or sm.url,
+                   "GOLDENGATE_IDENTITY_ATTEMPTS": attempts, "GOLDENGATE_IDENTITY_INTERVAL_SECONDS": "0",
+                   "GOLDENGATE_IDENTITY_NGINX_CONF_GLOB": f"{nginx_dir}/*.conf", "SIM_NGINX_DIR": str(nginx_dir), "SIM_REGISTRY": str(self.registry),
+                   "PYTHONDONTWRITEBYTECODE": "1", **({"SIM_INIT_REGISTERS": init_registers} if init_registers else {})}
+            proc = subprocess.run(["bash", str(entry)], env=env, capture_output=True, text=True, timeout=60)
+        finally:
+            sm.close()
+        proc.requests = sm.requests
+        proc.conf = (nginx_dir / "ogg.conf").read_text()
+        self.assertNotIn(SYNTHETIC_PASSWORD, proc.stdout + proc.stderr)
+        self.assertNotIn(password, proc.stdout + proc.stderr)
+        return proc
+
+    def _assert_routed_to(self, proc, registered, other=None):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SIM: entrypoint completed", proc.stdout)
+        identity_resolver.verify_nginx(str(self.root / "nginx" / "*.conf"), registered)
+        for svc in ("adminsrvr", "distsrvr", "pmsrvr", "recvsrvr"):
+            # A Service Manager link for the registered deployment reaches that service, not the Service Manager fallback.
+            self.assertEqual(_nginx_upstream_for(proc.conf, f"/services/{registered}/{svc}/v2/content/"), f"http_{svc}")
+            if other and other != registered:
+                self.assertEqual(_nginx_upstream_for(proc.conf, f"/services/{other}/{svc}/v2/content/"), "http_ServiceManager")
+
+    def test_observed_retained_registrations_route_under_the_registered_name(self):
+        for runtime_id, registered in OBSERVED_REGISTRATIONS.items():
+            with self.subTest(runtime_id=runtime_id):
+                proc = self._boot(runtime_id, registered=[registered])
+                self._assert_routed_to(proc, registered, other=runtime_id)
+                self.assertEqual(json.loads(self.registry.read_text()), [registered], "existing registration must not change")
+                self.assertIn(f"differs from the runtime bootstrap name {runtime_id!r}", proc.stderr)
+
+    def test_fresh_runtime_registers_and_routes_under_its_runtime_id(self):
+        for runtime_id in ("gg-postgresql-demo-003", "ogg-db2-settlement-123", "Ledger_Target"):
+            with self.subTest(runtime_id=runtime_id):
+                self.registry.unlink(missing_ok=True)
+                shutil.rmtree(self.root / "u02", ignore_errors=True)
+                proc = self._boot(runtime_id, existing_volume=False)
+                self._assert_routed_to(proc, runtime_id)
+                self.assertEqual(json.loads(self.registry.read_text()), [runtime_id])
+                self.assertIn("fresh volume true", proc.stdout)
+
+    def test_restart_and_pod_replacement_are_idempotent(self):
+        first = self._boot("gg-postgresql-demo-003", existing_volume=False)
+        second = self._boot("gg-postgresql-demo-003")
+        self._assert_routed_to(second, "gg-postgresql-demo-003")
+        self.assertEqual(first.conf, second.conf)
+        self.assertEqual(json.loads(self.registry.read_text()), ["gg-postgresql-demo-003"])
+        replaced = self._boot("gg-postgresql-renamed-004")
+        self._assert_routed_to(replaced, "gg-postgresql-demo-003", other="gg-postgresql-renamed-004")
+
+    def test_startup_delay_is_retried(self):
+        proc = self._boot("gg-oracle-repltest-002", registered=["gg-oracle-repltest-01"], fail_first=2, attempts="5")
+        self._assert_routed_to(proc, "gg-oracle-repltest-01")
+        self.assertEqual(proc.requests, 3)
+
+    def _assert_failed_before_nginx(self, proc, message):
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(message, proc.stderr)
+        self.assertNotIn("SIM: nginx started", proc.stdout)
+        self.assertIn("${OGG_DEPLOYMENT}", proc.conf, "NGINX must not be rendered with a guessed name")
+
+    def test_ambiguous_missing_or_malformed_registrations_fail_closed(self):
+        self._assert_failed_before_nginx(self._boot("gg-x-002", registered=["gg-x-01", "gg-x-02"]), "multiple application deployments")
+        self._assert_failed_before_nginx(self._boot("gg-x-002", registered=[]), "no application deployment is registered")
+        self._assert_failed_before_nginx(self._boot("gg-x-002", registered=["bad name"]), "invalid deployment name")
+
+    def test_service_manager_unreachable_or_erroring_fails_after_bounded_retries(self):
+        proc = self._boot("gg-x-002", registered=["gg-x-01"], url="http://127.0.0.1:9/services/v2/deployments", attempts="2")
+        self._assert_failed_before_nginx(proc, "not reachable")
+        proc = self._boot("gg-x-002", registered=["gg-x-01"], status=503, attempts="2")
+        self._assert_failed_before_nginx(proc, "HTTP 503 after 2 attempts")
+        self.assertEqual(proc.requests, 2)
+
+    def test_authentication_failure_fails_fast(self):
+        proc = self._boot("gg-x-002", registered=["gg-x-01"], password="wrong-Synthetic-pw", attempts="5")
+        self._assert_failed_before_nginx(proc, "rejected the administrator credentials")
+        self.assertEqual(proc.requests, 1)
+
+    def test_fresh_volume_registering_an_unexpected_name_fails(self):
+        proc = self._boot("gg-x-003", existing_volume=False, init_registers="someone-else")
+        self.assertNotEqual(proc.returncode, 0)
+        self._assert_failed_before_nginx(proc, "fresh volume registered")
+
+    def test_missing_setup_hook_is_caught_by_the_startup_hook(self):
+        proc = self._boot("gg-x-002", registered=["gg-x-01"], setup_hook=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("setup hook missing or bypassed", proc.stderr)
+        self.assertNotIn("SIM: entrypoint completed", proc.stdout)
+
+    def test_entrypoint_rendering_through_an_absolute_path_is_rejected_before_startup(self):
+        proc = self._boot("gg-x-002", registered=["gg-x-01"], render_call="BIN/replace-variables.sh")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("does not render NGINX through a bare replace-variables.sh call", proc.stderr)
+        self.assertEqual(proc.requests, 0)
+
+    def test_existing_image_setup_hooks_still_run(self):
+        proc = self._boot("gg-x-002", registered=["gg-x-01"], extra_setup={"50-existing-image-hook.sh": 'echo "SIM: existing hook ran"\n'})
+        self._assert_routed_to(proc, "gg-x-01")
+        self.assertIn("SIM: existing hook ran", proc.stdout)
 
 
 def _rendered_pod_spec(docs):
@@ -909,7 +1284,7 @@ def _env(container):
 
 @unittest.skipUnless(shutil.which("helm"), "helm not available")
 class RealRuntimeIdentityRenderTests(unittest.TestCase):
-    """Real Helm renders: GoldenGate registered name vs canonical Kubernetes identity."""
+    """Real Helm renders of the identity wiring for the DEV descriptors and a new runtime."""
 
     _render = RealRuntimeInitContainerRenderTests._render
 
@@ -924,72 +1299,54 @@ class RealRuntimeIdentityRenderTests(unittest.TestCase):
             return subprocess.run(["helm", "template", deployment_id, str(REPO_ROOT / "helm" / "goldengate"), "--namespace", TARGET_NAMESPACE,
                                    "--values", str(path), *overrides], capture_output=True, text=True)
 
-    def test_real_descriptors_keep_canonical_kubernetes_identity_and_retained_registration(self):
+    def _assert_identity_wiring(self, docs, deployment_id):
+        with redirect_stdout(io.StringIO()):
+            phase5_runtime._validate_ogg_deployment_identity(docs, deployment_id, TARGET_NAMESPACE)
+        pod_spec = _rendered_pod_spec(docs)
+        self.assertEqual(_env(pod_spec["containers"][0])["OGG_DEPLOYMENT"], deployment_id)
+        configmap = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == f"{deployment_id}-goldengate-identity")
+        for key in phase5_runtime.IDENTITY_CONFIGMAP_KEYS:
+            self.assertEqual(configmap["data"][key], (IDENTITY_FILES_DIR / key).read_text())
+        init_mounts = {m["name"] for c in pod_spec.get("initContainers") or [] for m in c.get("volumeMounts") or []}
+        self.assertFalse(init_mounts & set(phase5_runtime.expected_identity_mounts("/x")))
+
+    def test_dev_descriptors_render_runtime_id_bootstrap_and_identity_hooks(self):
         for values_file, retained_claim in REAL_DEV_RUNTIME_RETAINED_CLAIMS.items():
             with self.subTest(values_file=values_file):
                 deployment_id = Path(values_file).parent.name
-                registered = yaml.safe_load((REPO_ROOT / values_file).read_text())["runtime"]["ogg"]["deploymentName"]
                 proc = self._render(values_file)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 docs = phase5_runtime._parse_rendered_documents(proc.stdout)
-                with redirect_stdout(io.StringIO()):
-                    phase5_runtime._validate_ogg_deployment_identity(docs, deployment_id, TARGET_NAMESPACE, registered)
-                env = _env(_rendered_pod_spec(docs)["containers"][0])
-                self.assertEqual(env["OGG_DEPLOYMENT"], registered)
-                self.assertNotEqual(registered, deployment_id)
-                self.assertEqual(env["OGG_DOMAIN"], f"{deployment_id}.{TARGET_NAMESPACE}.svc.cluster.local")
-                names = {(d["kind"], d["metadata"]["name"]) for d in docs}
-                for kind, name in (("StatefulSet", deployment_id), ("Service", deployment_id), ("Service", f"{deployment_id}-headless"), ("Ingress", f"{deployment_id}-ingress")):
-                    self.assertIn((kind, name), names)
-                self.assertFalse(any(registered in name for _kind, name in names), "registered name must never leak into Kubernetes resource names")
-                ingress = next(d for d in docs if d["kind"] == "Ingress")
-                self.assertEqual(ingress["spec"]["rules"][0]["host"], f"{deployment_id}.goldengate-dev.example.internal")
+                self._assert_identity_wiring(docs, deployment_id)
+                self.assertNotIn(OBSERVED_REGISTRATIONS[deployment_id], proc.stdout.replace(retained_claim, ""), "no registered name may be declared in rendered manifests")
                 u02 = next(v for v in _rendered_pod_spec(docs)["volumes"] if v["name"] == "u02")
                 self.assertEqual(u02["persistentVolumeClaim"]["claimName"], retained_claim)
+                self.assertEqual([d for d in docs if d["kind"] == "PersistentVolumeClaim"], [])
 
-    def test_new_runtime_registers_under_its_canonical_id_without_overrides(self):
+    def test_new_runtime_renders_without_any_identity_configuration(self):
         values = yaml.safe_load((REPO_ROOT / next(iter(REAL_DEV_RUNTIME_RETAINED_CLAIMS))).read_text())
-        values["runtime"].pop("ogg")
         values["runtime"]["storage"]["u02"]["existingClaim"] = ""
-        for new_id in ("gg-postgresql-ledger-001", "ogg-db2-settlement-123", "gg-x-9"):
-            with self.subTest(new_id=new_id):
-                proc = self._render_values(new_id, values)
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                docs = phase5_runtime._parse_rendered_documents(proc.stdout)
-                self.assertEqual(_env(_rendered_pod_spec(docs)["containers"][0])["OGG_DEPLOYMENT"], new_id)
-                pvc = next(d for d in docs if d["kind"] == "PersistentVolumeClaim")
-                self.assertEqual(pvc["metadata"]["name"], f"{new_id}-u02")
+        proc = self._render_values("gg-postgresql-demo-003", values)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        docs = phase5_runtime._parse_rendered_documents(proc.stdout)
+        self._assert_identity_wiring(docs, "gg-postgresql-demo-003")
+        self.assertEqual(next(d for d in docs if d["kind"] == "PersistentVolumeClaim")["metadata"]["name"], "gg-postgresql-demo-003-u02")
 
-    def test_chart_rejects_unsafe_or_unbacked_registration_overrides(self):
+    def test_chart_rejects_the_retired_registered_name_override(self):
         values = yaml.safe_load((REPO_ROOT / next(iter(REAL_DEV_RUNTIME_RETAINED_CLAIMS))).read_text())
-        for name in ("1bad", "bad name", "bad;id", "$(id)", "ServiceManager", "a" * 64):
+        for name in ("gg-postgresql-repltest-01", "gg-postgresql-repltest-001"):
             with self.subTest(name=name):
-                values["runtime"]["ogg"]["deploymentName"] = name
+                values["runtime"]["ogg"] = {"deploymentName": name}
                 proc = self._render_values("gg-postgresql-repltest-001", values)
                 self.assertNotEqual(proc.returncode, 0)
-                self.assertIn("runtime.ogg.deploymentName", proc.stderr)
-        values["runtime"]["ogg"]["deploymentName"] = "gg-postgresql-repltest-01"
-        values["runtime"]["storage"]["u02"]["existingClaim"] = ""
-        proc = self._render_values("gg-postgresql-repltest-001", values)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("existingClaim", proc.stderr)
+                self.assertIn("runtime.ogg.deploymentName is retired", proc.stderr)
 
     def test_repeated_renders_are_byte_identical(self):
-        # Argo CD re-syncs, restarts and pod replacement all reuse this exact pod template; nothing in it varies between renders.
         for values_file in REAL_DEV_RUNTIME_RETAINED_CLAIMS:
             with self.subTest(values_file=values_file):
                 first, second = self._render(values_file), self._render(values_file)
                 self.assertEqual(first.returncode, 0, first.stderr)
                 self.assertEqual(first.stdout, second.stdout)
-
-    def test_init_container_never_touches_goldengate_registration_state(self):
-        for values_file in REAL_DEV_RUNTIME_RETAINED_CLAIMS:
-            with self.subTest(values_file=values_file):
-                docs = phase5_runtime._parse_rendered_documents(self._render(values_file).stdout)
-                script = phase5_runtime._init_script_text(_rendered_pod_spec(docs)["initContainers"][0])
-                self.assertNotIn("OGG_DEPLOYMENT", script)
-                for path in ("/u02/ServiceManager/etc", "deploymentRegistry", "/u02/Deployment"):
-                    self.assertNotIn(path, script)
 
 
 # ==== EFS RENDER TESTS ====
@@ -2424,7 +2781,7 @@ class ValidateLocalIntegrationTests(unittest.TestCase):
 
             import yaml as _yaml
             rendered_yaml = "\n---\n".join(_yaml.safe_dump(d) for d in (
-                _statefulset(), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin"),
+                _statefulset(), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin"), _identity_configmap(),
             ))
 
             package_dir = repo_root / "packaged"
@@ -4351,7 +4708,7 @@ class ValidateLocalChartRootOrderingTests(unittest.TestCase):
             repo_root, chart_dir, args = self._normal_root_fixture(tmp)
             import yaml as _yaml
             rendered_yaml = "\n---\n".join(_yaml.safe_dump(d) for d in (
-                _statefulset(), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin"),
+                _statefulset(), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin"), _identity_configmap(),
             ))
             package_dir = repo_root / "packaged"
             scripted = ScriptedRun()
@@ -4385,7 +4742,7 @@ class ValidateLocalChartRootOrderingTests(unittest.TestCase):
             repo_root, chart_dir, args = self._normal_root_fixture(tmp)
             import yaml as _yaml
             rendered_yaml = "\n---\n".join(_yaml.safe_dump(d) for d in (
-                _statefulset(), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin"),
+                _statefulset(), _service(DEPLOYMENT_ID), _service(f"{DEPLOYMENT_ID}-headless", headless=True), _admin_spc("dev/goldengate/source/admin"), _identity_configmap(),
             ))
             package_dir = repo_root / "packaged"
             scripted = ScriptedRun()

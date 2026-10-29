@@ -44,10 +44,6 @@ runtime:
         - path: '"ca-chain.pem"'
           objectAlias: ca-chain.pem
 
-  # GoldenGate deployment registered in the retained /u02 Service Manager (existingClaim below); registrations cannot be renamed in place.
-  ogg:
-    deploymentName: gg-oracle-repltest-01
-
   initPermissions:
     enabled: true
     mode: "0770"

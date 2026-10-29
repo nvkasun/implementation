@@ -1,4 +1,5 @@
 {{- include "goldengate.assertSupportedDeploymentModel" . }}
+{{- include "goldengate.assertNoRegisteredNameOverride" . }}
 {{- if and .Values.runtime.csi.enabled .Values.runtime.csi.admin.enabled (not .Values.runtime.csi.admin.objectName) }}
 {{- fail "runtime.csi.admin.objectName is required when runtime.csi.admin.enabled=true." }}
 {{- end }}
@@ -22,6 +23,8 @@ spec:
     metadata:
       labels:
         {{- include "goldengate.runtimeLabels" . | nindent 8 }}
+      annotations:
+        checksum/goldengate-identity: {{ include "goldengate.runtimeIdentityFiles" . | sha256sum }}
     spec:
       serviceAccountName: {{ include "goldengate.runtimeServiceAccountName" . }}
 
@@ -127,7 +130,10 @@ spec:
                   key: {{ .Values.runtime.admin.passwordKey | default "OGG_ADMIN_PWD" }}
 
             - name: OGG_DEPLOYMENT
-              value: {{ include "goldengate.oggDeploymentName" . | quote }}
+              value: {{ include "goldengate.runtimeName" . | quote }}
+
+            - name: OGG_DEPLOYMENT_SCRIPTS
+              value: {{ .Values.runtime.identity.deploymentScriptsPath | quote }}
 
             - name: OGG_DOMAIN
               value: {{ printf "%s.%s.svc.cluster.local" (include "goldengate.runtimeName" .) .Release.Namespace | quote }}
@@ -175,6 +181,20 @@ spec:
               mountPath: {{ .Values.runtime.csi.certificate.mountPath | quote }}
               readOnly: true
 {{- end }}
+
+            - name: goldengate-identity
+              mountPath: /opt/goldengate-identity
+              readOnly: true
+
+            - name: goldengate-identity-setup
+              mountPath: {{ printf "%s/setup/00-goldengate-identity.sh" .Values.runtime.identity.deploymentScriptsPath | quote }}
+              subPath: 00-goldengate-identity.sh
+              readOnly: true
+
+            - name: goldengate-identity-startup
+              mountPath: {{ printf "%s/startup/99-goldengate-identity.sh" .Values.runtime.identity.deploymentScriptsPath | quote }}
+              subPath: 99-goldengate-identity.sh
+              readOnly: true
 
 {{- with .Values.runtime.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
@@ -225,6 +245,30 @@ spec:
 
         - name: u03
           emptyDir: {}
+
+        - name: goldengate-identity
+          configMap:
+            name: {{ include "goldengate.runtimeIdentityConfigMapName" . }}
+            defaultMode: 0444
+            items:
+              - key: resolve_deployment.py
+                path: resolve_deployment.py
+
+        - name: goldengate-identity-setup
+          configMap:
+            name: {{ include "goldengate.runtimeIdentityConfigMapName" . }}
+            defaultMode: 0444
+            items:
+              - key: 00-goldengate-identity.sh
+                path: 00-goldengate-identity.sh
+
+        - name: goldengate-identity-startup
+          configMap:
+            name: {{ include "goldengate.runtimeIdentityConfigMapName" . }}
+            defaultMode: 0444
+            items:
+              - key: 99-goldengate-identity.sh
+                path: 99-goldengate-identity.sh
 
 {{- if and .Values.runtime.csi.enabled .Values.runtime.csi.admin.enabled }}
         - name: ogg-admin-csi
