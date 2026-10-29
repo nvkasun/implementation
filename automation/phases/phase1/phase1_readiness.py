@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -567,7 +568,40 @@ def _parse_describe_file_systems(stdout):
     return filesystems
 
 
-def verify_managed_efs_inventory(selected_environment, aws_region, eks_deploy_role_arn):
+def _load_inventory_guard():
+    spec = importlib.util.spec_from_file_location("managed_efs_inventory_guard", EFS_INVENTORY_GUARD_TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def parse_efs_replacement_authorization(raw, event_name):
+    """Validated one-time EFS replacement authorization. Only a manual workflow_dispatch may carry one; a push run always carries none."""
+    guard = _load_inventory_guard()
+    try:
+        ids = guard.parse_authorized_replacement_ids(raw)
+    except guard.InventoryGuardError as exc:
+        raise Phase1Error(f"invalid efs_replacement_authorized_ids: {exc}") from exc
+    if ids and event_name != "workflow_dispatch":
+        raise Phase1Error("efs_replacement_authorized_ids is only accepted on a manual workflow_dispatch run.")
+    return ids
+
+
+def _require_no_access_points(filesystem_ids, aws_region, role_env):
+    """An authorized replacement must already be detached from Kubernetes: zero EFS access points."""
+    for filesystem_id in filesystem_ids:
+        proc = run(["aws", "efs", "describe-access-points", "--region", aws_region, "--file-system-id", filesystem_id, "--output", "json"], env=role_env)
+        try:
+            access_points = json.loads(proc.stdout).get("AccessPoints")
+        except (json.JSONDecodeError, AttributeError) as exc:
+            raise Phase1Error(f"aws efs describe-access-points returned a malformed response for {filesystem_id}.") from exc
+        if not isinstance(access_points, list):
+            raise Phase1Error(f"aws efs describe-access-points returned no AccessPoints list for {filesystem_id}.")
+        if access_points:
+            raise Phase1Error(f"authorized replacement {filesystem_id} still has {len(access_points)} access point(s); remove the Kubernetes PVC/PV/access points first.")
+
+
+def verify_managed_efs_inventory(selected_environment, aws_region, eks_deploy_role_arn, authorized_replacement_ids=()):
     """Read-only comparison of the deployment model's expected managed-EFS inventory with the live AWS inventory. Raises Phase1Error on any mismatch, orphan, AWS error or malformed response. Shared by Phase 1 and the Phase 2 Terraform apply gate."""
     import tempfile
 
@@ -597,6 +631,7 @@ def verify_managed_efs_inventory(selected_environment, aws_region, eks_deploy_ro
 
         describe = run(["aws", "efs", "describe-file-systems", "--region", aws_region, "--output", "json"], env=role_env)
         sanitized = sanitize_efs_filesystems(_parse_describe_file_systems(describe.stdout))
+        _require_no_access_points(authorized_replacement_ids, aws_region, role_env)
 
         in_scope_count = sum(1 for fs in sanitized if any(t.get("Key") == "ManagedBy" and t.get("Value") == "goldengate-eks-app" for t in fs.get("Tags", [])))
         print(f"Actual AWS-side EFS scan (region {aws_region}): {in_scope_count} GoldenGate-managed-tagged filesystem(s) found in scope. Unrelated EFS filesystems and any non-GoldenGate tags are never logged.")
@@ -607,7 +642,7 @@ def verify_managed_efs_inventory(selected_environment, aws_region, eks_deploy_ro
             json.dump(sanitized, f)
 
         try:
-            run([sys.executable, str(EFS_INVENTORY_GUARD_TOOL), selected_environment, expected_path, actual_path])
+            run([sys.executable, str(EFS_INVENTORY_GUARD_TOOL), selected_environment, expected_path, actual_path, ",".join(authorized_replacement_ids)])
         finally:
             os.unlink(actual_path)
     finally:
@@ -621,8 +656,10 @@ def cmd_managed_efs_inventory(args):
         raise Phase1Error("managed-efs-inventory was invoked outside Deploy mode; refusing to touch live AWS.")
     selected_environment = require_state_value(state, "selected_environment")
 
-    verify_managed_efs_inventory(selected_environment, os.environ["AWS_REGION"], os.environ["EKS_DEPLOY_ROLE_ARN"])
+    authorized = parse_efs_replacement_authorization(os.environ.get("INPUT_EFS_REPLACEMENT_AUTHORIZED_IDS", ""), os.environ.get("EVENT_NAME", ""))
+    verify_managed_efs_inventory(selected_environment, os.environ["AWS_REGION"], os.environ["EKS_DEPLOY_ROLE_ARN"], authorized)
 
+    write_github_output([("efs_replacement_authorized_ids", ",".join(authorized))])
     update_state(args.state_path, {"managed_efs_inventory_completed": "true"})
     print("OK: managed-EFS inventory matches the deployment model; no orphan detected.")
 

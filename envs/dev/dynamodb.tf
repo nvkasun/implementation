@@ -40,16 +40,6 @@ module "goldengate_pipeline_state" {
 }
 
 # CONFIG is Terraform-owned (monitor owns LEASE/STATE#). ignore_changes=[item] preserves manual tuning.
-moved {
-  from = aws_dynamodb_table_item.gg_oracle_payments_01_config
-  to   = aws_dynamodb_table_item.pipeline_config["gg-oracle-payments-01"]
-}
-
-moved {
-  from = aws_dynamodb_table_item.gg_postgresql_payments_01_config
-  to   = aws_dynamodb_table_item.pipeline_config["gg-postgresql-payments-01"]
-}
-
 resource "aws_dynamodb_table_item" "pipeline_config" {
   depends_on = [module.goldengate_pipeline_state]
 

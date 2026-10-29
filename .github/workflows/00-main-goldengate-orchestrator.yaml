@@ -45,6 +45,14 @@ on:
         type: string
         default: "Cloud Factory POC work for the Goldengate on EKS Deploymnet"
 
+      efs_replacement_authorized_ids:
+        description: >
+          One-time, operator-approved DEV storage reset only: comma-separated EFS filesystem IDs whose stale
+          creation tokens Terraform may replace in this run. Leave empty for every normal run.
+        required: false
+        type: string
+        default: ""
+
   push:
     branches:
       - main
@@ -87,6 +95,7 @@ jobs:
       deletion_matrix: ${{ steps.phase1_outputs.outputs.deletion_matrix }}
       has_storage_transition_violations: ${{ steps.phase1_outputs.outputs.has_storage_transition_violations }}
       storage_transition_violations: ${{ steps.phase1_outputs.outputs.storage_transition_violations }}
+      efs_replacement_authorized_ids: ${{ steps.managed_efs_inventory.outputs.efs_replacement_authorized_ids }}
 
     steps:
       - name: Checkout repository
@@ -201,9 +210,12 @@ jobs:
           python3 automation/phases/phase1/phase1_readiness.py storage-transition-guard
 
       - name: Verify AWS-side managed-EFS inventory (read-only)
+        id: managed_efs_inventory
         if: ${{ steps.compute_effective_deploy.outputs.effective_deploy == 'true' }}
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_EFS_REPLACEMENT_AUTHORIZED_IDS: ${{ inputs.efs_replacement_authorized_ids }}
           AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
           AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
           AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
@@ -248,6 +260,7 @@ jobs:
       # Live Deploy Fix 5: propagates validate_model's single-source-of-truth governance derivation -- never re-derived here.
       terraform_governance_override: ${{ needs.validate_model.outputs.terraform_governance_override == 'true' }}
       terraform_governance_override_reason: ${{ needs.validate_model.outputs.terraform_governance_override_reason }}
+      efs_replacement_authorized_ids: ${{ needs.validate_model.outputs.efs_replacement_authorized_ids }}
 
   # Phase 3A | Argo CD Ownership Preflight -- Phase 3 Python Conversion: automation/phases/phase3/argocd_state.py remains a pure OWNERSHIP-SAFETY classifier -- ABSENT (nothing installed yet) and OWNED (whatever currently exists is safely this repository's own Argo CD release, regardless of individual readiness/desired-state drift) both converge via reconcile_argocd below; BROKEN (foreign/ambiguous ownership, or a genuine inspection failure) fails closed right here, never auto-repaired. A DEPLOY is an end-to-end convergence operation, not merely a bootstrap: reconcile_argocd's own idempotent Helm reconciliation is what actually applies the current committed desired state -- this preflight job never needs to learn a new resource name merely to keep permitting that reconciliation. This job never mutates the cluster -- automation/phases/phase3/phase3_argocd.py ownership-preflight only runs the read-only classifier.
   phase_3_argocd:

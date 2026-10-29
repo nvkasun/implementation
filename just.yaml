@@ -11,8 +11,8 @@ ARGO_NS="${ARGO_NS:-argocd}"
 REGION="${AWS_REGION:-eu-west-1}"
 DDB_TABLE="${DDB_TABLE:-gg-eks-pipeline}"
 RUNTIMES="${RUNTIMES:-gg-postgresql-repltest-001 gg-mssql-repltest-001 gg-oracle-repltest-002 gg-postgresql-repltest-002}"
-# Operator-supplied pre-reset identities, used only to look for leftovers; never runtime configuration.
-PRE_RESET_IDS="${PRE_RESET_IDS:-gg-postgresql-repltest-01 gg-mssql-repltest-01 gg-oracle-repltest-01 gg-postgresql-repltest-02}"
+# Optional operator-supplied pre-reset identities (space-separated), used only to look for leftovers; no default, never runtime configuration.
+PRE_RESET_IDS="${PRE_RESET_IDS:-}"
 
 BLOCKERS=()
 WARNINGS=()

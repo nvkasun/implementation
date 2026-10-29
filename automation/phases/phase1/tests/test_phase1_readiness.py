@@ -336,6 +336,74 @@ class TestManagedEfsInventoryFailClosed(Phase1TestCase):
         self.assertEqual(scripted.calls, [])
 
 
+class TestEfsReplacementAuthorization(Phase1TestCase):
+    """One-time DEV storage-reset authorization: manual dispatch only, detached filesystems only, passed to the guard verbatim."""
+
+    FS = ("fs-0123456789abcdef0", "fs-0123456789abcdef1")
+
+    def _scripted(self, access_points=None):
+        return (
+            ScriptedSubprocess()
+            .on(lambda argv: "managed-efs-inventory" in argv, _ok("[]"))
+            .on(lambda argv: argv[:3] == ["aws", "sts", "assume-role"], _assume_role_ok())
+            .on(lambda argv: argv[:3] == ["aws", "sts", "get-caller-identity"], _ok(WORKLOAD_ACCOUNT_ID + "\n"))
+            .on(lambda argv: argv[:3] == ["aws", "efs", "describe-file-systems"], _ok(json.dumps({"FileSystems": []})))
+            .on(lambda argv: argv[:3] == ["aws", "efs", "describe-access-points"], access_points or _ok(json.dumps({"AccessPoints": []})))
+            .on(lambda argv: str(p1.EFS_INVENTORY_GUARD_TOOL) in argv, _ok("OK"))
+        )
+
+    def _env(self, ids, event):
+        return {"AWS_REGION": "eu-west-1", "EKS_DEPLOY_ROLE_ARN": EKS_DEPLOY_ROLE_ARN, "INPUT_EFS_REPLACEMENT_AUTHORIZED_IDS": ids, "EVENT_NAME": event}
+
+    def _guard_calls(self, scripted):
+        return [c for c in scripted.calls if str(p1.EFS_INVENTORY_GUARD_TOOL) in c]
+
+    def test_parse_accepts_only_manual_dispatch(self):
+        self.assertEqual(p1.parse_efs_replacement_authorization("", "push"), [])
+        self.assertEqual(p1.parse_efs_replacement_authorization(" ".join(self.FS), "workflow_dispatch"), list(self.FS))
+        for raw, event in ((self.FS[0], "push"), (self.FS[0], "workflow_call"), (self.FS[0], ""), ("fs-bad", "workflow_dispatch"), (f"{self.FS[0]},{self.FS[0]}", "workflow_dispatch")):
+            with self.subTest(raw=raw, event=event), self.assertRaises(p1.Phase1Error):
+                p1.parse_efs_replacement_authorization(raw, event)
+
+    def test_push_run_with_authorization_makes_no_aws_call(self):
+        p1.update_state(self.state_path, {"effective_deploy": "true", "selected_environment": "dev"})
+        scripted = self._scripted()
+        with self.assertRaises(p1.Phase1Error):
+            self.run_subcommand(p1.cmd_managed_efs_inventory, scripted=scripted, env_overrides=self._env(self.FS[0], "push"))
+        self.assertEqual(scripted.calls, [])
+        self.assertNotIn("managed_efs_inventory_completed", self.read_state())
+
+    def test_normal_run_publishes_an_empty_authorization(self):
+        p1.update_state(self.state_path, {"effective_deploy": "true", "selected_environment": "dev"})
+        scripted = self._scripted()
+        self.run_subcommand(p1.cmd_managed_efs_inventory, scripted=scripted, env_overrides=self._env("", "push"))
+        self.assertEqual(self.read_outputs()["efs_replacement_authorized_ids"], "")
+        self.assertEqual(self._guard_calls(scripted)[0][-1], "")
+        self.assertFalse(any(c[:3] == ["aws", "efs", "describe-access-points"] for c in scripted.calls))
+
+    def test_dispatch_authorization_is_checked_and_passed_to_the_guard(self):
+        p1.update_state(self.state_path, {"effective_deploy": "true", "selected_environment": "dev"})
+        scripted = self._scripted()
+        self.run_subcommand(p1.cmd_managed_efs_inventory, scripted=scripted, env_overrides=self._env(",".join(self.FS), "workflow_dispatch"))
+        self.assertEqual(self._guard_calls(scripted)[0][-1], ",".join(self.FS))
+        self.assertEqual(self.read_outputs()["efs_replacement_authorized_ids"], ",".join(self.FS))
+        checked = [c[c.index("--file-system-id") + 1] for c in scripted.calls if c[:3] == ["aws", "efs", "describe-access-points"]]
+        self.assertEqual(checked, list(self.FS))
+
+    def test_attached_or_unverifiable_filesystems_are_refused_before_the_guard(self):
+        for label, handler in (
+            ("access point present", _ok(json.dumps({"AccessPoints": [{"AccessPointId": "fsap-1"}]}))),
+            ("malformed JSON", _ok("not json")),
+            ("no AccessPoints list", _ok(json.dumps({"NextToken": "x"}))),
+            ("denied", _fail(stderr="An error occurred (AccessDeniedException)", returncode=254)),
+        ):
+            with self.subTest(label=label):
+                scripted = self._scripted(access_points=handler)
+                with mock.patch.object(p1.subprocess, "run", scripted), self.assertRaises(p1.Phase1Error):
+                    p1.verify_managed_efs_inventory("dev", "eu-west-1", EKS_DEPLOY_ROLE_ARN, list(self.FS))
+                self.assertEqual(self._guard_calls(scripted), [])
+
+
 class TestShellInjectionSafety(Phase1TestCase):
     def test_is_safe_token_rejects_shell_metacharacters(self):
         for bad in ("dev; rm -rf /", "dev`whoami`", "dev$(id)", "../../etc/passwd", "dev && echo pwned", "dev|nc", "", None, 123):

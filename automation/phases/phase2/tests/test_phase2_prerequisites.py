@@ -400,6 +400,21 @@ class TestManagedEfsInventoryGate(Phase2TestCase):
         with mock.patch.dict("os.environ", INVENTORY_ENV), mock.patch("subprocess.run", _inventory_scripted(describe=_fail(stderr="AccessDenied", returncode=254))):
             self.assertEqual(p2.main(["--state-file", str(self.state_path), "managed-efs-inventory"]), 1)
 
+    def test_authorization_is_rejected_outside_a_manual_dispatch(self):
+        for event in ("push", "workflow_call", ""):
+            with self.subTest(event=event):
+                scripted = _inventory_scripted()
+                with self.assertRaises(p2.Phase2Error):
+                    self._run(scripted, env={**INVENTORY_ENV, "EVENT_NAME": event, "EFS_REPLACEMENT_AUTHORIZED_IDS": "fs-0123456789abcdef0"})
+                self.assertEqual(scripted.calls, [])
+
+    def test_orchestrated_authorization_reaches_the_guard(self):
+        ids = "fs-0123456789abcdef0,fs-0123456789abcdef1"
+        scripted = _inventory_scripted().on(lambda argv: argv[:3] == ["aws", "efs", "describe-access-points"], _ok('{"AccessPoints": []}'))
+        self._run(scripted, env={**INVENTORY_ENV, "EVENT_NAME": "workflow_dispatch", "EFS_REPLACEMENT_AUTHORIZED_IDS": ids})
+        guard_calls = [c for c in scripted.calls if "managed_efs_inventory_guard.py" in " ".join(c)]
+        self.assertEqual(guard_calls[0][-1], ids)
+
 
 class TestTerraformApplyEntryPoints(unittest.TestCase):
     """Every Terraform apply in the repository's workflows must depend on the managed-EFS inventory gate."""
@@ -425,6 +440,28 @@ class TestTerraformApplyEntryPoints(unittest.TestCase):
         self.assertFalse(any(s.get("continue-on-error") for s in steps))
         self.assertTrue(any("phase2_prerequisites.py managed-efs-inventory" in (s.get("run") or "") for s in steps))
         self.assertTrue(all("set -euo pipefail" in s["run"] for s in steps if "run" in s))
+
+    def test_efs_replacement_authorization_enters_only_through_a_manual_orchestrator_dispatch(self):
+        sub = self._load("10-sub-iam-secrets.yaml")
+        sub_triggers = sub.get(True) or sub.get("on")
+        self.assertIn("efs_replacement_authorized_ids", sub_triggers["workflow_call"]["inputs"])
+        self.assertNotIn("efs_replacement_authorized_ids", (sub_triggers["workflow_dispatch"] or {}).get("inputs") or {})
+        gate_env = sub["jobs"]["verify_managed_efs_inventory"]["steps"]
+        env = {k: v for step in gate_env for k, v in (step.get("env") or {}).items()} | (sub["jobs"]["verify_managed_efs_inventory"].get("env") or {})
+        self.assertEqual(env.get("EVENT_NAME"), "${{ github.event_name }}")
+        self.assertEqual(env.get("EFS_REPLACEMENT_AUTHORIZED_IDS"), "${{ inputs.efs_replacement_authorized_ids }}")
+
+        main = self._load("00-main-goldengate-orchestrator.yaml")
+        main_triggers = main.get(True) or main.get("on")
+        self.assertEqual(main_triggers["workflow_dispatch"]["inputs"]["efs_replacement_authorized_ids"].get("default"), "")
+        self.assertNotIn("inputs", main_triggers.get("push") or {})
+        jobs = main["jobs"]
+        self.assertEqual(jobs["validate_model"]["outputs"]["efs_replacement_authorized_ids"], "${{ steps.managed_efs_inventory.outputs.efs_replacement_authorized_ids }}")
+        step = next(s for s in jobs["validate_model"]["steps"] if s.get("id") == "managed_efs_inventory")
+        self.assertEqual(step["env"]["EVENT_NAME"], "${{ github.event_name }}")
+        callers = [j for j in jobs.values() if "10-sub-iam-secrets.yaml" in str(j.get("uses", ""))]
+        self.assertEqual(len(callers), 1)
+        self.assertEqual(callers[0]["with"]["efs_replacement_authorized_ids"], "${{ needs.validate_model.outputs.efs_replacement_authorized_ids }}")
 
     def test_no_other_workflow_job_reaches_terraform_apply(self):
         offenders = []

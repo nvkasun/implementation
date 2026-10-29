@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = str(Path(__file__).resolve().parents[4])
@@ -283,6 +284,70 @@ class CanonicalCreationTokenTests(unittest.TestCase):
         ids = ("gg-postgresql-repltest-001", "gg-mssql-repltest-001", "gg-oracle-repltest-002", "gg-postgresql-repltest-002")
         actual = [_fs(f"fs-{n}", f"dev-{i}-efs", _valid_tags(i)) for n, i in enumerate(ids)]
         self.assertEqual(guard.check_managed_efs_inventory([_expected(i) for i in ids], actual, "dev"), [])
+
+
+class AuthorizedReplacementTests(unittest.TestCase):
+    """One-time, explicitly authorized replacement of stale-token filesystems; nothing else is relaxed."""
+
+    IDS = ("gg-postgresql-ledger-001", "gg-mssql-ledger-001")
+
+    def _stale(self, n, deployment_id, **overrides):
+        fs = _fs(f"fs-{n:017x}", f"dev-{deployment_id}-stale-efs", _valid_tags(deployment_id))
+        fs.update(overrides)
+        return fs
+
+    def _expected(self):
+        return [_expected(i) for i in self.IDS]
+
+    def test_without_authorization_stale_filesystems_still_block(self):
+        actual = [self._stale(1, self.IDS[0])]
+        with self.assertRaises(guard.InventoryGuardError):
+            guard.check_managed_efs_inventory(self._expected(), actual, "dev")
+
+    def test_authorized_stale_filesystems_pass(self):
+        actual = [self._stale(1, self.IDS[0]), self._stale(2, self.IDS[1])]
+        ids = [fs["FileSystemId"] for fs in actual]
+        self.assertEqual(guard.check_managed_efs_inventory(self._expected(), actual, "dev", ids), [])
+
+    def test_partial_authorization_leaves_the_rest_blocked(self):
+        actual = [self._stale(1, self.IDS[0]), self._stale(2, self.IDS[1])]
+        with self.assertRaises(guard.InventoryGuardError):
+            guard.check_managed_efs_inventory(self._expected(), actual, "dev", [actual[0]["FileSystemId"]])
+
+    def test_authorization_cannot_cover_canonical_foreign_or_unavailable_filesystems(self):
+        canonical = _fs("fs-00000000000000001", f"dev-{self.IDS[0]}-efs", _valid_tags(self.IDS[0]))
+        unmanaged = _fs("fs-00000000000000002", "something-else", {"Name": "x"})
+        other_env = self._stale(3, self.IDS[0], Tags=[{"Key": k, "Value": v} for k, v in _valid_tags(self.IDS[0], environment="sit").items()])
+        unknown_runtime = self._stale(4, "gg-oracle-retired-009")
+        deleting = self._stale(5, self.IDS[0], LifeCycleState="deleting")
+        for fs in (canonical, unmanaged, other_env, unknown_runtime, deleting):
+            with self.subTest(fs=fs["FileSystemId"]), self.assertRaises(guard.InventoryGuardError):
+                guard.check_managed_efs_inventory(self._expected(), [fs], "dev", [fs["FileSystemId"]])
+
+    def test_stale_or_absent_authorization_fails(self):
+        with self.assertRaises(guard.InventoryGuardError):
+            guard.check_managed_efs_inventory(self._expected(), [], "dev", ["fs-0123456789abcdef0"])
+
+    def test_authorization_parsing(self):
+        self.assertEqual(guard.parse_authorized_replacement_ids(""), [])
+        self.assertEqual(guard.parse_authorized_replacement_ids(" fs-0123456789abcdef1, fs-0123456789abcdef0 "), ["fs-0123456789abcdef0", "fs-0123456789abcdef1"])
+        for raw in ("fs-xyz", "fs-0123", "gg-oracle-repltest-002", "fs-0123456789abcdef0,fs-0123456789abcdef0", "fs-0123456789abcdef0;rm",
+                    ",".join(f"fs-{n:017x}" for n in range(guard.MAX_AUTHORIZED_REPLACEMENTS + 1))):
+            with self.subTest(raw=raw[:40]), self.assertRaises(guard.InventoryGuardError):
+                guard.parse_authorized_replacement_ids(raw)
+
+    def test_cli_accepts_the_optional_authorization_argument(self):
+        import json as _json
+        import tempfile as _tempfile
+        actual = [self._stale(1, self.IDS[0]), self._stale(2, self.IDS[1])]
+        with _tempfile.TemporaryDirectory() as tmp:
+            exp, act = Path(tmp) / "e.json", Path(tmp) / "a.json"
+            exp.write_text(_json.dumps(self._expected()))
+            act.write_text(_json.dumps(actual))
+            with mock.patch("sys.stdout"):
+                self.assertEqual(guard.main(["dev", str(exp), str(act)]), 1)
+                self.assertEqual(guard.main(["dev", str(exp), str(act), ",".join(fs["FileSystemId"] for fs in actual)]), 0)
+                self.assertEqual(guard.main(["dev", str(exp), str(act), "fs-bad"]), 1)
 
 
 class GrammarTests(unittest.TestCase):

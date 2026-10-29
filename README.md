@@ -110,76 +110,77 @@ runtime identity. Everything below derives from it, with no per-runtime exceptio
 `runtime.storage.u02.existingClaim` remains a generic capability for an
 externally provisioned claim; standard descriptors leave it empty.
 
-## DEV pre-replication storage reset (runbook)
+## DEV storage reset (runbook)
 
-The four DEV runtimes still run on volumes and EFS filesystems created under their
-pre-hierarchy names. This runbook replaces them with fresh, canonically named
-storage. It deletes all GoldenGate data on those volumes. Each step marked
-**approved** needs the project owner's written approval of the exact commands.
+This runbook replaces the storage of DEV runtimes whose EFS filesystems still carry
+a stale creation token (anything other than `<env>-<runtime>-efs`). It deletes all
+GoldenGate data on those volumes. The RDS PostgreSQL and SQL Server databases are
+not touched. Each step marked **approved** needs the project owner's written
+approval of the exact commands.
 
-**Current state:** the canonical-naming change (`fbe560a`) is already on `main`.
-While the old filesystems exist, every deploy run, including a push that only
-disables runtimes, fails Phase 1. The managed-EFS inventory guard rejects
-filesystems whose creation token is not `<env>-<runtime>-efs`, so Terraform and
-Argo CD are never reached. The procedure therefore restores the previous code
-temporarily, disables the runtimes, retires the storage, and re-applies the
-change.
+While a stale filesystem exists, the managed-EFS inventory guard blocks every
+deploy run in Phase 1 and again in front of Terraform apply. The reset keeps that
+guard. It adds one narrow exception: a manual `00 | MAIN` dispatch may name, in
+`efs_replacement_authorized_ids`, the filesystems Terraform may replace in that run.
+The exception is refused unless every named filesystem:
 
-All commits below go to `main` and trigger `00 | MAIN | GoldenGate EKS End-to-End
-Deployment` automatically, because they touch `envs/dev/**`. Announce a freeze:
-nobody else pushes to those paths or dispatches the workflow until step 7 is done.
+- is GoldenGate-managed (`ManagedBy`, `GoldenGateEnvironment`, `GoldenGateStorage`
+  tags) and tagged with a runtime that is still in the deployment model;
+- carries a stale token (a canonical filesystem cannot be named);
+- is `available` and has **zero access points**, so Kubernetes is already detached;
+- exists (a stale or mistyped authorization fails the run).
 
-### 0. Read-only preflight (no approval needed)
+Push runs and standalone `10 | SUB` runs can never carry an authorization. All
+other filesystems are checked exactly as before. No Git change and no revert is
+needed: descriptors, chart and Terraform stay at their canonical state.
 
-Run `gg-dev-reset-preflight.sh` on the SSM kubectl host, and collect:
+Announce a freeze: nobody pushes to `envs/dev/**` or `helm/goldengate/**`, and
+nobody dispatches the workflow, until step 6 is done. A push during the freeze
+fails Phase 1 harmlessly.
 
-- the Terraform owner's `terraform state list | grep goldengate_runtime_efs`, plus
-  `terraform state show` for each instance (`creation_token`, `id`);
-- the GitHub Actions result of the automatic push run for `fbe560a`. Expected:
-  Phase 1 failed at "Verify AWS-side managed-EFS inventory".
+### 0. Read-only evidence (no approval needed)
+
+Run `bash just.yaml` on the SSM kubectl host. Set `RUNTIMES` to the runtimes being
+reset (default: the four DEV runtimes). Set `PRE_RESET_IDS` only to look for
+leftovers under older identities. Collect from the Terraform owner, with the
+pipeline's backend:
+
+- `terraform state list | grep goldengate_runtime_efs`;
+- `terraform state show` for each filesystem (`creation_token`, `id`).
 
 Do not continue unless all of the following hold:
 
-- four GoldenGate filesystems carry pre-reset tokens, and none is canonical;
-- the state addresses and filesystem IDs match the AWS inventory;
+- each runtime has exactly one GoldenGate filesystem, and its token is stale;
+- the state keys are the canonical runtime IDs, and the state IDs match AWS;
 - no PV outside `goldengate-dev` references these filesystems;
 - no replication configuration exists;
-- the `fbe560a` run changed nothing.
+- the preflight reports no UNKNOWN check.
 
-### 1. Restore the previous code (no data change)
+Record the filesystem IDs and the PVC, PV and access-point names per runtime.
+
+### 1. Remove the runtime compute (approved)
+
+For each runtime, delete its ApplicationSet. Phase 5 applies these directly, and
+no parent Application recreates them:
 
 ```bash
-git revert --no-edit fbe560a && git push origin main
+kubectl -n argocd delete applicationset goldengate-dev-<runtime without gg->-appset
 ```
 
-The run must pass end to end. Terraform applies no EFS change: at most it
-re-creates the `terraform_data` migration contract. Phase 5 converges the four
-runtimes to the `34cc67a` chart, which leaves them unchanged if that chart was
-already live; otherwise each pod restarts once. Re-run the preflight; nothing may
-differ except pod start times.
+Owner-reference garbage collection deletes the child Application. Its
+`resources-finalizer.argocd.argoproj.io` cascade-deletes the StatefulSet, Pod,
+Services, Ingress, SecretProviderClasses and StorageClass. The `<runtime>-u02` PVC
+is kept (`Delete=false`). Wait until the Application is gone. Never strip
+finalizers.
 
-### 2. Disable the runtimes through the pipeline
+Re-run the preflight. Expected: no runtime pods, no `gg-efs-dev-*` StorageClass,
+and the old PVCs and PVs still present.
 
-In each of the four descriptors, change only `deployment.enabled`, the first
-`enabled:` key under `deployment:` at the top of the file. A blanket `sed` on
-`  enabled: true` would also disable ingress and persistence. Check with
-`git diff`: exactly four changed lines. Commit and push. The run:
+### 2. Remove Kubernetes storage and access points (approved)
 
-- Phase 1 records `deployment-disabled` deletions; these are allowed for managed EFS.
-- Terraform deletes the four DynamoDB CONFIG items and their dashboard widgets
-  (they are recreated with defaults in step 6). EFS filesystems are kept.
-- Phase 5 deletes each ApplicationSet, then its Application. Argo CD
-  cascade-deletes the StatefulSet, Services, Ingress, SecretProviderClasses and
-  StorageClass. Post-delete acceptance requires `ABSENT`.
-
-Re-run the preflight. Expected: no runtime pods, no `gg-efs-dev-*`
-StorageClasses, and the old PVCs and PVs still present.
-
-### 3. Remove Kubernetes storage objects (approved)
-
-Confirm no pod mounts the claim:
+Confirm that no pod mounts the claim:
 `kubectl -n goldengate-dev get pods -o jsonpath='{..claimName}'`. Then, for each
-PVC from the preflight:
+PVC from step 0:
 
 ```bash
 kubectl -n goldengate-dev delete pvc <pvc>          # PV turns Released (Retain)
@@ -187,54 +188,46 @@ kubectl delete pv <pv>                              # no CSI delete; access poin
 aws efs delete-access-point --region eu-west-1 --access-point-id <fsap from the PV volumeHandle>
 ```
 
-Delete any remaining GoldenGate access point the preflight lists on these
-filesystems. Also delete process `STATE#…` rows under the four runtime IDs, if
-the preflight reports any. The monitor never deletes rows, so they would surface
-as stale processes after the reset.
+Delete any other access point the preflight lists on these filesystems. Delete
+the process `STATE#…` rows under the runtime IDs, if the preflight reports any.
+The monitor never deletes rows, so they would surface as stale processes. Keep
+`CONFIG` and `LEASE` items: CONFIG is Terraform-owned.
 
-### 4. Retire the old filesystems (approved)
+Re-run the preflight. Expected: zero access points on every filesystem being reset.
 
-From this point until step 6 is pushed, **any** deploy run would recreate empty
-filesystems under the old tokens: the restored code's guard passes when no
-filesystem exists.
+### 3. Single authorized dispatch (approved)
 
-- **Terraform owner (preferred):** with `main` at the step 2 commit and the
-  pipeline's backend, for each address shown in step 0:
-  `terraform plan -destroy -target='module.goldengate_runtime_efs["<address key>"]'`.
-  The plan must list only that filesystem and its mount targets. Apply it, then
-  confirm `terraform state list` no longer shows it.
-- **AWS CLI (if Terraform access is unavailable):** delete each mount target,
-  wait until `describe-mount-targets` is empty, then run
-  `aws efs delete-file-system --file-system-id <fs>`. Terraform drops the missing
-  resources on the next run's refresh.
+Dispatch `00 | MAIN | GoldenGate EKS End-to-End Deployment` with:
 
-Confirm with the preflight that no GoldenGate-managed filesystem remains.
+- `environment=dev`, `action=deploy`, `deployment_id` left blank;
+- `efs_replacement_authorized_ids=<the filesystem IDs from step 0>`, comma-separated.
 
-### 5. Re-apply the canonical-naming change and re-enable
+The run:
 
-```bash
-git revert --no-edit <step-2 commit> <step-1 revert commit>
-git diff --stat fbe560a -- envs automation helm .github README.md   # must be empty
-git push origin main
-```
-
-### 6. Expected run
-
-- **Phase 1:** the inventory guard passes, because no filesystems exist.
-- **Terraform:** creates four `dev-<runtime>-efs` filesystems with mount targets
-  and four default CONFIG items, and removes the migration contract.
+- **Phase 1:** prints `AUTHORIZED REPLACEMENT: …` for each named filesystem and
+  passes the IDs to the Terraform job only.
+- **Terraform:** the apply gate re-checks the same authorization. The plan must
+  show only `-/+` replacement of each named `aws_efs_file_system` and its mount
+  targets, now with token `dev-<runtime>-efs`. The Terraform owner rejects any
+  other destroy. CONFIG items are unchanged.
 - **Phase 5:**
-  - resolves the new filesystem IDs;
+  - recreates each ApplicationSet with the new filesystem ID;
   - creates `gg-efs-dev-<runtime>` (base path `/<runtime>`), the PVC
     `<runtime>-u02` with a new access point, and the StatefulSet;
   - on empty `/u02`, GoldenGate registers `<runtime>`, and the identity hook logs
     `registered deployment '<runtime>' matches the runtime bootstrap name`.
 
-### 7. Validate
+### 4. Close the authorization
+
+No action is needed. The input defaults to empty and applies to that run only.
+Every later run must leave it empty, and the guard then accepts only canonical
+filesystems.
+
+### 5. Validate
 
 Re-run the preflight. Every item below must hold:
 
-- [ ] Only canonical tokens.
+- [ ] Only canonical tokens; `terraform state show` matches AWS.
 - [ ] One `<runtime>-u02` PVC per runtime, Bound.
 - [ ] Pods Ready, with no restarts during bootstrap.
 - [ ] Service Manager registered list is `[ServiceManager, <runtime>]`.
@@ -244,16 +237,22 @@ Re-run the preflight. Every item below must hold:
 - [ ] The Service Manager UI links work.
 - [ ] Phase 6 acceptance is HEALTHY.
 
+### 6. Lift the freeze
+
+Normal push runs resume.
+
 ### Recovery
 
-- **Step 1 or 2 run fails:** fix and re-run. Nothing destructive has happened yet.
-- **Step 3 or 4 interrupted:** re-run the preflight and continue from the first
-  incomplete item.
-- **A deploy ran between steps 4 and 5:** it recreated empty filesystems with old
-  tokens. Treat them as old filesystems and repeat steps 2–4 for them before step 5.
-- **Step 6 Phase 1 fails naming an old token:** a filesystem was missed; finish step 4.
+- **Step 3 Phase 1 fails:** read the guard message. Typical causes are an access
+  point that still exists (finish step 2), a mistyped ID, or a filesystem that was
+  not named. Nothing has changed yet; fix and dispatch again.
+- **Terraform fails part-way:** the replaced filesystems now carry canonical
+  tokens. Dispatch again naming only the remaining stale IDs. Naming an ID that no
+  longer exists fails the run.
+- **Phase 5 fails after Terraform succeeded:** dispatch again with the
+  authorization empty.
 - **A pod stops with `goldengate-identity: ERROR`:** read the message.
   `multiple application deployments` means the volume is not fresh. If the
   container restarted during first bootstrap (liveness), the volume may hold a
-  partial deployment. In either case, stop and repeat steps 2–4 for that runtime.
-- **Rollback after step 4:** there is none. The old data is gone by design.
+  partial deployment. In either case, stop and repeat steps 1–3 for that runtime.
+- **Rollback after step 2:** there is none. The old data is gone by design.

@@ -236,7 +236,8 @@ def cmd_managed_efs_inventory(args):
 
     phase1 = _load_phase1_readiness()
     try:
-        phase1.verify_managed_efs_inventory(target_environment, aws_region, eks_deploy_role_arn)
+        authorized = phase1.parse_efs_replacement_authorization(os.environ.get("EFS_REPLACEMENT_AUTHORIZED_IDS", ""), os.environ.get("EVENT_NAME", ""))
+        phase1.verify_managed_efs_inventory(target_environment, aws_region, eks_deploy_role_arn, authorized)
     except phase1.Phase1Error as exc:
         raise Phase2Error(f"managed-EFS inventory guard failed -- Terraform apply is blocked: {exc}") from exc
     except (OSError, ValueError, KeyError, TypeError) as exc:

@@ -12,6 +12,9 @@ _SAFE_ENVIRONMENT_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
 _SAFE_CREATION_TOKEN_RE = re.compile(r"^[a-z][a-z0-9-]*-efs\Z")
 _EFS_CREATION_TOKEN_MAX_LENGTH = 64
 
+_FILESYSTEM_ID_RE = re.compile(r"^fs-[0-9a-f]{8,40}\Z")
+MAX_AUTHORIZED_REPLACEMENTS = 16
+
 MANAGED_BY_VALUE = "goldengate-eks-app"
 REQUIRED_STORAGE_VALUE = "u02"
 
@@ -47,15 +50,50 @@ def derive_expected_creation_token(environment, deployment_id):
     return f"{environment}-{deployment_id}-efs"
 
 
-def check_managed_efs_inventory(expected, actual, environment):
+def parse_authorized_replacement_ids(raw):
+    """Explicit one-time replacement authorization: comma/space separated fs- IDs. Empty means none; anything malformed fails."""
+    tokens = [t for t in re.split(r"[\s,]+", raw or "") if t]
+    if len(tokens) > MAX_AUTHORIZED_REPLACEMENTS:
+        raise InventoryGuardError(f"at most {MAX_AUTHORIZED_REPLACEMENTS} filesystems may be authorized for replacement in one run.")
+    for token in tokens:
+        if not _FILESYSTEM_ID_RE.match(token):
+            raise InventoryGuardError(f"authorized replacement {token!r} is not a valid EFS filesystem ID.")
+    if len(set(tokens)) != len(tokens):
+        raise InventoryGuardError("authorized replacement IDs contain duplicates.")
+    return sorted(tokens)
+
+
+def _check_authorized_replacement(fs, expected_by_id, environment):
+    """An authorized filesystem must be a GoldenGate-owned, available filesystem of a current managed runtime whose creation token is stale; Terraform then replaces it."""
+    tags = _normalize_tags(fs.get("Tags"))
+    filesystem_id = fs.get("FileSystemId")
+    deployment_id = tags.get("GoldenGateDeploymentId")
+    if not (tags.get("ManagedBy") == MANAGED_BY_VALUE and tags.get("GoldenGateEnvironment") == environment and tags.get("GoldenGateStorage") == REQUIRED_STORAGE_VALUE):
+        raise InventoryGuardError(f"authorized replacement {filesystem_id!r} is not a GoldenGate-managed u02 filesystem of environment {environment!r}.")
+    if deployment_id not in expected_by_id:
+        raise InventoryGuardError(f"authorized replacement {filesystem_id!r} is not tagged with a current managed runtime (GoldenGateDeploymentId={deployment_id!r}).")
+    if fs.get("CreationToken") == expected_by_id[deployment_id]:
+        raise InventoryGuardError(f"authorized replacement {filesystem_id!r} already carries the canonical creation token for {deployment_id!r}; it must not be replaced.")
+    if fs.get("LifeCycleState") != "available":
+        raise InventoryGuardError(f"authorized replacement {filesystem_id!r} is in lifecycle state {fs.get('LifeCycleState')!r}, expected 'available'.")
+    return deployment_id
+
+
+def check_managed_efs_inventory(expected, actual, environment, authorized_replacement_ids=()):
     """expected: [{"deploymentId": ..., "efsCreationToken": ...}, ...] (from the deployment model, includes deployment.enabled=false descriptors). actual: AWS FileSystemDescription-shaped dicts (FileSystemId/CreationToken/Tags) sanitized down to the four GoldenGate tags. Returns the list of orphan deployment IDs (each with the fixed ORPHAN_MESSAGE) -- empty means PASS. Raises InventoryGuardError for a creation-token collision, malformed/missing ownership tags on an otherwise ManagedBy=goldengate-eks-app filesystem (checked in full BEFORE any environment-based ignore decision -- a validly-tagged other-environment resource is the only thing ever silently ignored), a deployment-tag/creation-token identity mismatch, or a duplicate GoldenGateDeploymentId -- all fail closed before any orphan comparison even runs."""
     expected_by_id = {e["deploymentId"]: e["efsCreationToken"] for e in expected}
     expected_by_token = {e["efsCreationToken"]: e["deploymentId"] for e in expected}
 
+    authorized = set(authorized_replacement_ids)
+    authorized_seen = set()
     in_scope = []
     for fs in actual:
         tags = _normalize_tags(fs.get("Tags"))
         filesystem_id = fs.get("FileSystemId")
+        if filesystem_id in authorized:
+            _check_authorized_replacement(fs, expected_by_id, environment)
+            authorized_seen.add(filesystem_id)
+            continue
         creation_token = fs.get("CreationToken")
         managed_by = tags.get("ManagedBy")
         environment_tag = tags.get("GoldenGateEnvironment")
@@ -147,6 +185,10 @@ def check_managed_efs_inventory(expected, actual, environment):
                 f"({expected_by_id[deployment_id]!r})."
             )
 
+    missing_authorized = sorted(authorized - authorized_seen)
+    if missing_authorized:
+        raise InventoryGuardError(f"authorized replacement filesystem(s) {missing_authorized} were not found in the actual inventory -- refusing a stale authorization.")
+
     actual_ids = set(by_deployment_id.keys())
     expected_ids = set(expected_by_id.keys())
     orphans = sorted(actual_ids - expected_ids)
@@ -155,18 +197,19 @@ def check_managed_efs_inventory(expected, actual, environment):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 3:
-        print("usage: managed_efs_inventory_guard.py <environment> <expected-json-file> <actual-json-file>")
+    if len(argv) not in (3, 4):
+        print("usage: managed_efs_inventory_guard.py <environment> <expected-json-file> <actual-json-file> [<authorized-replacement-ids>]")
         return 2
 
-    environment, expected_path, actual_path = argv
+    environment, expected_path, actual_path = argv[:3]
     with open(expected_path) as f:
         expected = json.load(f)
     with open(actual_path) as f:
         actual = json.load(f)
 
     try:
-        orphans = check_managed_efs_inventory(expected, actual, environment)
+        authorized = parse_authorized_replacement_ids(argv[3] if len(argv) == 4 else "")
+        orphans = check_managed_efs_inventory(expected, actual, environment, authorized)
     except InventoryGuardError as exc:
         print(f"FAIL: {exc}")
         return 1
@@ -176,6 +219,8 @@ def main(argv=None):
             print(f"FAIL: {orphan['deploymentId']}: {orphan['message']}")
         return 1
 
+    for filesystem_id in authorized:
+        print(f"AUTHORIZED REPLACEMENT: {filesystem_id} carries a stale creation token; Terraform will replace it in this run.")
     print(f"OK: every actual GoldenGate-managed EFS filesystem in {environment} maps to a current managed deployment descriptor by both identity tag and creation token.")
     return 0
 

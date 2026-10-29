@@ -48,10 +48,10 @@ class PreflightClassificationTests(unittest.TestCase):
             path.chmod(0o755)
         self.log = self.root / "calls.jsonl"
 
-    def _run(self, rules):
+    def _run(self, rules, extra_env=None):
         rules_path = self.root / "rules.json"
         rules_path.write_text(json.dumps(rules + [["sts get-caller-identity", 0, "123456789012\n", ""], ["get --raw /version", 0, "{}", ""]]))
-        env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_RULES": str(rules_path), "STUB_LOG": str(self.log)}
+        env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_RULES": str(rules_path), "STUB_LOG": str(self.log), **(extra_env or {})}
         proc = subprocess.run(["bash", str(PREFLIGHT)], env=env, capture_output=True, text=True, timeout=120)
         self.assertNotIn(SECRET_MARKER, proc.stdout + proc.stderr, "error bodies must never be printed")
         proc.calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
@@ -106,7 +106,7 @@ class PreflightClassificationTests(unittest.TestCase):
         self.assertNotIn("process STATE# rows exist", proc.stdout)
 
     def test_dynamodb_rows_are_reported_when_confirmed(self):
-        proc = self._run([["dynamodb query", 0, "CONFIG\tNone\nSTATE#EXT1\t1780000000\n", ""]])
+        proc = self._run([["dynamodb query", 0, "CONFIG\tNone\nSTATE#EXT1\t1780000000\n", ""]], {"PRE_RESET_IDS": "gg-postgresql-repltest-01"})
         self.assertEqual(proc.returncode, 0, proc.stdout)
         self.assertIn(f"WARNING: process STATE# rows exist under {RUNTIMES[0]}", proc.stdout)
         self.assertIn("items remain under pre-reset id gg-postgresql-repltest-01", proc.stdout)
@@ -126,6 +126,13 @@ class PreflightClassificationTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("WARNING: GoldenGate PV(s) without Retain: pv-a", proc.stdout)
         self.assertIn("BLOCKER: fs-00000000000000000 is referenced by PV(s) outside goldengate-dev: pv-b", proc.stdout)
+
+    def test_no_pre_reset_identities_are_queried_by_default(self):
+        proc = self._run([])
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        queried = [c for c in proc.calls if c[0] == "aws" and "query" in c]
+        self.assertEqual(len(queried), len(RUNTIMES))
+        self.assertNotIn("pre-reset id", proc.stdout)
 
     def test_aws_identity_failure_is_a_blocker(self):
         proc = self._run([["sts get-caller-identity", 255, "", "Unable to locate credentials"]])

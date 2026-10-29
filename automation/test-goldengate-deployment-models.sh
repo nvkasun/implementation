@@ -6696,8 +6696,8 @@ check("dynamodb.tf has no CONFIG identity-migration map, contract or legacy data
       all(t not in dynamodb for t in ("goldengate_config_migration", "legacy_pipeline_config", "terraform_data")))
 check("pipeline_config always writes the default CONFIG body keyed by the canonical runtime ID, preserving manual tuning via ignore_changes=[item]",
       re.search(r'resource "aws_dynamodb_table_item" "pipeline_config" \{.*?item = jsonencode\(\{\s*pipeline\s*= \{ S = each.key \}.*?ignore_changes = \[item\]', dynamodb, re.S) is not None)
-check("the two historical payments-01 moved blocks remain untouched",
-      dynamodb.count('to   = aws_dynamodb_table_item.pipeline_config["gg-') == 2)
+check("envs/dev/dynamodb.tf carries no historical moved block (retired payments-01 CONFIG addresses)",
+      "moved {" not in dynamodb and "payments" not in dynamodb)
 for path, text in (("envs/dev/efs.tf", efs), ("envs/dev/goldengate_inventory.tf", inventory), ("envs/dev/dynamodb.tf", dynamodb)):
     check(f"{path} references no pre-hierarchy runtime identity", not re.search(r"gg-(postgresql|mssql|oracle)-repltest-0[12]\b", text))
 PYEOF
@@ -15055,9 +15055,9 @@ for step_name in DEPLOY_ONLY_STEPS:
 for step_name in LOCAL_GUARD_STEPS:
     check(f"F: '{step_name}' carries no Deploy-only if: (still applicable in Validate mode)", by_name.get(step_name, {}).get("if") is None)
 
-# G: validate_model exposes exactly the 12 canonical outputs.
+# G: validate_model exposes exactly the 12 canonical outputs plus the per-run EFS replacement authorization (a step output, never state).
 vm_outputs = vm.get("outputs", {}) if isinstance(vm, dict) else {}
-check("G: validate_model exposes all 12 canonical outputs, no more, no fewer", set(vm_outputs.keys()) == set(CANONICAL_OUTPUTS))
+check("G: validate_model exposes all 12 canonical outputs plus efs_replacement_authorized_ids, no more, no fewer", set(vm_outputs.keys()) == set(CANONICAL_OUTPUTS) | {"efs_replacement_authorized_ids"})
 
 # H: every step with a run: body (i.e. excluding actions/checkout and aws-actions/configure-aws-credentials, which have no shell script of their own) actually invokes the canonical phase1_readiness.py CLI (never a reimplementation).
 subcommand_steps = [s for s in steps if s.get("run") is not None]
@@ -15368,7 +15368,7 @@ check("V: phase2_prerequisites.py never invokes terraform init/plan/apply/destro
 
 # W: Phase 1 implementation and outputs are unchanged.
 vm = main_jobs.get("validate_model", {})
-check("W: validate_model still exposes all 12 canonical Phase 1 outputs", set((vm.get("outputs") or {}).keys()) == {
+check("W: validate_model still exposes all 12 canonical Phase 1 outputs (plus the EFS replacement authorization step output)", set((vm.get("outputs") or {}).keys()) - {"efs_replacement_authorized_ids"} == {
     "selected_environment", "effective_deploy", "has_active_deployments", "active_runtime_matrix",
     "terraform_governance_override", "terraform_governance_override_reason", "has_changes",
     "deployment_matrix", "has_deletions", "deletion_matrix", "has_storage_transition_violations",
