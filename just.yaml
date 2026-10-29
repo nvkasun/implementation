@@ -4,46 +4,64 @@ set -u
 
 NS="goldengate-dev"
 
-APPS=(
-  "gg-postgresql-repltest-001"
-  "gg-mssql-repltest-001"
-  "gg-oracle-repltest-002"
-  "gg-postgresql-repltest-002"
-)
-
-echo "=== GOLDENGATE SERVICE MANAGER REGISTRATION CHECK ==="
+echo "=== GOLDENGATE IDENTITY AND STARTUP AUDIT ==="
 echo "Namespace: $NS"
-echo "Read-only: no Kubernetes modifications"
 echo
 
-for APP in "${APPS[@]}"; do
-  echo "========== $APP =========="
+for item in \
+  "gg-postgresql-repltest-001:ogg-postgresql" \
+  "gg-mssql-repltest-001:ogg-sqlserver" \
+  "gg-oracle-repltest-002:ogg-oracle" \
+  "gg-postgresql-repltest-002:ogg-postgresql"
+do
+  POD="${item%%:*}-0"
+  CONTAINER="${item#*:}"
 
-  POD="${APP}-0"
+  echo "=============================================="
+  echo "POD: $POD"
+  echo "=============================================="
 
-  kubectl exec -n "$NS" "$POD" -- \
-    sh -c '
+  kubectl exec -n "$NS" "$POD" -c "$CONTAINER" \
+    -- sh -c '
+      echo "[1] Runtime identity"
+      printf "OGG_DEPLOYMENT="
+      printenv OGG_DEPLOYMENT || true
+
+      echo "[2] Startup script configuration"
+      if [ -f /usr/local/bin/deployment-main.sh ]; then
+        grep -nE "run_user_scripts|replace-variables|deployment-init|OGG_DEPLOYMENT" \
+          /usr/local/bin/deployment-main.sh | head -25 || true
+      fi
+
+      echo "[3] Generated NGINX deployment routes"
+      if [ -f /etc/nginx/ogg.conf ]; then
+        grep -oE "/services/[^/]+/(adminsrvr|distsrvr|pmsrvr|recvsrvr)" \
+          /etc/nginx/ogg.conf | sort -u || true
+      fi
+
+      echo "[4] Service Manager availability"
       for PORT in 8443 8080; do
-        case "$PORT" in
-          8443) BASE="https://127.0.0.1:8443" ;;
-          8080) BASE="http://127.0.0.1:8080" ;;
-        esac
-
-        CODE=$(curl -sk --max-time 5 \
+        CODE=$(curl -ksS --max-time 5 \
           -o /dev/null -w "%{http_code}" \
-          "$BASE/services/v2/deployments")
-
-        echo "Service Manager API port=$PORT HTTP=$CODE"
+          "https://127.0.0.1:${PORT}/services/v2/deployments" \
+          2>/dev/null || true)
+        echo "port=$PORT http=${CODE:-000}"
       done
-    ' 2>/dev/null || echo "Unable to execute check"
+
+      echo "[5] Persistent registration metadata"
+      for FILE in \
+        /u02/ServiceManager/etc/conf/deploymentRegistry.dat \
+        /u02/Deployment/etc
+      do
+        if [ -e "$FILE" ]; then
+          echo "PRESENT: $FILE"
+        else
+          echo "NOT FOUND: $FILE"
+        fi
+      done
+    ' 2>&1 | grep -vE 'password|secret|token'
 
   echo
 done
 
-echo "=== CHECK COMPLETE ==="
-echo "HTTP 401 = authentication required"
-echo "HTTP 200 = endpoint accessible"
-echo "HTTP 404 = endpoint/route not found"
-echo "HTTP 000 = connection failed"
-echo
-echo "No credentials or persistent files accessed."
+echo "=== AUDIT COMPLETE ==="
