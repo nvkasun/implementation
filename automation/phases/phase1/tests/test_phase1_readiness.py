@@ -281,6 +281,61 @@ class TestManagedEfsInventory(Phase1TestCase):
         self.assertNotIn("managed_efs_inventory_completed", self.read_state())
 
 
+class TestManagedEfsInventoryFailClosed(Phase1TestCase):
+    """verify_managed_efs_inventory(): every AWS failure or malformed response raises -- never an empty inventory, never a guard run on partial data."""
+
+    def _scripted(self, assume=None, identity=None, describe=None, guard=None):
+        return (
+            ScriptedSubprocess()
+            .on(lambda argv: "managed-efs-inventory" in argv, _ok("[]"))
+            .on(lambda argv: argv[:3] == ["aws", "sts", "assume-role"], assume or _assume_role_ok())
+            .on(lambda argv: argv[:3] == ["aws", "sts", "get-caller-identity"], identity or _ok(WORKLOAD_ACCOUNT_ID + "\n"))
+            .on(lambda argv: argv[:3] == ["aws", "efs", "describe-file-systems"], describe or _ok(json.dumps({"FileSystems": []})))
+            .on(lambda argv: str(p1.EFS_INVENTORY_GUARD_TOOL) in argv, guard or _ok("OK"))
+        )
+
+    def _verify(self, scripted):
+        with mock.patch.object(p1.subprocess, "run", scripted):
+            p1.verify_managed_efs_inventory("dev", "eu-west-1", EKS_DEPLOY_ROLE_ARN)
+
+    def _guard_calls(self, scripted):
+        return [c for c in scripted.calls if str(p1.EFS_INVENTORY_GUARD_TOOL) in c]
+
+    def test_confirmed_empty_inventory_still_runs_the_guard(self):
+        scripted = self._scripted()
+        self._verify(scripted)
+        self.assertEqual(len(self._guard_calls(scripted)), 1)
+
+    def test_aws_failures_fail_closed_before_the_guard(self):
+        denied = _fail(stderr="An error occurred (AccessDeniedException) when calling the DescribeFileSystems operation", returncode=254)
+        for label, kwargs in (
+            ("assume-role denied", {"assume": _fail(stderr="An error occurred (AccessDenied) when calling the AssumeRole operation", returncode=254)}),
+            ("assume-role malformed", {"assume": _ok("{}")}),
+            ("caller identity failed", {"identity": _fail(stderr="ExpiredToken", returncode=255)}),
+            ("wrong account", {"identity": _ok("999999999999\n")}),
+            ("describe denied", {"describe": denied}),
+            ("describe malformed JSON", {"describe": _ok("not json")}),
+            ("describe without FileSystems", {"describe": _ok(json.dumps({"NextMarker": "x"}))}),
+            ("describe FileSystems not a list", {"describe": _ok(json.dumps({"FileSystems": {}}))}),
+            ("describe non-object entries", {"describe": _ok(json.dumps({"FileSystems": ["fs-1"]}))}),
+        ):
+            with self.subTest(label=label):
+                scripted = self._scripted(**kwargs)
+                with self.assertRaises(p1.Phase1Error):
+                    self._verify(scripted)
+                self.assertEqual(self._guard_calls(scripted), [])
+
+    def test_guard_rejection_fails(self):
+        with self.assertRaises(p1.Phase1Error):
+            self._verify(self._scripted(guard=_fail(stdout="FAIL: actual EFS 'fs-1' ... does not match")))
+
+    def test_malformed_role_arn_makes_no_aws_call(self):
+        scripted = self._scripted()
+        with mock.patch.object(p1.subprocess, "run", scripted), self.assertRaises(p1.Phase1Error):
+            p1.verify_managed_efs_inventory("dev", "eu-west-1", "not-an-arn")
+        self.assertEqual(scripted.calls, [])
+
+
 class TestShellInjectionSafety(Phase1TestCase):
     def test_is_safe_token_rejects_shell_metacharacters(self):
         for bad in ("dev; rm -rf /", "dev`whoami`", "dev$(id)", "../../etc/passwd", "dev && echo pwned", "dev|nc", "", None, 123):

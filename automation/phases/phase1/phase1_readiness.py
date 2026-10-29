@@ -555,19 +555,23 @@ def sanitize_efs_filesystems(raw_filesystems):
     return sanitized
 
 
-def cmd_managed_efs_inventory(args):
+def _parse_describe_file_systems(stdout):
+    """Fails closed on anything but a JSON object whose FileSystems is a list of objects -- never treats a malformed or partial response as an empty inventory."""
+    try:
+        raw = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise Phase1Error(f"aws efs describe-file-systems returned malformed JSON: {exc}") from exc
+    filesystems = raw.get("FileSystems") if isinstance(raw, dict) else None
+    if not isinstance(filesystems, list) or not all(isinstance(fs, dict) for fs in filesystems):
+        raise Phase1Error("aws efs describe-file-systems returned no FileSystems list; refusing to treat the inventory as empty.")
+    return filesystems
+
+
+def verify_managed_efs_inventory(selected_environment, aws_region, eks_deploy_role_arn):
+    """Read-only comparison of the deployment model's expected managed-EFS inventory with the live AWS inventory. Raises Phase1Error on any mismatch, orphan, AWS error or malformed response. Shared by Phase 1 and the Phase 2 Terraform apply gate."""
     import tempfile
 
-    state = load_state(args.state_path)
-    effective_deploy = require_state_value(state, "effective_deploy")
-    if effective_deploy != "true":
-        raise Phase1Error("managed-efs-inventory was invoked outside Deploy mode; refusing to touch live AWS.")
-    selected_environment = require_state_value(state, "selected_environment")
-
-    aws_region = os.environ["AWS_REGION"]
-    eks_deploy_role_arn = os.environ["EKS_DEPLOY_ROLE_ARN"]
-
-    expected_match = re.match(r"^arn:aws:iam::([0-9]{12}):role/.*$", eks_deploy_role_arn)
+    expected_match = re.match(r"^arn:aws:iam::([0-9]{12}):role/.*$", eks_deploy_role_arn or "")
     if not expected_match:
         raise Phase1Error("could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN; refusing to read the managed-EFS inventory without a provable expected workload account.")
     expected_workload_account_id = expected_match.group(1)
@@ -581,7 +585,10 @@ def cmd_managed_efs_inventory(args):
         print("Expected managed-EFS inventory (includes deployment.enabled=false descriptors on purpose -- their EFS is retained, not decommissioned):")
         print(proc.stdout)
 
-        role_env = _assume_role_env(eks_deploy_role_arn, f"gg-efs-inventory-{os.environ.get('GITHUB_RUN_ID', 'local')}-{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
+        try:
+            role_env = _assume_role_env(eks_deploy_role_arn, f"gg-efs-inventory-{os.environ.get('GITHUB_RUN_ID', 'local')}-{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise Phase1Error(f"aws sts assume-role returned an unexpected response ({type(exc).__name__}).") from exc
 
         identity = run(["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text", "--region", aws_region], env=role_env)
         actual_account = identity.stdout.strip()
@@ -589,8 +596,7 @@ def cmd_managed_efs_inventory(args):
             raise Phase1Error(f"assumed role resolved to account {actual_account}, expected the GoldenGate workload account {expected_workload_account_id}.")
 
         describe = run(["aws", "efs", "describe-file-systems", "--region", aws_region, "--output", "json"], env=role_env)
-        raw = json.loads(describe.stdout)
-        sanitized = sanitize_efs_filesystems(raw.get("FileSystems", []))
+        sanitized = sanitize_efs_filesystems(_parse_describe_file_systems(describe.stdout))
 
         in_scope_count = sum(1 for fs in sanitized if any(t.get("Key") == "ManagedBy" and t.get("Value") == "goldengate-eks-app" for t in fs.get("Tags", [])))
         print(f"Actual AWS-side EFS scan (region {aws_region}): {in_scope_count} GoldenGate-managed-tagged filesystem(s) found in scope. Unrelated EFS filesystems and any non-GoldenGate tags are never logged.")
@@ -606,6 +612,16 @@ def cmd_managed_efs_inventory(args):
             os.unlink(actual_path)
     finally:
         os.unlink(expected_path)
+
+
+def cmd_managed_efs_inventory(args):
+    state = load_state(args.state_path)
+    effective_deploy = require_state_value(state, "effective_deploy")
+    if effective_deploy != "true":
+        raise Phase1Error("managed-efs-inventory was invoked outside Deploy mode; refusing to touch live AWS.")
+    selected_environment = require_state_value(state, "selected_environment")
+
+    verify_managed_efs_inventory(selected_environment, os.environ["AWS_REGION"], os.environ["EKS_DEPLOY_ROLE_ARN"])
 
     update_state(args.state_path, {"managed_efs_inventory_completed": "true"})
     print("OK: managed-EFS inventory matches the deployment model; no orphan detected.")

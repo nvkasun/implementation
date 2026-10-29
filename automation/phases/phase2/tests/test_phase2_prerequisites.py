@@ -349,6 +349,98 @@ class TestAcceptance(Phase2TestCase):
             p2.cmd_acceptance(self.args)
 
 
+WORKLOAD_ACCOUNT_ID = "123456789012"
+EKS_DEPLOY_ROLE_ARN = f"arn:aws:iam::{WORKLOAD_ACCOUNT_ID}:role/GoldenGateEKSDeployRole-dev"
+INVENTORY_ENV = {"TARGET_ENVIRONMENT": "dev", "AWS_REGION": "eu-west-1", "EKS_DEPLOY_ROLE_ARN": EKS_DEPLOY_ROLE_ARN}
+
+
+def _inventory_scripted(describe=None, guard=None):
+    creds = {"Credentials": {"AccessKeyId": "FAKE_ID", "SecretAccessKey": "FAKE_SECRET", "SessionToken": "FAKE_TOKEN"}}
+    return (
+        ScriptedSubprocess()
+        .on(lambda argv: "managed-efs-inventory" in argv, _ok("[]"))
+        .on(lambda argv: argv[:3] == ["aws", "sts", "assume-role"], _ok(__import__("json").dumps(creds)))
+        .on(lambda argv: argv[:3] == ["aws", "sts", "get-caller-identity"], _ok(WORKLOAD_ACCOUNT_ID + "\n"))
+        .on(lambda argv: argv[:3] == ["aws", "efs", "describe-file-systems"], describe or _ok('{"FileSystems": []}'))
+        .on(lambda argv: "managed_efs_inventory_guard.py" in " ".join(argv), guard or _ok("OK"))
+    )
+
+
+class TestManagedEfsInventoryGate(Phase2TestCase):
+    """phase2 managed-efs-inventory: the Terraform apply gate reuses Phase 1's guard and fails closed."""
+
+    def _run(self, scripted, env=INVENTORY_ENV):
+        with mock.patch.dict("os.environ", env), mock.patch("subprocess.run", scripted):
+            p2.cmd_managed_efs_inventory(self.args)
+
+    def test_matching_inventory_passes(self):
+        scripted = _inventory_scripted()
+        self._run(scripted)
+        self.assertTrue(any("managed_efs_inventory_guard.py" in " ".join(c) for c in scripted.calls))
+
+    def test_guard_rejection_blocks_apply(self):
+        with self.assertRaises(p2.Phase2Error) as ctx:
+            self._run(_inventory_scripted(guard=_fail(stdout="FAIL: gg-x-01: An AWS GoldenGate managed EFS exists without a current managed deployment descriptor.")))
+        self.assertIn("Terraform apply is blocked", str(ctx.exception))
+
+    def test_access_denied_and_malformed_responses_block_apply(self):
+        for describe in (_fail(stderr="An error occurred (AccessDeniedException)", returncode=254), _ok("garbage"), _ok("{}")):
+            with self.subTest(describe=describe), self.assertRaises(p2.Phase2Error):
+                self._run(_inventory_scripted(describe=describe))
+
+    def test_missing_or_unsafe_inputs_make_no_aws_call(self):
+        for env in ({**INVENTORY_ENV, "AWS_REGION": ""}, {**INVENTORY_ENV, "EKS_DEPLOY_ROLE_ARN": ""}, {**INVENTORY_ENV, "TARGET_ENVIRONMENT": "dev;id"}, {**INVENTORY_ENV, "TARGET_ENVIRONMENT": ""}):
+            with self.subTest(env=env):
+                scripted = _inventory_scripted()
+                with self.assertRaises(p2.Phase2Error):
+                    self._run(scripted, env=env)
+                self.assertEqual(scripted.calls, [])
+
+    def test_cli_exit_status(self):
+        with mock.patch.dict("os.environ", INVENTORY_ENV), mock.patch("subprocess.run", _inventory_scripted(describe=_fail(stderr="AccessDenied", returncode=254))):
+            self.assertEqual(p2.main(["--state-file", str(self.state_path), "managed-efs-inventory"]), 1)
+
+
+class TestTerraformApplyEntryPoints(unittest.TestCase):
+    """Every Terraform apply in the repository's workflows must depend on the managed-EFS inventory gate."""
+
+    WORKFLOWS = Path(__file__).resolve().parents[4] / ".github" / "workflows"
+
+    def _load(self, name):
+        import yaml
+        return yaml.safe_load((self.WORKFLOWS / name).read_text(encoding="utf-8"))
+
+    def test_iam_secrets_apply_requires_the_inventory_gate_on_every_trigger(self):
+        doc = self._load("10-sub-iam-secrets.yaml")
+        triggers = doc.get(True) or doc.get("on")
+        self.assertIn("workflow_dispatch", triggers)
+        self.assertIn("workflow_call", triggers)
+        jobs = doc["jobs"]
+        apply = jobs["apply"]
+        self.assertIn("verify_managed_efs_inventory", apply["needs"])
+        self.assertNotIn("if", apply, "apply must keep the default success() gate on all needs")
+        gate = jobs["verify_managed_efs_inventory"]
+        self.assertNotIn("if", gate, "the gate must run for orchestrated and standalone runs alike")
+        steps = gate["steps"]
+        self.assertFalse(any(s.get("continue-on-error") for s in steps))
+        self.assertTrue(any("phase2_prerequisites.py managed-efs-inventory" in (s.get("run") or "") for s in steps))
+        self.assertTrue(all("set -euo pipefail" in s["run"] for s in steps if "run" in s))
+
+    def test_no_other_workflow_job_reaches_terraform_apply(self):
+        offenders = []
+        for path in sorted(self.WORKFLOWS.glob("*.y*ml")):
+            jobs = (self._load(path.name) or {}).get("jobs") or {}
+            for job_id, job in jobs.items():
+                uses = str(job.get("uses", ""))
+                if "terraform" in uses.lower() and not (path.name == "10-sub-iam-secrets.yaml" and job_id == "apply"):
+                    offenders.append(f"{path.name}:{job_id}")
+                for step in job.get("steps") or []:
+                    text = f"{step.get('uses', '')} {step.get('run', '')}".lower()
+                    if "terraform apply" in text or "terraform destroy" in text or "setup-terraform" in text:
+                        offenders.append(f"{path.name}:{job_id}")
+        self.assertEqual(offenders, [])
+
+
 class TestNoLiveExecution(Phase2TestCase):
     def test_no_aws_cli_invocation_in_normal_commands(self):
         with open(TOOL_PATH, encoding="utf-8") as f:

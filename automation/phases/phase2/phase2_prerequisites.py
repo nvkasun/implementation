@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 ENVIRONMENT_TOOL = REPO_ROOT / "automation" / "goldengate-environment.py"
+PHASE1_READINESS_TOOL = REPO_ROOT / "automation" / "phases" / "phase1" / "phase1_readiness.py"
 
 # Mirrors automation/phases/phase1/phase1_readiness.py's own _SAFE_TOKEN_RE -- each tool in this repository intentionally keeps its own local copy of this grammar rather than importing it across modules; used here only for defense-in-depth path-safety before an environment name is ever interpolated into a filesystem path, never as the canonical acceptance/rejection of an environment (that remains automation/goldengate-environment.py's own concern).
 _SAFE_TOKEN_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
@@ -214,6 +216,34 @@ def cmd_validate_governance(args):
     write_github_output([("terraform_governance_override", override), ("terraform_governance_override_reason", reason)])
 
 
+def _load_phase1_readiness():
+    """The managed-EFS inventory check lives in phase1_readiness.py; Phase 2 reuses it rather than keeping a second copy."""
+    spec = importlib.util.spec_from_file_location("phase1_readiness", PHASE1_READINESS_TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cmd_managed_efs_inventory(args):
+    """Terraform apply gate: the same read-only managed-EFS inventory guard Phase 1 runs, so a standalone run of this workflow cannot apply Terraform without it."""
+    target_environment = os.environ.get("TARGET_ENVIRONMENT", "")
+    if not is_safe_token(target_environment):
+        raise Phase2Error(f"TARGET_ENVIRONMENT {target_environment!r} is not a safe identifier; refusing to inspect the managed-EFS inventory.")
+    aws_region = os.environ.get("AWS_REGION", "")
+    eks_deploy_role_arn = os.environ.get("EKS_DEPLOY_ROLE_ARN", "")
+    if not aws_region or not eks_deploy_role_arn:
+        raise Phase2Error("AWS_REGION and EKS_DEPLOY_ROLE_ARN must be loaded from the canonical environment configuration before the managed-EFS inventory check.")
+
+    phase1 = _load_phase1_readiness()
+    try:
+        phase1.verify_managed_efs_inventory(target_environment, aws_region, eks_deploy_role_arn)
+    except phase1.Phase1Error as exc:
+        raise Phase2Error(f"managed-EFS inventory guard failed -- Terraform apply is blocked: {exc}") from exc
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise Phase2Error(f"managed-EFS inventory guard could not complete ({type(exc).__name__}) -- Terraform apply is blocked.") from exc
+    print("OK: managed-EFS inventory matches the deployment model; Terraform apply may proceed.")
+
+
 def cmd_publish_outputs(args):
     state = load_state(args.state_path)
     missing = [k for k in CANONICAL_OUTPUT_KEYS if k not in state]
@@ -264,6 +294,7 @@ _SUBCOMMANDS = {
     "validate-governance": cmd_validate_governance,
     "publish-outputs": cmd_publish_outputs,
     "acceptance": cmd_acceptance,
+    "managed-efs-inventory": cmd_managed_efs_inventory,
 }
 
 

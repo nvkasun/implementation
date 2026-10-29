@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # GoldenGate EKS DEV -- read-only pre-reset audit. Makes no changes: kubectl get/logs/exec (read-only commands only), AWS describe/get/query only.
-# Never prints secret values: in-pod checks read OGG_ADMIN/OGG_ADMIN_PWD from the container environment and print deployment names only.
-# Usage: bash gg-dev-reset-preflight.sh 2>&1 | tee gg-dev-reset-preflight-$(date +%Y%m%d-%H%M%S).log
+# Every check is CONFIRMED_PRESENT, CONFIRMED_ZERO or UNKNOWN. A failed query is never read as an empty or populated inventory: UNKNOWN is a BLOCKER.
+# Exit status: 0 = no blockers, 2 = at least one BLOCKER (including any UNKNOWN). Errors are reported by class and AWS error code only, never by raw response body.
+# Usage: bash just.yaml 2>&1 | tee gg-dev-reset-preflight-$(date +%Y%m%d-%H%M%S).log
 set -u
 
 ENV_NAME="${ENV_NAME:-dev}"
@@ -10,119 +11,208 @@ ARGO_NS="${ARGO_NS:-argocd}"
 REGION="${AWS_REGION:-eu-west-1}"
 DDB_TABLE="${DDB_TABLE:-gg-eks-pipeline}"
 RUNTIMES="${RUNTIMES:-gg-postgresql-repltest-001 gg-mssql-repltest-001 gg-oracle-repltest-002 gg-postgresql-repltest-002}"
-PRE_HIERARCHY_IDS="${PRE_HIERARCHY_IDS:-gg-postgresql-repltest-01 gg-mssql-repltest-01 gg-oracle-repltest-01 gg-postgresql-repltest-02}"
+# Operator-supplied pre-reset identities, used only to look for leftovers; never runtime configuration.
+PRE_RESET_IDS="${PRE_RESET_IDS:-gg-postgresql-repltest-01 gg-mssql-repltest-01 gg-oracle-repltest-01 gg-postgresql-repltest-02}"
 
-FINDINGS=()
+BLOCKERS=()
+WARNINGS=()
+UNKNOWN_COUNT=0
+
 section() { printf '\n==================== %s ====================\n' "$1"; }
 note() { printf '%s\n' "$*"; }
-finding() { FINDINGS+=("$1"); printf '>>> %s\n' "$1"; }
-run() { printf '$ %s\n' "$*"; "$@" 2>&1 || printf '(command exited %s)\n' "$?"; }
+blocker() { BLOCKERS+=("$1"); printf 'BLOCKER: %s\n' "$1"; }
+warning() { WARNINGS+=("$1"); printf 'WARNING: %s\n' "$1"; }
+
+# Runs a read-only command; sets OUT (stdout), ERR (stderr, never printed) and RC.
+capture() {
+  local errf
+  errf="$(mktemp)"
+  OUT="$("$@" 2>"$errf" </dev/null)"
+  RC=$?
+  ERR="$(cat "$errf")"
+  rm -f "$errf"
+}
+
+err_class() {
+  case "$1" in
+    *AccessDenied*|*UnauthorizedOperation*|*"is not authorized"*|*Forbidden*|*forbidden*) echo PERMISSION_DENIED ;;
+    *ExpiredToken*|*InvalidClientTokenId*|*UnrecognizedClient*|*"Unable to locate credentials"*|*Unauthorized*|*"must be logged in"*) echo AUTHENTICATION ;;
+    *Throttl*|*"Rate exceeded"*) echo THROTTLED ;;
+    *"Could not connect"*|*EndpointConnectionError*|*timeout*|*"connection refused"*|*"no such host"*) echo CONNECTIVITY ;;
+    *NotFound*|*"not found"*) echo NOT_FOUND ;;
+    *) echo ERROR ;;
+  esac
+}
+
+err_code() { grep -oE '\([A-Za-z]+\)' <<<"$1" | head -n 1; }
+
+unknown() {
+  UNKNOWN_COUNT=$((UNKNOWN_COUNT + 1))
+  blocker "UNKNOWN ${1}: query failed (exit ${RC}, $(err_class "$ERR") $(err_code "$ERR")) -- inventory cannot be confirmed"
+}
+
+# Classifies the last capture: UNKNOWN on failure (unless stderr carries one of the given zero-meaning codes), else CONFIRMED_PRESENT / CONFIRMED_ZERO by output.
+classify() {
+  local check="$1"; shift
+  local code
+  if [ "$RC" -ne 0 ]; then
+    for code in "$@"; do
+      case "$ERR" in *"$code"*) STATUS=CONFIRMED_ZERO; note "CONFIRMED_ZERO ${check} (${code})"; return ;; esac
+    done
+    STATUS=UNKNOWN
+    unknown "$check"
+    return
+  fi
+  if [ -n "$(tr -d '[:space:]' <<<"$OUT")" ]; then STATUS=CONFIRMED_PRESENT; else STATUS=CONFIRMED_ZERO; fi
+  note "${STATUS} ${check}"
+}
 
 section "0. Tooling and identity"
-for tool in kubectl aws; do command -v "$tool" >/dev/null 2>&1 && note "OK: $tool $(command -v "$tool")" || finding "BLOCKER: $tool not found"; done
-run aws sts get-caller-identity --query Account --output text --region "$REGION"
-run kubectl config current-context
-run kubectl version --request-timeout=20s
-
-section "1. Argo CD ownership (runtime ApplicationSets/Applications)"
-run kubectl -n "$ARGO_NS" get applicationsets.argoproj.io -o custom-columns=NAME:.metadata.name,CREATED:.metadata.creationTimestamp --request-timeout=30s
-run kubectl -n "$ARGO_NS" get applications.argoproj.io -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REVISION:.status.sync.revision,DELETING:.metadata.deletionTimestamp --request-timeout=30s
-for old in $PRE_HIERARCHY_IDS; do
-  suffix="${old#gg-}"
-  if kubectl -n "$ARGO_NS" get applications.argoproj.io "goldengate-${ENV_NAME}-${suffix}" >/dev/null 2>&1 || kubectl -n "$ARGO_NS" get applicationsets.argoproj.io "goldengate-${ENV_NAME}-${suffix}-appset" >/dev/null 2>&1; then
-    finding "WARNING: pre-hierarchy Argo CD object still exists for ${old}"
-  fi
+for tool in kubectl aws; do
+  if command -v "$tool" >/dev/null 2>&1; then note "OK: $tool found"; else RC=127; ERR="command not found"; unknown "tool:${tool}"; fi
 done
+capture aws sts get-caller-identity --query Account --output text --region "$REGION"
+classify "aws-identity"; [ "$STATUS" = CONFIRMED_PRESENT ] && note "account: ${OUT}"
+capture kubectl get --raw /version --request-timeout=20s
+classify "kubernetes-api"
+
+section "1. Argo CD ownership"
+capture kubectl -n "$ARGO_NS" get applicationsets.argoproj.io -o custom-columns=NAME:.metadata.name --no-headers --request-timeout=30s
+classify "argocd-applicationsets"; APPSETS_STATUS="$STATUS"; APPSETS="$OUT"
+[ "$APPSETS_STATUS" = CONFIRMED_PRESENT ] && note "$APPSETS"
+capture kubectl -n "$ARGO_NS" get applications.argoproj.io -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,DELETING:.metadata.deletionTimestamp --no-headers --request-timeout=30s
+classify "argocd-applications"; APPS_STATUS="$STATUS"; APPS="$OUT"
+[ "$APPS_STATUS" = CONFIRMED_PRESENT ] && note "$APPS"
+if [ "$APPSETS_STATUS" != UNKNOWN ] && [ "$APPS_STATUS" != UNKNOWN ]; then
+  for old in $PRE_RESET_IDS; do
+    name="goldengate-${ENV_NAME}-${old#gg-}"
+    if grep -qx -e "$name" -e "${name}-appset" <<<"$APPSETS" || awk '{print $1}' <<<"$APPS" | grep -qx "$name"; then
+      warning "pre-reset Argo CD object still exists for ${old}"
+    fi
+  done
+fi
 
 section "2. Runtime compute"
-run kubectl -n "$NS" get statefulsets -o custom-columns=NAME:.metadata.name,READY:.status.readyReplicas,REPLICAS:.spec.replicas,REVISION:.status.currentRevision --request-timeout=30s
-run kubectl -n "$NS" get pods -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount,STARTED:.status.startTime,NODE:.spec.nodeName --request-timeout=30s
+capture kubectl -n "$NS" get statefulsets -o custom-columns=NAME:.metadata.name,READY:.status.readyReplicas,REPLICAS:.spec.replicas --no-headers --request-timeout=30s
+classify "statefulsets"; [ "$STATUS" = CONFIRMED_PRESENT ] && note "$OUT"
+capture kubectl -n "$NS" get pods -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount --no-headers --request-timeout=30s
+classify "pods"; PODS_STATUS="$STATUS"; PODS="$OUT"
+[ "$PODS_STATUS" = CONFIRMED_PRESENT ] && note "$PODS"
 
 for rt in $RUNTIMES; do
   section "2.${rt}"
   pod="${rt}-0"
-  if ! kubectl -n "$NS" get pod "$pod" >/dev/null 2>&1; then
-    note "pod ${pod} not present"
-    continue
-  fi
-  container="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.containers[0].name}')"
-  note "container: ${container}"
-  note "image: $(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.containers[0].image}')"
-  note "spec OGG_DEPLOYMENT: $(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.containers[0].env[?(@.name=="OGG_DEPLOYMENT")].value}')"
-  note "spec OGG_DEPLOYMENT_SCRIPTS: $(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.containers[0].env[?(@.name=="OGG_DEPLOYMENT_SCRIPTS")].value}')"
-  note "u02 claim: $(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.volumes[?(@.name=="u02")].persistentVolumeClaim.claimName}')"
-  identity_mounts="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{range .spec.containers[0].volumeMounts[*]}{.name}={.mountPath}{"\n"}{end}' | grep goldengate-identity || true)"
-  if [ -n "$identity_mounts" ]; then note "identity hook mounts:"; note "$identity_mounts"; else finding "WARNING: ${rt} pod has no goldengate-identity mounts (resolver chart not running on this pod)"; fi
+  if [ "$PODS_STATUS" = UNKNOWN ]; then note "UNKNOWN pod ${pod} (pod listing failed)"; continue; fi
+  if ! awk '{print $1}' <<<"$PODS" | grep -qx "$pod"; then note "CONFIRMED_ZERO pod ${pod}"; continue; fi
+  note "CONFIRMED_PRESENT pod ${pod}"
 
-  note "--- identity hook log lines (current container)"
-  kubectl -n "$NS" logs "$pod" -c "$container" --tail=-1 2>/dev/null | grep 'goldengate-identity' | tail -n 10 || true
+  capture kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.containers[0].name}{"\n"}{.spec.containers[0].image}{"\n"}{.spec.containers[0].env[?(@.name=="OGG_DEPLOYMENT")].value}{"\n"}{.spec.volumes[?(@.name=="u02")].persistentVolumeClaim.claimName}{"\n"}{range .spec.containers[0].volumeMounts[*]}{.name} {end}' --request-timeout=30s
+  classify "pod-spec:${pod}"
+  [ "$STATUS" = UNKNOWN ] && continue
+  container="$(sed -n 1p <<<"$OUT")"
+  note "container=${container} image=$(sed -n 2p <<<"$OUT") OGG_DEPLOYMENT=$(sed -n 3p <<<"$OUT") u02-claim=$(sed -n 4p <<<"$OUT")"
+  grep -q 'goldengate-identity' <<<"$(sed -n 5p <<<"$OUT")" && note "identity hook mounts: present" || warning "${rt} pod has no goldengate-identity mounts"
 
-  note "--- image startup contract (read-only)"
-  kubectl -n "$NS" exec "$pod" -c "$container" -- sh -c '
-    head -1 /usr/local/bin/deployment-main.sh 2>/dev/null
-    grep -nE "run_user_scripts|[[:space:]]source |^[[:space:]]*replace-variables\.sh|^start_ogg|^start_nginx" /usr/local/bin/deployment-main.sh 2>/dev/null
-    for d in "${OGG_DEPLOYMENT_SCRIPTS:-/u01/ogg/scripts}/setup" "${OGG_DEPLOYMENT_SCRIPTS:-/u01/ogg/scripts}/startup"; do echo "dir $d:"; ls -1 "$d" 2>&1; done
-    echo "rendered NGINX deployment routes:"; grep -ohE "/services/[^/ ]+/(adminsrvr|distsrvr|pmsrvr|recvsrvr)" /etc/nginx/*.conf 2>/dev/null | sort -u
-    echo "persistent layout:"; for p in /u02/ServiceManager /u02/Deployment/etc /u02/ServiceManager/etc/conf/deploymentRegistry.dat; do [ -e "$p" ] && echo "present $p" || echo "absent  $p"; done
-  ' 2>&1
+  capture kubectl -n "$NS" logs "$pod" -c "$container" --tail=2000 --request-timeout=60s
+  classify "pod-logs:${pod}"
+  [ "$STATUS" != UNKNOWN ] && { grep 'goldengate-identity' <<<"$OUT" | tail -n 10 || note "(no goldengate-identity log lines)"; }
 
-  note "--- Service Manager registered deployments (names only)"
-  kubectl -n "$NS" exec "$pod" -c "$container" -- python3 -c '
-import base64, json, os, urllib.request
+  capture kubectl -n "$NS" exec "$pod" -c "$container" --request-timeout=60s -- sh -c '
+    grep -nE "run_user_scripts|[[:space:]]source |^[[:space:]]*replace-variables\.sh|^start_ogg|^start_nginx" /usr/local/bin/deployment-main.sh
+    for d in "${OGG_DEPLOYMENT_SCRIPTS:-/u01/ogg/scripts}/setup" "${OGG_DEPLOYMENT_SCRIPTS:-/u01/ogg/scripts}/startup"; do echo "dir $d:"; ls -1 "$d"; done
+    echo "rendered NGINX deployment routes:"; grep -ohE "/services/[^/ ]+/(adminsrvr|distsrvr|pmsrvr|recvsrvr)" /etc/nginx/*.conf | sort -u
+    for p in /u02/ServiceManager /u02/Deployment/etc; do [ -e "$p" ] && echo "present $p" || echo "absent  $p"; done'
+  classify "image-startup-contract:${pod}"
+  [ "$STATUS" != UNKNOWN ] && note "$OUT"
+
+  capture kubectl -n "$NS" exec "$pod" -c "$container" --request-timeout=60s -- python3 -c '
+import base64, json, os, sys, urllib.request
 token = base64.b64encode((os.environ.get("OGG_ADMIN", "") + ":" + os.environ.get("OGG_ADMIN_PWD", "")).encode()).decode()
 req = urllib.request.Request("http://127.0.0.1:9011/services/v2/deployments", headers={"Authorization": "Basic " + token, "Accept": "application/json"})
 try:
     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=10) as r:
-        items = json.loads(r.read()).get("response", {}).get("items", [])
-        print("HTTP", r.status, "registered:", sorted(i.get("name") for i in items if isinstance(i, dict)))
+        items = json.loads(r.read())["response"]["items"]
+        print("registered:", sorted(i["name"] for i in items))
 except Exception as e:
-    print("request failed:", type(e).__name__, getattr(e, "code", ""))
-' 2>&1
+    sys.exit("service-manager query failed: %s %s" % (type(e).__name__, getattr(e, "code", "")))'
+  classify "service-manager-registrations:${pod}"
+  [ "$STATUS" != UNKNOWN ] && note "$OUT"
 done
 
-section "3. Persistent volume claims and volumes"
-run kubectl -n "$NS" get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,VOLUME:.spec.volumeName,SC:.spec.storageClassName,SYNC_OPTIONS:.metadata.annotations.argocd\\.argoproj\\.io/sync-options,CREATED:.metadata.creationTimestamp --request-timeout=30s
-run kubectl get pv -o custom-columns=NAME:.metadata.name,CLAIM_NS:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,STATUS:.status.phase,RECLAIM:.spec.persistentVolumeReclaimPolicy,SC:.spec.storageClassName,HANDLE:.spec.csi.volumeHandle --request-timeout=30s
-run kubectl get storageclass -o custom-columns=NAME:.metadata.name,PROVISIONER:.provisioner,RECLAIM:.reclaimPolicy,FS:.parameters.fileSystemId,BASE:.parameters.basePath,PERMS:.parameters.directoryPerms --request-timeout=30s
-non_retain="$(kubectl get pv -o jsonpath='{range .items[?(@.spec.claimRef.namespace=="'"$NS"'")]}{.metadata.name} {.spec.persistentVolumeReclaimPolicy}{"\n"}{end}' | awk '$2 != "Retain"')"
-[ -n "$non_retain" ] && finding "WARNING: GoldenGate PV(s) without Retain: ${non_retain}"
+section "3. Persistent volume claims, volumes and storage classes"
+capture kubectl -n "$NS" get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,VOLUME:.spec.volumeName,SC:.spec.storageClassName --no-headers --request-timeout=30s
+classify "pvcs"; [ "$STATUS" = CONFIRMED_PRESENT ] && note "$OUT"
+capture kubectl get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.claimRef.namespace}{"\t"}{.spec.claimRef.name}{"\t"}{.status.phase}{"\t"}{.spec.persistentVolumeReclaimPolicy}{"\t"}{.spec.csi.volumeHandle}{"\n"}{end}' --request-timeout=30s
+classify "pvs"; PV_STATUS="$STATUS"; PVS="$OUT"
+if [ "$PV_STATUS" != UNKNOWN ]; then
+  [ "$PV_STATUS" = CONFIRMED_PRESENT ] && note "$PVS"
+  non_retain="$(awk -F'\t' -v ns="$NS" '$2 == ns && $5 != "Retain" {print $1}' <<<"$PVS")"
+  [ -n "$non_retain" ] && warning "GoldenGate PV(s) without Retain: $(tr '\n' ' ' <<<"$non_retain")"
+fi
+capture kubectl get storageclass -o custom-columns=NAME:.metadata.name,RECLAIM:.reclaimPolicy,FS:.parameters.fileSystemId,BASE:.parameters.basePath,PERMS:.parameters.directoryPerms --no-headers --request-timeout=30s
+classify "storageclasses"; [ "$STATUS" = CONFIRMED_PRESENT ] && grep 'gg-efs-' <<<"$OUT"
 
 section "4. Managed EFS filesystems (ManagedBy=goldengate-eks-app)"
-GG_FS="$(aws efs describe-file-systems --region "$REGION" --query "FileSystems[?Tags[?Key=='ManagedBy' && Value=='goldengate-eks-app']].FileSystemId" --output text 2>/dev/null)"
-run aws efs describe-file-systems --region "$REGION" --query "FileSystems[?Tags[?Key=='ManagedBy' && Value=='goldengate-eks-app']].{id:FileSystemId,token:CreationToken,state:LifeCycleState,mts:NumberOfMountTargets,deployment:Tags[?Key=='GoldenGateDeploymentId']|[0].Value,env:Tags[?Key=='GoldenGateEnvironment']|[0].Value}" --output table
-old_tokens=0; canonical_tokens=0
-for fs in $GG_FS; do
-  token="$(aws efs describe-file-systems --region "$REGION" --file-system-id "$fs" --query 'FileSystems[0].CreationToken' --output text)"
-  tag="$(aws efs describe-file-systems --region "$REGION" --file-system-id "$fs" --query "FileSystems[0].Tags[?Key=='GoldenGateDeploymentId']|[0].Value" --output text)"
-  if [ "$token" = "${ENV_NAME}-${tag}-efs" ]; then canonical_tokens=$((canonical_tokens + 1)); else old_tokens=$((old_tokens + 1)); note "pre-reset token: ${fs} tag=${tag} token=${token}"; fi
-  note "--- ${fs}: access points"
-  aws efs describe-access-points --region "$REGION" --file-system-id "$fs" --query "AccessPoints[].{ap:AccessPointId,path:RootDirectory.Path,state:LifeCycleState,uid:PosixUser.Uid}" --output table 2>&1
-  note "--- ${fs}: mount targets"
-  aws efs describe-mount-targets --region "$REGION" --file-system-id "$fs" --query "MountTargets[].{mt:MountTargetId,subnet:SubnetId,az:AvailabilityZoneName,state:LifeCycleState}" --output table 2>&1
-  note "--- ${fs}: replication / backup / file-system policy"
-  aws efs describe-replication-configurations --region "$REGION" --file-system-id "$fs" --query "Replications[].Destinations[].{dest:FileSystemId,status:Status}" --output text 2>&1 | sed 's/^/replication: /'
-  aws efs describe-backup-policy --region "$REGION" --file-system-id "$fs" --query "BackupPolicy.Status" --output text 2>&1 | sed 's/^/backup policy: /'
-  aws efs describe-file-system-policy --region "$REGION" --file-system-id "$fs" --query "length(Policy)" --output text >/dev/null 2>&1 && note "file-system policy: present" || note "file-system policy: none"
-  others="$(kubectl get pv -o jsonpath='{range .items[*]}{.metadata.name} {.spec.claimRef.namespace} {.spec.csi.volumeHandle}{"\n"}{end}' | awk -v fs="$fs" -v ns="$NS" 'index($3, fs) == 1 && $2 != ns')"
-  [ -n "$others" ] && finding "BLOCKER: ${fs} is referenced by a PV outside ${NS}: ${others}"
-done
-note "GoldenGate filesystems: pre-reset tokens=${old_tokens} canonical tokens=${canonical_tokens}"
-[ "$old_tokens" -gt 0 ] && finding "INFO: ${old_tokens} filesystem(s) carry pre-reset creation tokens -- with fbe560a on main every deploy run fails Phase 1 until they are retired"
-[ "$canonical_tokens" -gt 0 ] && finding "WARNING: ${canonical_tokens} filesystem(s) already carry canonical tokens -- a Terraform apply has run against the new naming; review before continuing"
+capture aws efs describe-file-systems --region "$REGION" --output text \
+  --query "FileSystems[?Tags[?Key=='ManagedBy' && Value=='goldengate-eks-app']].[FileSystemId,CreationToken,LifeCycleState,NumberOfMountTargets,Tags[?Key=='GoldenGateDeploymentId']|[0].Value,Tags[?Key=='GoldenGateEnvironment']|[0].Value]"
+classify "efs-filesystems"; FS_STATUS="$STATUS"; FS_ROWS="$OUT"
+pre_reset_tokens=0; canonical_tokens=0
+if [ "$FS_STATUS" = CONFIRMED_PRESENT ]; then
+  note "$FS_ROWS"
+  while IFS=$'\t' read -r fs token state mts tag fs_env; do
+    [ -z "$fs" ] && continue
+    if [ "$token" = "${fs_env}-${tag}-efs" ]; then canonical_tokens=$((canonical_tokens + 1)); else pre_reset_tokens=$((pre_reset_tokens + 1)); fi
+    note "--- ${fs} (tag=${tag}, token=${token}, state=${state}, mount-targets=${mts})"
+    capture aws efs describe-access-points --region "$REGION" --file-system-id "$fs" --output text --query "AccessPoints[].[AccessPointId,RootDirectory.Path,LifeCycleState]"
+    classify "efs-access-points:${fs}"; [ "$STATUS" = CONFIRMED_PRESENT ] && note "$OUT"
+    capture aws efs describe-mount-targets --region "$REGION" --file-system-id "$fs" --output text --query "MountTargets[].[MountTargetId,AvailabilityZoneName,LifeCycleState]"
+    classify "efs-mount-targets:${fs}"; [ "$STATUS" = CONFIRMED_PRESENT ] && note "$OUT"
+    capture aws efs describe-replication-configurations --region "$REGION" --file-system-id "$fs" --output text --query "Replications[].Destinations[].[FileSystemId,Status]"
+    classify "efs-replication:${fs}" ReplicationNotFound
+    [ "$STATUS" = CONFIRMED_PRESENT ] && blocker "${fs} has a replication configuration"
+    capture aws efs describe-file-system-policy --region "$REGION" --file-system-id "$fs" --output text --query "FileSystemId"
+    classify "efs-file-system-policy:${fs}" PolicyNotFound
+    capture aws efs describe-backup-policy --region "$REGION" --file-system-id "$fs" --output text --query "BackupPolicy.Status"
+    classify "efs-backup-policy:${fs}" PolicyNotFound
+    [ "$STATUS" = CONFIRMED_PRESENT ] && note "backup policy: ${OUT}"
+    if [ "$PV_STATUS" != UNKNOWN ]; then
+      others="$(awk -F'\t' -v fs="$fs" -v ns="$NS" 'index($6, fs) == 1 && $2 != ns {print $1}' <<<"$PVS")"
+      [ -n "$others" ] && blocker "${fs} is referenced by PV(s) outside ${NS}: $(tr '\n' ' ' <<<"$others")"
+    fi
+  done <<<"$FS_ROWS"
+fi
+if [ "$FS_STATUS" != UNKNOWN ]; then
+  note "GoldenGate filesystems: pre-reset tokens=${pre_reset_tokens} canonical tokens=${canonical_tokens}"
+  [ "$canonical_tokens" -gt 0 ] && warning "${canonical_tokens} filesystem(s) already carry canonical tokens -- a Terraform apply has run against the canonical naming"
+fi
 
-section "5. DynamoDB ${DDB_TABLE} items (keys and timestamps only)"
-for id in $RUNTIMES $PRE_HIERARCHY_IDS; do
-  out="$(aws dynamodb query --region "$REGION" --table-name "$DDB_TABLE" --key-condition-expression "pipeline = :p" \
-        --expression-attribute-values "{\":p\":{\"S\":\"${id}\"}}" --projection-expression "recordType, recordedAt" \
-        --query "Items[].[recordType.S, recordedAt.N]" --output text 2>&1)"
-  note "${id}:"; note "${out:-  (none)}"
-  case " $PRE_HIERARCHY_IDS " in *" $id "*) [ -n "$out" ] && finding "INFO: items remain under pre-hierarchy id ${id} (ignored by the monitor; optional cleanup)";; esac
-  case " $RUNTIMES " in *" $id "*) echo "$out" | grep -E '^STATE#' | grep -v '^STATE#_deployment' >/dev/null && finding "WARNING: process STATE# rows exist under ${id}; they persist across the reset and would surface as stale rows";; esac
+section "5. DynamoDB ${DDB_TABLE} (record types and timestamps only)"
+for id in $RUNTIMES $PRE_RESET_IDS; do
+  capture aws dynamodb query --region "$REGION" --table-name "$DDB_TABLE" --key-condition-expression "pipeline = :p" \
+    --expression-attribute-values "{\":p\":{\"S\":\"${id}\"}}" --projection-expression "recordType, recordedAt" \
+    --query "Items[].[recordType.S, recordedAt.N]" --output text
+  classify "dynamodb:${id}"
+  [ "$STATUS" = UNKNOWN ] && continue
+  [ "$STATUS" = CONFIRMED_PRESENT ] && note "$OUT"
+  case " $RUNTIMES " in
+    *" $id "*) awk '{print $1}' <<<"$OUT" | grep -E '^STATE#' | grep -vx 'STATE#_deployment' >/dev/null && warning "process STATE# rows exist under ${id}; they persist across the reset" ;;
+    *) [ "$STATUS" = CONFIRMED_PRESENT ] && warning "items remain under pre-reset id ${id} (ignored by the monitor; optional cleanup)" ;;
+  esac
 done
 
 section "6. Not checkable from this host"
-note "- Terraform state: ask the Terraform owner for 'terraform state list | grep goldengate_runtime_efs' and the creation_token of each instance."
-note "- GitHub Actions: result of the automatic push run for commit fbe560a (00 | MAIN | GoldenGate EKS End-to-End Deployment)."
+note "- Terraform state: 'terraform state list | grep goldengate_runtime_efs' and 'terraform state show' per instance, from the Terraform owner."
+note "- GitHub Actions: results of the corporate orchestrator runs since the canonical-naming commit."
 
 section "SUMMARY"
-if [ "${#FINDINGS[@]}" -eq 0 ]; then note "no findings"; else printf '%s\n' "${FINDINGS[@]}"; fi
+note "unknown checks: ${UNKNOWN_COUNT}"
+note "blockers: ${#BLOCKERS[@]}"
+[ "${#BLOCKERS[@]}" -gt 0 ] && printf 'BLOCKER: %s\n' "${BLOCKERS[@]}"
+note "warnings: ${#WARNINGS[@]}"
+[ "${#WARNINGS[@]}" -gt 0 ] && printf 'WARNING: %s\n' "${WARNINGS[@]}"
+if [ "${#BLOCKERS[@]}" -gt 0 ]; then
+  note "RESULT: BLOCKED"
+  exit 2
+fi
+note "RESULT: NO BLOCKERS"
+exit 0

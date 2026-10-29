@@ -10388,7 +10388,7 @@ results.append(("6b: cmd_resolve_region derives AWS_REGION via goldengate-enviro
 results.append(("6c: cmd_resolve_region fails closed on an empty AWS_REGION (no eu-west-1 fallback)", "if not aws_region:" in phase2_source and "eu-west-1" not in phase2_source))
 
 apply_job = jobs["apply"]
-results.append(("7a: apply.needs == validate_environment_config", apply_job.get("needs") == "validate_environment_config"))
+results.append(("7a: apply.needs == [validate_environment_config, verify_managed_efs_inventory] (the managed-EFS inventory gate precedes every apply)", apply_job.get("needs") == ["validate_environment_config", "verify_managed_efs_inventory"]))
 results.append(("7b: apply.with.region == needs.validate_environment_config.outputs.aws_region", apply_job.get("with", {}).get("region") == "${{ needs.validate_environment_config.outputs.aws_region }}"))
 
 for label, ok in results:
@@ -15278,7 +15278,7 @@ sub_jobs = sub_doc["jobs"]
 main_jobs = main_doc["jobs"]
 
 # A: 10-sub-iam-secrets.yaml still contains exactly the expected jobs.
-check("A: 10-sub-iam-secrets.yaml contains exactly the expected jobs (validate_environment_config, apply)", set(sub_jobs.keys()) == {"validate_environment_config", "apply"})
+check("A: 10-sub-iam-secrets.yaml contains exactly the expected jobs (validate_environment_config, verify_managed_efs_inventory, apply)", set(sub_jobs.keys()) == {"validate_environment_config", "verify_managed_efs_inventory", "apply"})
 
 vec = sub_jobs.get("validate_environment_config", {})
 apply_job = sub_jobs.get("apply", {})
@@ -15305,7 +15305,7 @@ check("F: validate_environment_config never invokes the aws CLI", not re.search(
 check("F: validate_environment_config never invokes terraform apply", "terraform apply" not in vec_text and not re.search(r'[\'"]terraform[\'"]', vec_text))
 
 # G/H/I: apply needs validate_environment_config, still calls the exact corporate reusable workflow, and forwards secrets: inherit.
-check("G: apply needs validate_environment_config", apply_job.get("needs") == "validate_environment_config")
+check("G: apply needs validate_environment_config and the managed-EFS inventory gate", apply_job.get("needs") == ["validate_environment_config", "verify_managed_efs_inventory"])
 check("H: apply uses exactly the ADCB corporate reusable workflow", apply_job.get("uses") == "AbuDhabiCommercialBank/adcb-reusable-workflows/.github/workflows/aws-terraform-apply.yaml@main")
 check("I: apply has secrets: inherit", apply_job.get("secrets") == "inherit")
 
@@ -15981,7 +15981,7 @@ with open(sub_path) as f:
     sub_doc = yaml.safe_load(f)
 check("J: MAIN job count reflects the Phase 3 + Phase 4 + Phase 5 + Phase 6 groupings (6; Automated Replication Implementation Removal deleted the former Phase 6 automated-replication job outright, down from 7)", len(main_doc.get("jobs", {})) == 6)
 check("J: MAIN still defines validate_model and terraform_sync_once", {"validate_model", "terraform_sync_once"} <= set(main_doc.get("jobs", {}).keys()))
-check("J: 10-sub-iam-secrets.yaml still defines exactly validate_environment_config and apply", set(sub_doc.get("jobs", {}).keys()) == {"validate_environment_config", "apply"})
+check("J: 10-sub-iam-secrets.yaml defines exactly validate_environment_config, verify_managed_efs_inventory and apply", set(sub_doc.get("jobs", {}).keys()) == {"validate_environment_config", "verify_managed_efs_inventory", "apply"})
 
 for label, ok in results:
     print(("OK " if ok else "FAIL ") + label)
