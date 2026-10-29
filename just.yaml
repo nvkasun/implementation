@@ -1,1 +1,37 @@
-https://gg-postgresql-repltest-001.goldengate-dev.adcbmis.local/services/gg-postgresql-repltest-001/adminsrvr/v2/content/index.html?utm_source=chatgpt.com
+#!/usr/bin/env bash
+# GoldenGate routing preflight - read-only; no credentials, writes or restarts.
+set -u
+NS="${NS:-goldengate-dev}"
+RUNTIMES=(gg-postgresql-repltest-001 gg-mssql-repltest-001 gg-oracle-repltest-002 gg-postgresql-repltest-002)
+command -v kubectl >/dev/null 2>&1 || { echo 'ERROR: kubectl missing'; exit 1; }
+echo '=== GOLDENGATE ROUTING PRE-FLIGHT (READ ONLY) ==='
+date -u '+UTC: %Y-%m-%dT%H:%M:%SZ'
+echo "Context: $(kubectl config current-context 2>/dev/null || echo UNKNOWN) | Namespace: $NS"
+echo
+for id in "${RUNTIMES[@]}"; do
+  echo "========== $id =========="
+  pod="${id}-0"
+  if ! kubectl get pod "$pod" -n "$NS" >/dev/null 2>&1; then echo "POD NOT FOUND: $pod"; echo; continue; fi
+  kubectl get pod "$pod" -n "$NS" -o 'custom-columns=POD:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount' --no-headers 2>/dev/null || true
+  echo '-- StatefulSet declared identity and PVC --'
+  kubectl get sts "$id" -n "$NS" -o jsonpath='{range .spec.template.spec.containers[*]}container={.name}{"\n"}{range .env[?(@.name=="OGG_DEPLOYMENT")]}OGG_DEPLOYMENT={.value}{"\n"}{end}{range .env[?(@.name=="OGG_DOMAIN")]}OGG_DOMAIN={.value}{"\n"}{end}{end}{range .spec.template.spec.volumes[?(@.name=="u02")]}u02_claim={.persistentVolumeClaim.claimName}{"\n"}{end}' 2>/dev/null || true
+  echo
+  echo '-- Live process identity + generated NGINX service routes --'
+  container=$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.spec.containers[0].name}' 2>/dev/null || true)
+  if [ -z "$container" ]; then echo 'Unable to detect main container'; echo; continue; fi
+  kubectl exec -n "$NS" "$pod" -c "$container" -- sh -c '
+    printf "live_OGG_DEPLOYMENT=%s\n" "${OGG_DEPLOYMENT:-<unset>}"
+    printf "live_OGG_DOMAIN=%s\n" "${OGG_DOMAIN:-<unset>}"
+    if [ -r /etc/nginx/ogg.conf ]; then
+      grep -E "^[[:space:]]*location .*\/services\/.*(adminsrvr|distsrvr|pmsrvr|recvsrvr)" /etc/nginx/ogg.conf | head -n 12 || true
+    else
+      echo "NGINX configuration not readable at /etc/nginx/ogg.conf"
+    fi
+    printf "GoldenGate processes: "
+    ps -eo args 2>/dev/null | grep -E "/u01/ogg/bin/(ServiceManager|adminsrvr|distsrvr|pmsrvr|recvsrvr)" | grep -v grep | sed -E "s@ --config.*@@" | sort -u | tr "\n" ";" || true
+    echo
+  ' 2>&1 || echo 'WARN: exec failed'
+  echo
+ done
+ echo '=== END: NO CLUSTER CHANGES WERE MADE ==='
+ echo 'NOTE: This does not prove the Service Manager registered names. Confirm these in the authenticated Service Manager UI before rollout.'
