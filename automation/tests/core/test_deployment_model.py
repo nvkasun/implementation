@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -868,7 +869,7 @@ class EnvironmentScopedContractTests(ScratchEnvironmentTestCase):
         self.assertEqual(len(invalid), 1)
 
     def test_efs_creation_token_derivation_is_deterministic(self):
-        # A generic ID deliberately distinct from the four real LEGACY_MANAGED_EFS_CREATION_TOKENS entries -- this proves the ORDINARY deterministic formula, not the Pipeline-Aware Descriptor Hierarchy Migration's own narrowly-scoped override (see PipelineAwareLegacyEfsTokenMigrationTests below for that).
+        # The deterministic formula applies to every runtime; there are no per-runtime overrides.
         self.assertEqual(gdm.derive_efs_creation_token("dev", "gg-generic-fixture-001"),
                          "dev-gg-generic-fixture-001-efs")
         self.assertEqual(gdm.derive_efs_creation_token("dev", "gg-generic-fixture-001"),
@@ -1770,22 +1771,34 @@ class RetiredRegisteredNameOverrideTests(ScratchEnvironmentTestCase):
 class RealRepositoryChartOwnedVsExternalU02ClaimTests(unittest.TestCase):
     """Exercised against the real, live envs/dev descriptors -- no scratch root (mirrors RealRepositoryDescriptorTests' own convention above)."""
 
-    def test_the_four_real_migration_descriptors_use_existing_claim_pointing_at_the_old_retained_pvc(self):
-        # 16: confirms the real, currently-active migrated descriptors still resolve through this corrected model to the exact same OLD retained PVC names -- this correction must never rename/recreate/re-point them.
+    def test_real_descriptors_derive_every_storage_identity_from_the_runtime_id(self):
+        # Canonical naming: chart-owned PVC "<runtime>-u02" and managed EFS creation token "<env>-<runtime>-efs", with no per-runtime overrides.
         real_active, real_inactive, real_invalid = gdm.scan("dev")
         self.assertEqual(real_invalid, [])
-        by_id = {d["deploymentId"]: d for d in real_active + real_inactive}
-        expected = {
-            "gg-postgresql-repltest-001": "gg-postgresql-repltest-01-u02",
-            "gg-mssql-repltest-001": "gg-mssql-repltest-01-u02",
-            "gg-oracle-repltest-002": "gg-oracle-repltest-01-u02",
-            "gg-postgresql-repltest-002": "gg-postgresql-repltest-02-u02",
-        }
-        for deployment_id, expected_old_pvc in expected.items():
-            d = by_id[deployment_id]
-            self.assertEqual(d["u02ExistingClaim"], expected_old_pvc, deployment_id)
-            self.assertEqual(d["u02EffectivePvcName"], expected_old_pvc, deployment_id)
-            self.assertFalse(d["u02ChartOwnsPvc"], deployment_id)
+        self.assertEqual(len(real_active + real_inactive), 4)
+        for d in real_active + real_inactive:
+            deployment_id = d["deploymentId"]
+            self.assertEqual(d["u02ExistingClaim"], "", deployment_id)
+            self.assertEqual(d["u02ClaimName"], "", deployment_id)
+            self.assertTrue(d["u02ChartOwnsPvc"], deployment_id)
+            self.assertEqual(d["u02EffectivePvcName"], f"{deployment_id}-u02")
+            self.assertEqual(d["efsMode"], "managed")
+            self.assertEqual(d["efsCreationToken"], f"dev-{deployment_id}-efs")
+
+    def test_no_legacy_identity_mapping_remains_in_active_configuration(self):
+        self.assertFalse(hasattr(gdm, "LEGACY_MANAGED_EFS_CREATION_TOKENS"))
+        legacy = re.compile(r"gg-(postgresql|mssql|oracle)-repltest-0[12]\b|RUNTIME_IDENTITY_MIGRATIONS|LEGACY_MANAGED_EFS_CREATION_TOKENS|"
+                            r"PENDING_DEPLOYMENT_ID_MIGRATIONS|KNOWN_DEPLOYMENT_ID_MIGRATIONS|goldengate_config_migration|goldengate_legacy_managed_efs")
+        roots = ["envs/dev", "helm/goldengate", "monitoring/monitor", "automation", ".github/workflows"]
+        offenders = []
+        for root in roots:
+            for path in Path(REPO_ROOT, root).rglob("*"):
+                rel = path.relative_to(REPO_ROOT).as_posix()
+                if not path.is_file() or "/tests/" in f"/{rel}" or rel.endswith("test-goldengate-deployment-models.sh") or path.suffix not in (".py", ".sh", ".tf", ".yaml", ".yml", ".tpl"):
+                    continue
+                if legacy.search(path.read_text(errors="replace")):
+                    offenders.append(rel)
+        self.assertEqual(offenders, [])
 
     def test_real_descriptors_declare_no_registered_name(self):
         real_active, real_inactive, real_invalid = gdm.scan("dev")

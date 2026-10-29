@@ -252,168 +252,37 @@ class SelfConsistentOwnershipIdentityTests(unittest.TestCase):
             guard.check_managed_efs_inventory([], actual, "dev")
 
 
-class PipelineAwareLegacyEfsTokenMigrationTests(unittest.TestCase):
-    """Pipeline-Aware Descriptor Hierarchy Migration: proves the exact four (environment, NEW deployment ID) legacy overrides are applied, that they never leak to any other deployment ID, that this module's copy agrees byte-for-byte with automation/goldengate-deployment-model.py's own canonical copy (drift test), and that the real post-migration self-consistency scenario (an actual AWS filesystem tagged with the NEW deployment ID but still carrying its OLD, immutable CreationToken) passes cleanly."""
+class CanonicalCreationTokenTests(unittest.TestCase):
+    """Every runtime's managed EFS creation token is "<environment>-<deployment_id>-efs"; no per-runtime exceptions exist."""
 
-    LEGACY_PAIRS = [
-        ("dev", "gg-postgresql-repltest-001", "dev-gg-postgresql-repltest-01-efs"),
-        ("dev", "gg-mssql-repltest-001", "dev-gg-mssql-repltest-01-efs"),
-        ("dev", "gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs"),
-        ("dev", "gg-postgresql-repltest-002", "dev-gg-postgresql-repltest-02-efs"),
-    ]
-
-    def test_each_legacy_pair_derives_its_exact_pre_migration_token(self):
-        for environment, deployment_id, expected_token in self.LEGACY_PAIRS:
-            with self.subTest(deployment_id=deployment_id):
-                self.assertEqual(guard.derive_expected_creation_token(environment, deployment_id), expected_token)
-
-    def test_legacy_mapping_never_applies_to_a_different_environment(self):
-        # The exact same NEW deployment ID string under a DIFFERENT (hypothetical) environment must never inherit dev's legacy token -- it is keyed by the full (environment, deployment_id) pair, never deployment_id alone.
-        self.assertEqual(guard.derive_expected_creation_token("sit", "gg-postgresql-repltest-001"), "sit-gg-postgresql-repltest-001-efs")
-
-    def test_old_pre_migration_deployment_ids_are_not_in_the_legacy_map(self):
-        # The OLD deployment IDs (gg-postgresql-repltest-01, etc.) are never map keys -- only the NEW ones are. An actual AWS filesystem still tagged with an OLD ID (before the real, separately-approved live migration has actually run) must keep deriving the plain, unchanged naive formula.
-        for environment, deployment_id in [("dev", "gg-postgresql-repltest-01"), ("dev", "gg-mssql-repltest-01"), ("dev", "gg-oracle-repltest-01"), ("dev", "gg-postgresql-repltest-02")]:
+    def test_canonical_token_for_current_and_future_runtimes(self):
+        for environment, deployment_id in (("dev", "gg-postgresql-repltest-001"), ("dev", "gg-oracle-repltest-002"),
+                                           ("dev", "gg-postgresql-demo-003"), ("uat2", "ogg-db2-settlement-123")):
             with self.subTest(deployment_id=deployment_id):
                 self.assertEqual(guard.derive_expected_creation_token(environment, deployment_id), f"{environment}-{deployment_id}-efs")
 
-    @unittest.skipUnless(_PYYAML_AVAILABLE, "automation/goldengate-deployment-model.py requires PyYAML at import time")
-    def test_legacy_map_matches_the_deployment_model_exactly(self):
-        # Regression proof against drift: this module's own LEGACY_MANAGED_EFS_CREATION_TOKENS copy must be byte-for-byte identical to automation/goldengate-deployment-model.py's canonical one -- mirrored, never imported, exactly like derive_expected_creation_token()'s own drift test above.
-        spec = importlib.util.spec_from_file_location("goldengate_deployment_model", os.path.join(REPO_ROOT, "automation", "goldengate-deployment-model.py"))
-        dm = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(dm)
-        self.assertEqual(guard.LEGACY_MANAGED_EFS_CREATION_TOKENS, dm.LEGACY_MANAGED_EFS_CREATION_TOKENS)
+    def test_no_legacy_or_pending_migration_mappings_remain(self):
+        self.assertFalse(hasattr(guard, "LEGACY_MANAGED_EFS_CREATION_TOKENS"))
+        self.assertFalse(hasattr(guard, "PENDING_DEPLOYMENT_ID_MIGRATIONS"))
 
-    def test_post_migration_actual_filesystem_self_consistency_passes(self):
-        # The real scenario this override exists for: after the separately-approved live Terraform apply, an actual AWS filesystem is tagged with the NEW deployment ID (GoldenGateDeploymentId updated in place) but its CreationToken remains the OLD, immutable value (ForceNew -- never changes on an existing resource). Self-consistency (and therefore the whole guard) must pass cleanly, never fail closed, for exactly this shape.
-        expected = [_expected("gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs")]
-        actual = [_fs("fs-oracle", "dev-gg-oracle-repltest-01-efs", _valid_tags("gg-oracle-repltest-002", environment="dev"))]
-        orphans = guard.check_managed_efs_inventory(expected, actual, "dev")
-        self.assertEqual(orphans, [])
+    def test_guard_agrees_with_the_deployment_model(self):
+        import importlib.util as _util
+        spec = _util.spec_from_file_location("gdm_for_guard_test", Path(__file__).resolve().parents[3] / "goldengate-deployment-model.py")
+        gdm = _util.module_from_spec(spec)
+        spec.loader.exec_module(gdm)
+        for deployment_id in ("gg-postgresql-repltest-001", "gg-mssql-repltest-001", "gg-oracle-repltest-002", "gg-postgresql-repltest-002", "gg-x-9"):
+            self.assertEqual(gdm.derive_efs_creation_token("dev", deployment_id), guard.derive_expected_creation_token("dev", deployment_id))
 
-    def test_post_migration_wrong_leftover_old_tag_still_fails_closed(self):
-        # Defense in depth: an actual filesystem tagged with the NEW deployment ID but a token that matches NEITHER the legacy value NOR the naive new-ID formula must still fail closed -- the override never becomes a blanket excuse to skip self-consistency.
-        actual = [_fs("fs-oracle", "dev-gg-totally-different-efs", _valid_tags("gg-oracle-repltest-002", environment="dev"))]
+    def test_filesystem_still_carrying_a_pre_reset_token_blocks_terraform(self):
+        # A pre-reset filesystem tagged with a current runtime ID but an older creation token must stop the pipeline before Terraform replaces it.
+        actual = [_fs("fs-0old", "dev-gg-oracle-sample-01-efs", _valid_tags("gg-oracle-repltest-002"))]
         with self.assertRaises(guard.InventoryGuardError):
-            guard.check_managed_efs_inventory([], actual, "dev")
+            guard.check_managed_efs_inventory([_expected("gg-oracle-repltest-002")], actual, "dev")
 
-
-class PendingDeploymentIdMigrationTests(unittest.TestCase):
-    """Managed EFS Identity Migration Correction (First-Live-Run Tag Convergence): the Terraform `moved` blocks (envs/dev/efs.tf) migrate the STATE ADDRESS on the very next `terraform apply`, but this read-only guard runs in Phase 1 BEFORE that apply -- so on the very first post-migration push, an actual pre-existing AWS filesystem may still carry one of exactly four bounded OLD GoldenGateDeploymentId tags while the current Git inventory already expects only the mapped NEW deployment ID. Proves the exact nine-condition bounded acceptance contract: any single condition failing (wrong token, wrong mapped target, unknown old id, wrong environment, wrong ManagedBy, wrong storage, duplicate identity) must still fail exactly as fail-closed as before this mechanism existed."""
-
-    MIGRATION_PAIRS = [
-        ("dev", "gg-postgresql-repltest-01", "gg-postgresql-repltest-001", "dev-gg-postgresql-repltest-01-efs"),
-        ("dev", "gg-mssql-repltest-01", "gg-mssql-repltest-001", "dev-gg-mssql-repltest-01-efs"),
-        ("dev", "gg-oracle-repltest-01", "gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs"),
-        ("dev", "gg-postgresql-repltest-02", "gg-postgresql-repltest-002", "dev-gg-postgresql-repltest-02-efs"),
-    ]
-
-    def test_each_bounded_pair_is_present_and_maps_to_its_exact_new_id(self):
-        for environment, old_id, new_id, _token in self.MIGRATION_PAIRS:
-            with self.subTest(old_id=old_id):
-                self.assertEqual(guard.PENDING_DEPLOYMENT_ID_MIGRATIONS.get((environment, old_id)), new_id)
-
-    def test_no_pending_migration_mapping_exists_for_an_unrelated_or_future_runtime(self):
-        self.assertEqual(len(guard.PENDING_DEPLOYMENT_ID_MIGRATIONS), 4)
-        for key in guard.PENDING_DEPLOYMENT_ID_MIGRATIONS:
-            self.assertIn(key, {(env, old_id) for env, old_id, _new, _tok in self.MIGRATION_PAIRS})
-        self.assertNotIn(("dev", "gg-postgresql-repltest-001"), guard.PENDING_DEPLOYMENT_ID_MIGRATIONS)
-        self.assertNotIn(("dev", "gg-brand-new-runtime-003"), guard.PENDING_DEPLOYMENT_ID_MIGRATIONS)
-
-    def test_4_first_run_old_tag_exact_old_token_mapped_new_expected_passes(self):
-        # Requirement 4: existing EFS with OLD deployment tag + exact old token + mapped NEW expected deployment passes the first-run guard.
-        for environment, old_id, new_id, token in self.MIGRATION_PAIRS:
-            with self.subTest(old_id=old_id):
-                expected = [_expected(new_id, token)]
-                actual = [_fs(f"fs-{old_id}", token, _valid_tags(old_id, environment=environment))]
-                orphans = guard.check_managed_efs_inventory(expected, actual, environment)
-                self.assertEqual(orphans, [])
-
-    def test_5_steady_state_new_tag_with_same_old_immutable_token_passes(self):
-        # Requirement 5: the SAME physical filesystem, now tagged with the NEW deployment ID (Terraform has applied the moved block), still carries the OLD immutable token -- normal steady state, no migration-map lookup involved at all.
-        for environment, _old_id, new_id, token in self.MIGRATION_PAIRS:
-            with self.subTest(new_id=new_id):
-                expected = [_expected(new_id, token)]
-                actual = [_fs(f"fs-{new_id}", token, _valid_tags(new_id, environment=environment))]
-                orphans = guard.check_managed_efs_inventory(expected, actual, environment)
-                self.assertEqual(orphans, [])
-
-    def test_6_old_tag_with_wrong_creation_token_fails(self):
-        expected = [_expected("gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs")]
-        actual = [_fs("fs-oracle", "dev-gg-oracle-repltest-01-efs-WRONG", _valid_tags("gg-oracle-repltest-01", environment="dev"))]
-        with self.assertRaises(guard.InventoryGuardError):
-            guard.check_managed_efs_inventory(expected, actual, "dev")
-
-    def test_7_old_tag_whose_token_belongs_to_a_different_expected_deployment_fails(self):
-        # The OLD id's bounded map target is gg-oracle-repltest-002, but this filesystem's actual CreationToken belongs to an entirely different expected deployment (gg-mssql-repltest-001) -- eligibility must fail, falling through to the pre-existing collision-identity-mismatch rule.
-        expected = [
-            _expected("gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs"),
-            _expected("gg-mssql-repltest-001", "dev-gg-mssql-repltest-01-efs"),
-        ]
-        actual = [_fs("fs-oracle", "dev-gg-mssql-repltest-01-efs", _valid_tags("gg-oracle-repltest-01", environment="dev"))]
-        with self.assertRaises(guard.InventoryGuardError):
-            guard.check_managed_efs_inventory(expected, actual, "dev")
-
-    def test_8_unknown_old_deployment_id_is_not_pending_and_orphans_under_existing_rules(self):
-        expected = [_expected("gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs")]
-        actual = [_fs("fs-unknown", "dev-gg-totally-unknown-01-efs", _valid_tags("gg-totally-unknown-01", environment="dev"))]
-        orphans = guard.check_managed_efs_inventory(expected, actual, "dev")
-        self.assertEqual([o["deploymentId"] for o in orphans], ["gg-totally-unknown-01"])
-
-    def test_9_wrong_environment_tag_on_an_otherwise_eligible_old_tag_fails(self):
-        expected = [_expected("gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs")]
-        actual = [_fs("fs-oracle", "dev-gg-oracle-repltest-01-efs", _valid_tags("gg-oracle-repltest-01", environment="sit"))]
-        with self.assertRaises(guard.InventoryGuardError):
-            guard.check_managed_efs_inventory(expected, actual, "dev")
-
-    def test_10_wrong_managed_by_on_an_otherwise_eligible_old_tag_fails(self):
-        expected = [_expected("gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs")]
-        tags = _valid_tags("gg-oracle-repltest-01", environment="dev")
-        tags["ManagedBy"] = "something-else"
-        actual = [_fs("fs-oracle", "dev-gg-oracle-repltest-01-efs", tags)]
-        with self.assertRaises(guard.InventoryGuardError):
-            guard.check_managed_efs_inventory(expected, actual, "dev")
-
-    def test_11_wrong_storage_tag_on_an_otherwise_eligible_old_tag_fails(self):
-        expected = [_expected("gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs")]
-        tags = _valid_tags("gg-oracle-repltest-01", environment="dev")
-        tags["GoldenGateStorage"] = "u01"
-        actual = [_fs("fs-oracle", "dev-gg-oracle-repltest-01-efs", tags)]
-        with self.assertRaises(guard.InventoryGuardError):
-            guard.check_managed_efs_inventory(expected, actual, "dev")
-
-    def test_12_old_tagged_and_new_tagged_duplicate_of_the_same_effective_identity_fails(self):
-        # Requirement 9/12: the OLD-tagged (pending) filesystem and a genuinely separate NEW-tagged filesystem must never both silently satisfy the same expected deployment -- duplicate/ambiguous identity fails exactly like today's pre-existing duplicate-GoldenGateDeploymentId rule.
-        expected = [_expected("gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs")]
-        actual = [
-            _fs("fs-oracle-old", "dev-gg-oracle-repltest-01-efs", _valid_tags("gg-oracle-repltest-01", environment="dev")),
-            _fs("fs-oracle-new", "dev-gg-oracle-repltest-01-efs", _valid_tags("gg-oracle-repltest-002", environment="dev")),
-        ]
-        with self.assertRaises(guard.InventoryGuardError):
-            guard.check_managed_efs_inventory(expected, actual, "dev")
-
-    def test_13_unrelated_filesystem_colliding_with_a_migration_pairs_legacy_token_still_fails(self):
-        # Requirement 13: a completely unrelated/mistagged filesystem that happens to share one of the four legacy tokens is still the ambiguous case the pre-existing collision check exists to catch -- the pending-migration mechanism never widens that check.
-        expected = [_expected("gg-oracle-repltest-002", "dev-gg-oracle-repltest-01-efs")]
-        actual = [_fs("fs-impostor", "dev-gg-oracle-repltest-01-efs", _valid_tags("gg-totally-unrelated", environment="dev"))]
-        with self.assertRaises(guard.InventoryGuardError):
-            guard.check_managed_efs_inventory(expected, actual, "dev")
-
-    @unittest.skipUnless(_PYYAML_AVAILABLE, "automation/phases/phase1/detect-goldengate-deployments.sh's KNOWN_DEPLOYMENT_ID_MIGRATIONS is compared against this module's own bounded map by literal (old, new) pairs, independent of PyYAML -- guarded only to match this file's existing convention for cross-module drift tests")
-    def test_pending_map_agrees_with_the_bash_detection_scripts_known_migration_pairs(self):
-        # Drift test: automation/phases/phase1/detect-goldengate-deployments.sh's own KNOWN_DEPLOYMENT_ID_MIGRATIONS bash associative array must name the exact same four (old -> new) pairs as this module's PENDING_DEPLOYMENT_ID_MIGRATIONS (dev-scoped) -- both exist to recognize the SAME one-time migration, from two different execution contexts (Phase 1 bash discovery vs. this Python inventory guard), and must never drift apart.
-        import re
-        detect_script_path = os.path.join(REPO_ROOT, "automation", "phases", "phase1", "detect-goldengate-deployments.sh")
-        with open(detect_script_path) as f:
-            detect_script_source = f.read()
-        match = re.search(r"declare -A KNOWN_DEPLOYMENT_ID_MIGRATIONS=\((.*?)\)\n", detect_script_source, re.S)
-        self.assertIsNotNone(match, "could not locate KNOWN_DEPLOYMENT_ID_MIGRATIONS in detect-goldengate-deployments.sh")
-        pairs = dict(re.findall(r'\["([^"]+)"\]="([^"]+)"', match.group(1)))
-        expected_pairs = {old_id: new_id for _env, old_id, new_id, _tok in self.MIGRATION_PAIRS}
-        self.assertEqual(pairs, expected_pairs)
-        for old_id, new_id in pairs.items():
-            self.assertEqual(guard.PENDING_DEPLOYMENT_ID_MIGRATIONS.get(("dev", old_id)), new_id)
+    def test_fresh_canonical_filesystems_pass(self):
+        ids = ("gg-postgresql-repltest-001", "gg-mssql-repltest-001", "gg-oracle-repltest-002", "gg-postgresql-repltest-002")
+        actual = [_fs(f"fs-{n}", f"dev-{i}-efs", _valid_tags(i)) for n, i in enumerate(ids)]
+        self.assertEqual(guard.check_managed_efs_inventory([_expected(i) for i in ids], actual, "dev"), [])
 
 
 class GrammarTests(unittest.TestCase):

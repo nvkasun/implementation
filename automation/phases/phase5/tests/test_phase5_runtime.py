@@ -815,12 +815,17 @@ class RenderedManifestContractTests(unittest.TestCase):
 
 # ==== REAL HELM RENDER: init-container persistent-state safety ====
 
-REAL_DEV_RUNTIME_RETAINED_CLAIMS = {
-    "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml": "gg-postgresql-repltest-01-u02",
-    "envs/dev/pipelines/repltest-pg-to-mssql-001/gg-mssql-repltest-001/values.yaml": "gg-mssql-repltest-01-u02",
-    "envs/dev/pipelines/repltest-ora-to-pg-002/gg-oracle-repltest-002/values.yaml": "gg-oracle-repltest-01-u02",
-    "envs/dev/pipelines/repltest-ora-to-pg-002/gg-postgresql-repltest-002/values.yaml": "gg-postgresql-repltest-02-u02",
-}
+REAL_DEV_RUNTIME_VALUES_FILES = sorted(str(p.relative_to(REPO_ROOT)) for p in (REPO_ROOT / "envs" / "dev" / "pipelines").glob("*/*/values.yaml"))
+
+
+def _assert_canonical_chart_owned_pvc(test, docs, deployment_id):
+    """The u02 volume mounts the chart-owned PVC <runtime>-u02, which carries the Argo CD retention annotation."""
+    pod_spec = next(d for d in docs if d["kind"] == "StatefulSet")["spec"]["template"]["spec"]
+    u02 = next(v for v in pod_spec["volumes"] if v["name"] == "u02")
+    test.assertEqual(u02["persistentVolumeClaim"]["claimName"], f"{deployment_id}-u02")
+    pvcs = [d for d in docs if d["kind"] == "PersistentVolumeClaim"]
+    test.assertEqual([p["metadata"]["name"] for p in pvcs], [f"{deployment_id}-u02"])
+    test.assertEqual(pvcs[0]["metadata"]["annotations"]["argocd.argoproj.io/sync-options"], "Prune=false,Delete=false")
 
 
 @unittest.skipUnless(shutil.which("helm"), "helm not available")
@@ -837,7 +842,8 @@ class RealRuntimeInitContainerRenderTests(unittest.TestCase):
                                "--values", str(REPO_ROOT / values_file), *overrides, *extra_args], capture_output=True, text=True)
 
     def test_real_descriptors_render_a_safe_non_recursive_init_container(self):
-        for values_file, retained_claim in REAL_DEV_RUNTIME_RETAINED_CLAIMS.items():
+        self.assertEqual(len(REAL_DEV_RUNTIME_VALUES_FILES), 4)
+        for values_file in REAL_DEV_RUNTIME_VALUES_FILES:
             with self.subTest(values_file=values_file):
                 deployment_id = Path(values_file).parent.name
                 proc = self._render(values_file)
@@ -861,12 +867,10 @@ class RealRuntimeInitContainerRenderTests(unittest.TestCase):
                 self.assertEqual([line for line in script.splitlines() if line.strip().startswith("rm ")],
                                  ["rm -f /u02/oggf/certificate/write-test.txt", '  rm -f -- "$SERVICE_MANAGER_PID_FILE"'])
 
-                u02 = next(v for v in pod_spec["volumes"] if v["name"] == "u02")
-                self.assertEqual(u02["persistentVolumeClaim"]["claimName"], retained_claim)
-                self.assertEqual([d for d in docs if d["kind"] == "PersistentVolumeClaim"], [])
+                _assert_canonical_chart_owned_pvc(self, docs, deployment_id)
 
     def test_chart_rejects_unsafe_init_permissions_mode(self):
-        values_file = next(iter(REAL_DEV_RUNTIME_RETAINED_CLAIMS))
+        values_file = REAL_DEV_RUNTIME_VALUES_FILES[0]
         for mode in ("0777", "0775", "0770; id", "$(id)", "770"):
             with self.subTest(mode=mode):
                 proc = self._render(values_file, ("--set-string", f"runtime.initPermissions.mode={mode}"))
@@ -945,7 +949,7 @@ def _deployments_body(*names, include_service_manager=True):
 
 class IdentityResolverUnitTests(unittest.TestCase):
     def test_parses_the_application_deployment_and_excludes_service_manager(self):
-        self.assertEqual(identity_resolver.parse_registered_names(_deployments_body("gg-oracle-repltest-01")), ["gg-oracle-repltest-01"])
+        self.assertEqual(identity_resolver.parse_registered_names(_deployments_body("gg-oracle-sample-01")), ["gg-oracle-sample-01"])
         self.assertEqual(identity_resolver.parse_registered_names(_deployments_body("Ledger", include_service_manager=False)), ["Ledger"])
         self.assertEqual(identity_resolver.parse_registered_names(json.dumps({"response": {"items": [{"name": "servicemanager"}]}}).encode()), [])
 
@@ -1044,12 +1048,11 @@ def _nginx_upstream_for(conf_text, uri):
     return None
 
 
-# Confirmed live registrations retained on the four DEV volumes (runtime ID -> registered GoldenGate deployment).
-OBSERVED_REGISTRATIONS = {
-    "gg-postgresql-repltest-001": "gg-postgresql-repltest-01",
-    "gg-mssql-repltest-001": "gg-mssql-repltest-01",
-    "gg-oracle-repltest-002": "gg-oracle-repltest-01",
-    "gg-postgresql-repltest-002": "gg-postgresql-repltest-02",
+# Synthetic retained-volume cases: a registration that predates the current runtime ID (e.g. storage reattached after a rename).
+RETAINED_REGISTRATION_FIXTURES = {
+    "gg-postgresql-ledger-001": "gg-postgresql-ledger-previous",
+    "gg-mssql-ledger-001": "LedgerTarget",
+    "ogg-db2-settlement-123": "settlement_source_v1",
 }
 
 SYNTHETIC_ADMIN = "synthetic-oggadmin"
@@ -1196,8 +1199,19 @@ class IdentityEntrypointSimulationTests(unittest.TestCase):
             if other and other != registered:
                 self.assertEqual(_nginx_upstream_for(proc.conf, f"/services/{other}/{svc}/v2/content/"), "http_ServiceManager")
 
-    def test_observed_retained_registrations_route_under_the_registered_name(self):
-        for runtime_id, registered in OBSERVED_REGISTRATIONS.items():
+    def test_dev_runtimes_on_fresh_storage_register_and_route_under_their_runtime_id(self):
+        for values_file in REAL_DEV_RUNTIME_VALUES_FILES:
+            runtime_id = Path(values_file).parent.name
+            with self.subTest(runtime_id=runtime_id):
+                self.registry.unlink(missing_ok=True)
+                shutil.rmtree(self.root / "u02", ignore_errors=True)
+                proc = self._boot(runtime_id, existing_volume=False)
+                self._assert_routed_to(proc, runtime_id)
+                self.assertEqual(json.loads(self.registry.read_text()), [runtime_id])
+                self.assertIn(f"registered deployment {runtime_id!r} matches the runtime bootstrap name", proc.stderr)
+
+    def test_retained_registration_routes_under_the_registered_name(self):
+        for runtime_id, registered in RETAINED_REGISTRATION_FIXTURES.items():
             with self.subTest(runtime_id=runtime_id):
                 proc = self._boot(runtime_id, registered=[registered])
                 self._assert_routed_to(proc, registered, other=runtime_id)
@@ -1224,8 +1238,8 @@ class IdentityEntrypointSimulationTests(unittest.TestCase):
         self._assert_routed_to(replaced, "gg-postgresql-demo-003", other="gg-postgresql-renamed-004")
 
     def test_startup_delay_is_retried(self):
-        proc = self._boot("gg-oracle-repltest-002", registered=["gg-oracle-repltest-01"], fail_first=2, attempts="5")
-        self._assert_routed_to(proc, "gg-oracle-repltest-01")
+        proc = self._boot("gg-oracle-repltest-002", registered=["gg-oracle-sample-01"], fail_first=2, attempts="5")
+        self._assert_routed_to(proc, "gg-oracle-sample-01")
         self.assertEqual(proc.requests, 3)
 
     def _assert_failed_before_nginx(self, proc, message):
@@ -1311,21 +1325,20 @@ class RealRuntimeIdentityRenderTests(unittest.TestCase):
         self.assertFalse(init_mounts & set(phase5_runtime.expected_identity_mounts("/x")))
 
     def test_dev_descriptors_render_runtime_id_bootstrap_and_identity_hooks(self):
-        for values_file, retained_claim in REAL_DEV_RUNTIME_RETAINED_CLAIMS.items():
+        for values_file in REAL_DEV_RUNTIME_VALUES_FILES:
             with self.subTest(values_file=values_file):
                 deployment_id = Path(values_file).parent.name
                 proc = self._render(values_file)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 docs = phase5_runtime._parse_rendered_documents(proc.stdout)
                 self._assert_identity_wiring(docs, deployment_id)
-                self.assertNotIn(OBSERVED_REGISTRATIONS[deployment_id], proc.stdout.replace(retained_claim, ""), "no registered name may be declared in rendered manifests")
-                u02 = next(v for v in _rendered_pod_spec(docs)["volumes"] if v["name"] == "u02")
-                self.assertEqual(u02["persistentVolumeClaim"]["claimName"], retained_claim)
-                self.assertEqual([d for d in docs if d["kind"] == "PersistentVolumeClaim"], [])
+                _assert_canonical_chart_owned_pvc(self, docs, deployment_id)
+                storage_class = next(d for d in docs if d["kind"] == "StorageClass")
+                self.assertEqual(storage_class["metadata"]["name"], f"gg-efs-dev-{deployment_id}")
+                self.assertEqual(storage_class["parameters"]["basePath"], f"/{deployment_id}")
 
     def test_new_runtime_renders_without_any_identity_configuration(self):
-        values = yaml.safe_load((REPO_ROOT / next(iter(REAL_DEV_RUNTIME_RETAINED_CLAIMS))).read_text())
-        values["runtime"]["storage"]["u02"]["existingClaim"] = ""
+        values = yaml.safe_load((REPO_ROOT / REAL_DEV_RUNTIME_VALUES_FILES[0]).read_text())
         proc = self._render_values("gg-postgresql-demo-003", values)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         docs = phase5_runtime._parse_rendered_documents(proc.stdout)
@@ -1333,8 +1346,8 @@ class RealRuntimeIdentityRenderTests(unittest.TestCase):
         self.assertEqual(next(d for d in docs if d["kind"] == "PersistentVolumeClaim")["metadata"]["name"], "gg-postgresql-demo-003-u02")
 
     def test_chart_rejects_the_retired_registered_name_override(self):
-        values = yaml.safe_load((REPO_ROOT / next(iter(REAL_DEV_RUNTIME_RETAINED_CLAIMS))).read_text())
-        for name in ("gg-postgresql-repltest-01", "gg-postgresql-repltest-001"):
+        values = yaml.safe_load((REPO_ROOT / REAL_DEV_RUNTIME_VALUES_FILES[0]).read_text())
+        for name in ("gg-postgresql-sample-01", "gg-postgresql-repltest-001"):
             with self.subTest(name=name):
                 values["runtime"]["ogg"] = {"deploymentName": name}
                 proc = self._render_values("gg-postgresql-repltest-001", values)
@@ -1342,7 +1355,7 @@ class RealRuntimeIdentityRenderTests(unittest.TestCase):
                 self.assertIn("runtime.ogg.deploymentName is retired", proc.stderr)
 
     def test_repeated_renders_are_byte_identical(self):
-        for values_file in REAL_DEV_RUNTIME_RETAINED_CLAIMS:
+        for values_file in REAL_DEV_RUNTIME_VALUES_FILES:
             with self.subTest(values_file=values_file):
                 first, second = self._render(values_file), self._render(values_file)
                 self.assertEqual(first.returncode, 0, first.stderr)
@@ -1499,9 +1512,9 @@ class EfsRenderedManifestTests(unittest.TestCase):
 
 
 class ExternalClaimRenderedManifestTests(unittest.TestCase):
-    """Runtime Identity Migration (u02 storage-preserving bridge): runtime.storage.u02.existingClaim set -- helm/goldengate/templates/runtime-pvc.yaml never creates a PVC for this shape (its own render condition checks exactly this field), so _validate_rendered_storageclass_and_pvc must expect ZERO chart-owned PersistentVolumeClaim documents and instead require the StatefulSet's own u02 volume to reference the externally-provisioned claim name directly -- exactly the defect this class exists to catch a regression of (confirmed reproduced against the real gg-oracle-repltest-002 descriptor/chart during this task)."""
+    """Generic external-claim capability: with runtime.storage.u02.existingClaim set the chart renders no PVC, and the StatefulSet must mount exactly that claim."""
 
-    RETAINED_CLAIM = "gg-oracle-repltest-01-u02"
+    RETAINED_CLAIM = "gg-oracle-sample-01-u02"
     _VALUES = {"runtime": {"storage": {"u02": {"existingClaim": RETAINED_CLAIM}}}}
 
     def _statefulset_with_claim(self, claim_name):
@@ -3030,7 +3043,7 @@ class CrossRuntimeReconcileStateTests(unittest.TestCase):
         self._resolve_live_inputs_fails_zero_calls(environment="staging")
 
     def test_11_deployment_id_mismatch_fails_before_mutation(self):
-        self._resolve_live_inputs_fails_zero_calls(deployment_id="gg-mssql-repltest-01")
+        self._resolve_live_inputs_fails_zero_calls(deployment_id="gg-mssql-sample-01")
 
     def test_12_wrong_release_name_fails(self):
         self._resolve_live_inputs_fails_zero_calls(release_name="totally-unrelated-release")
@@ -3144,7 +3157,7 @@ class CrossRuntimeRemovalStateTests(unittest.TestCase):
         self._removal_preflight_fails_zero_calls(environment="staging")
 
     def test_24_deployment_id_mismatch_fails(self):
-        self._removal_preflight_fails_zero_calls(deployment_id="gg-mssql-repltest-01")
+        self._removal_preflight_fails_zero_calls(deployment_id="gg-mssql-sample-01")
 
     def _remove_runtime_fails_zero_calls(self, **state_overrides):
         state = {**_removal_state_fixture(**state_overrides), "ownership_state": "OWNED", "application_found": True, "applicationset_found": False, "footprint_found": _complete_footprint()}
@@ -3823,7 +3836,7 @@ class ResolvedDescriptorBindingTests(unittest.TestCase):
         self._assert_field_mismatch_fails(admin_secret_name="dev/goldengate/other/admin")
 
     def test_16_source_runtime_with_target_admin_secret_fails_before_kubernetes_mutation(self):
-        """Mandatory regression: the real canonical descriptor for a source runtime (e.g. gg-postgresql-repltest-01) declares adminSecretName=dev/goldengate/source/admin -- a state claiming dev/goldengate/target/admin must fail before any Kubernetes mutation."""
+        """Mandatory regression: the real canonical descriptor for a source runtime (e.g. gg-postgresql-sample-01) declares adminSecretName=dev/goldengate/source/admin -- a state claiming dev/goldengate/target/admin must fail before any Kubernetes mutation."""
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             state = _resolved_state_fixture(admin_secret_name="dev/goldengate/target/admin")
@@ -4049,7 +4062,7 @@ class ValidateLocalDiagnosticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             state_path = repo_root / "state.json"
-            state = _resolved_state_fixture(deployment_id="gg-mssql-repltest-01")
+            state = _resolved_state_fixture(deployment_id="gg-mssql-sample-01")
             phase5_runtime.update_state(state_path, state, phase5_runtime.RECONCILE_ALLOWED_STATE_KEYS)
             args = argparse_namespace(environment=ENVIRONMENT, deployment_id=DEPLOYMENT_ID, state_path=state_path)
             scripted = ScriptedRun()
@@ -5267,249 +5280,10 @@ class ChartSourceTreeIntegrityTests(unittest.TestCase):
         self.assertEqual(members, expected)
 
 
-# ==== RUNTIME IDENTITY MIGRATION TESTS (u02 storage-preserving bridge) ====
-
-MIGRATION_ENVIRONMENT = "dev"
-MIGRATION_NEW_ID = "gg-oracle-repltest-002"
-MIGRATION_OLD_ID = "gg-oracle-repltest-01"  # RUNTIME_IDENTITY_MIGRATIONS[("dev", "gg-oracle-repltest-002")] -- a real bounded pair, never a synthetic one.
-MIGRATION_UNRELATED_ID = DEPLOYMENT_ID  # "gg-oracle-payments-01" -- not a key in RUNTIME_IDENTITY_MIGRATIONS.
-MIGRATION_EFS_ID = "fs-0123456789abcdef0"
-MIGRATION_OLD_PVC_NAME = f"{MIGRATION_OLD_ID}-u02"
-MIGRATION_OLD_PV_NAME = "pv-old-12345"
-MIGRATION_OLD_VOLUME_HANDLE = f"{MIGRATION_EFS_ID}::fsap-0old00000000000001"
-
-
-def _migration_descriptor(efs_mode="managed"):
-    return {"deploymentId": MIGRATION_NEW_ID, "efsMode": efs_mode}
-
-
-def _migration_pvc_proc(volume_name=MIGRATION_OLD_PV_NAME, phase="Bound"):
-    return FakeProc(0, json.dumps({"status": {"phase": phase}, "spec": {"volumeName": volume_name}}))
-
-
-def _migration_pv_proc(volume_handle=MIGRATION_OLD_VOLUME_HANDLE, driver="efs.csi.aws.com"):
-    return FakeProc(0, json.dumps({"spec": {"csi": {"driver": driver, "volumeHandle": volume_handle}}}))
-
-
-def _migration_state_fixture(**overrides):
-    """A complete, canonical, schema-valid migration-state JSON document for the ONE real bridged pair above -- everything _validate_migration_state_identity requires, plus the full storage-identity capture cmd_migration_preflight itself persists on a successful bridge run."""
-    base = {
-        "environment": MIGRATION_ENVIRONMENT, "new_deployment_id": MIGRATION_NEW_ID, "old_deployment_id": MIGRATION_OLD_ID,
-        "bridge_required": True,
-        "old_ownership_state": "OWNED", "old_application_found": True, "old_applicationset_found": True,
-        "old_footprint_found": _complete_footprint(),
-        "old_pvc_name": MIGRATION_OLD_PVC_NAME, "old_pv_name": MIGRATION_OLD_PV_NAME, "old_volume_handle": MIGRATION_OLD_VOLUME_HANDLE,
-        "expected_efs_file_system_id": MIGRATION_EFS_ID,
-    }
-    base.update(overrides)
-    return base
-
-
-class MigrationTempStateCase(TempStateCase):
-    """Like TempStateCase, but also gives cmd_migration_preflight a controllable "runtime-state" file to read resolved_efs_id from -- default_state_path() derives that path from RUNNER_TEMP, which _migration_env_patch() below points at this test's own tmpdir instead of a real host path."""
-
-    def setUp(self):
-        super().setUp()
-        self.args = argparse_namespace(environment=MIGRATION_ENVIRONMENT, deployment_id=MIGRATION_NEW_ID, state_path=self.state_path)
-        self.reconcile_state_path = Path(self._tmpdir.name) / "goldengate-phase5-runtime-state.json"
-
-    def _migration_env_patch(self, **overrides):
-        overrides.setdefault("RUNNER_TEMP", self._tmpdir.name)
-        return _env_patch(**overrides)
-
-    def _write_reconcile_state(self, resolved_efs_id=MIGRATION_EFS_ID):
-        phase5_runtime.save_state(self.reconcile_state_path, {"resolved_efs_id": resolved_efs_id})
-
-
-class RuntimeIdentityMigrationBoundedMapTests(unittest.TestCase):
-    """RUNTIME_IDENTITY_MIGRATIONS itself: exactly the four historical pipeline-aware-hierarchy renames, never a general arbitrary-rename mechanism."""
-
-    def test_exactly_four_bounded_pairs(self):
-        self.assertEqual(len(phase5_runtime.RUNTIME_IDENTITY_MIGRATIONS), 4)
-
-    def test_exact_pairs_match_the_pipeline_aware_hierarchy_migration(self):
-        self.assertEqual(phase5_runtime.RUNTIME_IDENTITY_MIGRATIONS, {
-            ("dev", "gg-postgresql-repltest-001"): "gg-postgresql-repltest-01",
-            ("dev", "gg-mssql-repltest-001"): "gg-mssql-repltest-01",
-            ("dev", "gg-oracle-repltest-002"): "gg-oracle-repltest-01",
-            ("dev", "gg-postgresql-repltest-002"): "gg-postgresql-repltest-02",
-        })
-
-    def test_no_replication_or_process_key_anywhere_in_the_bounded_map_or_its_state_schema(self):
-        blob = json.dumps(list(phase5_runtime.RUNTIME_IDENTITY_MIGRATIONS.items())) + json.dumps(sorted(phase5_runtime.MIGRATION_ALLOWED_STATE_KEYS))
-        for banned in ("replicat", "extract", "trail", "distpath", "distribution_path", "process"):
-            self.assertNotIn(banned, blob.lower())
-
-    def test_migration_commands_registered_for_environment_wide_dispatch(self):
-        """A manual environment-wide workflow_dispatch Deploy (deployment_id="") still iterates the matrix and invokes these three subcommands per deployment_id exactly like every other Phase 5B step -- discoverability comes from which deployment_id is CURRENTLY being processed, never from a Git diff."""
-        for name in ("migration-preflight", "migration-remove-old", "migration-verify-old-absent"):
-            self.assertIn(name, phase5_runtime._SUBCOMMANDS)
-            self.assertIn(name, phase5_runtime._DEPLOYMENT_ID_SUBCOMMANDS)
-
-    def test_migration_commands_use_a_dedicated_state_file_never_removal_or_runtime_state(self):
-        for name in ("migration-preflight", "migration-remove-old", "migration-verify-old-absent"):
-            path = phase5_runtime.state_path_for(name, None, None)
-            self.assertEqual(path.name, "goldengate-phase5-migration-state.json")
-
-
-class MigrationPreflightTests(MigrationTempStateCase):
-    def _run(self, new_deployment_id=MIGRATION_NEW_ID):
-        self.args = argparse_namespace(environment=MIGRATION_ENVIRONMENT, deployment_id=new_deployment_id, state_path=self.state_path)
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-        return scripted
-
-    def test_unrelated_deployment_id_is_noop_zero_calls(self):
-        self.args = argparse_namespace(environment=MIGRATION_ENVIRONMENT, deployment_id=MIGRATION_UNRELATED_ID, state_path=self.state_path)
-        scripted = ScriptedRun()
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-        self.assertEqual(scripted.calls, [], "no AWS/kubectl/classifier call at all for a deployment_id outside the bounded map")
-        state = phase5_runtime.load_state(self.state_path)
-        self.assertIs(state["bridge_required"], False)
-        self.assertEqual(state["old_deployment_id"], "")
-
-    def test_matching_id_in_a_different_environment_is_also_noop(self):
-        """The bounded map keys on (environment, new_deployment_id) together -- the same literal ID string under an unrelated environment must never accidentally match."""
-        self.args = argparse_namespace(environment="prod", deployment_id=MIGRATION_NEW_ID, state_path=self.state_path)
-        scripted = ScriptedRun()
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-        self.assertEqual(scripted.calls, [])
-        self.assertIs(phase5_runtime.load_state(self.state_path)["bridge_required"], False)
-
-    def _scripted_bounded_pair(self, old_state="OWNED", old_application_found=True, old_applicationset_found=True,
-                                efs_mode="managed", pvc_proc=None, pv_proc=None):
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)),
-                      FakeProc(0, json.dumps(_classifier_result(old_state, old_application_found, old_applicationset_found))))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_migration_descriptor(efs_mode))))
-        scripted.when(_starts_with("kubectl", "get", "persistentvolumeclaim", MIGRATION_OLD_PVC_NAME), pvc_proc or _migration_pvc_proc())
-        scripted.when(_starts_with("kubectl", "get", "persistentvolume", MIGRATION_OLD_PV_NAME), pv_proc or _migration_pv_proc())
-        return scripted
-
-    def _run_bounded_pair(self, **kwargs):
-        self._write_reconcile_state()
-        scripted = self._scripted_bounded_pair(**kwargs)
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-        return scripted
-
-    def test_broken_old_identity_fails_closed_before_any_state_write(self):
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps(_classifier_result("BROKEN", True))))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-        self.assertEqual(phase5_runtime.load_state(self.state_path), {}, "a BROKEN OLD identity must never persist any migration state, bridge_required included")
-
-    def test_classifier_inspection_failure_fails_closed(self):
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(1, "", "inspection error"))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-
-    def test_retained_pvc_expected_flag_is_passed_classifying_the_old_identity(self):
-        scripted = self._run_bounded_pair()
-        classifier_call = next(c["argv"] for c in scripted.calls if str(phase5_runtime.RUNTIME_STATE_TOOL) in c["argv"])
-        self.assertIn("--retained-pvc-expected", classifier_call)
-        self.assertIn(MIGRATION_OLD_ID, classifier_call)
-
-    def test_missing_old_pvc_fails_closed(self):
-        self._write_reconcile_state()
-        scripted = self._scripted_bounded_pair(pvc_proc=FakeProc(1, "", "persistentvolumeclaims \"x\" not found (NotFound)"))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-
-    def test_old_pvc_not_bound_fails_closed(self):
-        self._write_reconcile_state()
-        scripted = self._scripted_bounded_pair(pvc_proc=_migration_pvc_proc(phase="Pending"))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-
-    def test_old_pvc_bound_to_no_volume_fails_closed(self):
-        self._write_reconcile_state()
-        scripted = self._scripted_bounded_pair(pvc_proc=_migration_pvc_proc(volume_name=""))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-
-    def test_missing_old_pv_fails_closed(self):
-        self._write_reconcile_state()
-        scripted = self._scripted_bounded_pair(pv_proc=FakeProc(1, "", "persistentvolumes \"x\" not found (NotFound)"))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-
-    def test_wrong_csi_driver_fails_closed(self):
-        self._write_reconcile_state()
-        scripted = self._scripted_bounded_pair(pv_proc=_migration_pv_proc(driver="kubernetes.io/aws-ebs"))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-
-    def test_volume_handle_referencing_a_different_filesystem_fails_closed(self):
-        self._write_reconcile_state()
-        scripted = self._scripted_bounded_pair(pv_proc=_migration_pv_proc(volume_handle="fs-000000000000000ff::fsap-0old00000000000001"))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-
-    def test_successful_bridge_persists_exact_identity_never_a_secret(self):
-        self._run_bounded_pair()
-        state = phase5_runtime.load_state(self.state_path)
-        self.assertLessEqual(set(state), phase5_runtime.MIGRATION_ALLOWED_STATE_KEYS)
-        self.assertEqual(state["environment"], MIGRATION_ENVIRONMENT)
-        self.assertEqual(state["new_deployment_id"], MIGRATION_NEW_ID)
-        self.assertEqual(state["old_deployment_id"], MIGRATION_OLD_ID)
-        self.assertIs(state["bridge_required"], True)
-        self.assertEqual(state["old_pvc_name"], MIGRATION_OLD_PVC_NAME)
-        self.assertEqual(state["old_pv_name"], MIGRATION_OLD_PV_NAME)
-        self.assertEqual(state["old_volume_handle"], MIGRATION_OLD_VOLUME_HANDLE)
-        self.assertEqual(state["expected_efs_file_system_id"], MIGRATION_EFS_ID)
-
-    def test_old_absent_and_new_descriptor_has_no_efs_mode_skips_storage_checks_and_bridge_required_false(self):
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps(_classifier_result("ABSENT", False, False))))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_migration_descriptor(efs_mode=None))))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-        pvc_calls = [c for c in scripted.calls if "persistentvolumeclaim" in c["argv"]]
-        self.assertEqual(pvc_calls, [], "no efsMode on the NEW descriptor -> never inspects any PVC/PV")
-        state = phase5_runtime.load_state(self.state_path)
-        self.assertIs(state["bridge_required"], False)
-        self.assertEqual(state["old_pvc_name"], "")
-
-    def test_storage_identity_is_still_verified_even_when_old_compute_already_gone(self):
-        """Self-terminating idempotence: a prior run already removed OLD compute, so bridge_required becomes False here, but the retained storage identity is still proven read-only whenever the NEW descriptor declares EFS -- a later run is a read-only no-op, never a skip of the storage proof itself."""
-        scripted = self._run_bounded_pair(old_application_found=False, old_applicationset_found=False, old_state="ABSENT")
-        pvc_calls = [c for c in scripted.calls if "persistentvolumeclaim" in c["argv"]]
-        self.assertEqual(len(pvc_calls), 1)
-        state = phase5_runtime.load_state(self.state_path)
-        self.assertIs(state["bridge_required"], False)
-        self.assertEqual(state["old_pv_name"], MIGRATION_OLD_PV_NAME)
-
-    def test_reads_resolved_efs_id_from_the_prior_resolve_live_inputs_step_never_a_second_aws_call(self):
-        scripted = self._run_bounded_pair()
-        self.assertFalse(any("aws efs" in " ".join(str(a) for a in c["argv"]).lower() for c in scripted.calls))
-        self.assertFalse(any(c["argv"][:2] == ["aws", "efs"] for c in scripted.calls))
-
-
-# ==== LIVE-PROVEN ARGO APPLICATION DELETION TIMEOUT FIX ====
-
 class ArgoApplicationDeleteAndAwaitAbsenceTests(unittest.TestCase):
-    """A real VDR environment-wide Deploy proved `kubectl delete application ... --wait=true --timeout=10m` treats a legitimate asynchronous Argo Application cascade deletion that merely takes slightly longer than 10 minutes as an immediate fatal mutation failure, even though deletion was still progressing and completed successfully moments later (confirmed live for the gg-mssql-repltest-01 -> gg-mssql-repltest-001 migration: the OLD Application/StatefulSet/compute fully disappeared, and a retry then completed the migration correctly with the retained PVC/PV/EFS access point unchanged). Focused, direct coverage of _delete_argo_application_and_await_absence() -- the ONE shared helper both cmd_migration_remove_old() and cmd_remove_runtime() now use instead of each keeping its own copy of the old brittle pattern. All time-bounded scenarios mock time.sleep -- no test actually waits."""
+    """_delete_argo_application_and_await_absence(): non-blocking delete, then a bounded poll until the Application is positively absent. time.sleep is mocked."""
 
-    APP_NAME = "goldengate-dev-mssql-repltest-01"
+    APP_NAME = "goldengate-dev-mssql-repltest-001"
     NAMESPACE = "argocd"
 
     def _run_helper(self, scripted):
@@ -5563,7 +5337,7 @@ class ArgoApplicationDeleteAndAwaitAbsenceTests(unittest.TestCase):
         for c in sleep_mock.call_args_list:
             self.assertEqual(c.args[0], 15)
 
-    # 6: deletion takes LONGER than the OLD 10-minute boundary but completes inside the NEW bounded poll window -> succeeds. This is the general case; the exact live incident shape is its own dedicated named regression test in MigrationRemoveOldTests below.
+    # 6: deletion takes longer than ten minutes but completes inside the bounded poll window -> succeeds.
     def test_deletion_longer_than_old_ten_minute_boundary_but_within_new_bound_succeeds(self):
         still_exists_polls = 44  # 44 * 15s = 660s (~11 minutes) -- would have failed the OLD --timeout=10m contract outright.
         calls = {"n": 0}
@@ -5658,265 +5432,6 @@ class ArgoApplicationDeleteAndAwaitAbsenceTests(unittest.TestCase):
         self._run_helper(scripted)
         flat = [str(a) for c in scripted.calls for a in c["argv"]]
         self.assertFalse(any("--force" in a or "grace-period" in a for a in flat))
-
-
-class MigrationRemoveOldTests(MigrationTempStateCase):
-    def _set_state(self, **overrides):
-        phase5_runtime.update_state(self.state_path, _migration_state_fixture(**overrides), phase5_runtime.MIGRATION_ALLOWED_STATE_KEYS)
-
-    def test_noop_when_bridge_not_required_zero_calls(self):
-        self._set_state(bridge_required=False, old_application_found=False, old_applicationset_found=False)
-        scripted = ScriptedRun()
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
-        self.assertEqual(scripted.calls, [])
-
-    def test_rejects_state_for_a_different_new_deployment_id(self):
-        self._set_state()
-        self.args = argparse_namespace(environment=MIGRATION_ENVIRONMENT, deployment_id="gg-postgresql-repltest-002", state_path=self.state_path)
-        with self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
-
-    def test_rejects_state_with_a_tampered_old_deployment_id(self):
-        self._set_state(old_deployment_id="gg-some-foreign-id")
-        with self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
-
-    def test_rejects_non_boolean_bridge_required(self):
-        self._set_state(bridge_required="true")
-        with self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
-
-    def _mutating_call_argvs(self, **state_overrides):
-        self._set_state(**state_overrides)
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-        _register_default_argo_app_scripted_responses(scripted, phase5_runtime._canonical_argocd_app_name(MIGRATION_ENVIRONMENT, MIGRATION_OLD_ID))
-        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep"), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
-        return [c["argv"] for c in scripted.calls]
-
-    def test_applicationset_deleted_before_application_is_ever_touched(self):
-        argvs = self._mutating_call_argvs()
-        kinds = [argv[1:3] for argv in argvs if argv[0] == "kubectl"]
-        appset_index = kinds.index(["delete", "applicationset"])
-        application_indices = [i for i, k in enumerate(kinds) if k[1] == "application"]
-        self.assertTrue(all(appset_index < i for i in application_indices), f"applicationset delete must precede every application call: {kinds}")
-
-    def test_targets_the_old_identitys_own_canonical_names_never_the_new_ones(self):
-        argvs = self._mutating_call_argvs()
-        flat = [str(a) for argv in argvs for a in argv]
-        self.assertIn(phase5_runtime._canonical_appset_name(MIGRATION_ENVIRONMENT, MIGRATION_OLD_ID), flat)
-        self.assertIn(phase5_runtime._canonical_argocd_app_name(MIGRATION_ENVIRONMENT, MIGRATION_OLD_ID), flat)
-        self.assertNotIn(phase5_runtime._canonical_appset_name(MIGRATION_ENVIRONMENT, MIGRATION_NEW_ID), flat)
-        self.assertNotIn(phase5_runtime._canonical_argocd_app_name(MIGRATION_ENVIRONMENT, MIGRATION_NEW_ID), flat)
-
-    def test_never_touches_pvc_or_pv(self):
-        argvs = self._mutating_call_argvs()
-        self.assertFalse(any("persistentvolumeclaim" in argv or "persistentvolume" in argv or "pvc" in argv for argv in argvs))
-
-    def test_never_deletes_the_shared_runtime_namespace(self):
-        argvs = self._mutating_call_argvs()
-        self.assertFalse(any("namespace" in argv for argv in argvs))
-
-    def test_appset_absent_removes_only_the_application(self):
-        argvs = self._mutating_call_argvs(old_applicationset_found=False)
-        kinds = [argv[1:3] for argv in argvs if argv[0] == "kubectl"]
-        self.assertNotIn(["delete", "applicationset"], kinds)
-        self.assertIn(["patch", "application"], kinds)
-        self.assertIn(["delete", "application"], kinds)
-
-    def test_application_absent_removes_only_the_applicationset(self):
-        argvs = self._mutating_call_argvs(old_application_found=False)
-        kinds = [argv[1:3] for argv in argvs if argv[0] == "kubectl"]
-        self.assertIn(["delete", "applicationset"], kinds)
-        self.assertNotIn(["patch", "application"], kinds)
-        self.assertNotIn(["delete", "application"], kinds)
-
-    def test_applicationset_delete_failure_fails_before_touching_the_application(self):
-        self._set_state()
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(1, "", "Forbidden"))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
-        self.assertFalse(any(c["argv"][:2] == ["kubectl", "patch"] or c["argv"][:2] == ["kubectl", "delete"] and c["argv"][2] == "application" for c in scripted.calls))
-
-    def test_application_delete_notfound_is_tolerated_idempotent(self):
-        # 4: delete returns explicit NotFound because the Application was already removed -> succeeds, immediately, with no polling needed at all.
-        self._set_state()
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(1, "", "applications.argoproj.io \"x\" not found (NotFound)"))
-        scripted.when(_starts_with("kubectl", "get", "application"), _argo_app_notfound_proc())
-        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep") as sleep_mock, self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
-        sleep_mock.assert_not_called()
-
-    # 15: cmd_migration_remove_old uses the SAME shared _delete_argo_application_and_await_absence() helper -- proven behaviorally (the --wait=false shape it always constructs), never merely "a delete call happened somehow".
-    def test_uses_the_shared_delete_and_await_absence_helper(self):
-        with mock.patch.object(phase5_runtime, "_delete_argo_application_and_await_absence") as helper_mock:
-            self._set_state()
-            scripted = ScriptedRun()
-            scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-            scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
-            scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-            with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-                _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
-        helper_mock.assert_called_once_with(
-            phase5_runtime._canonical_argocd_app_name(MIGRATION_ENVIRONMENT, MIGRATION_OLD_ID),
-            "argocd",
-        )
-        # The helper itself (mocked away here) is what would have issued the actual delete/poll kubectl calls -- confirms cmd_migration_remove_old() never independently constructs its own duplicate `kubectl delete application` call alongside it.
-        self.assertFalse(any(c["argv"][:3] == ["kubectl", "delete", "application"] for c in scripted.calls))
-
-    def test_live_evidence_regression_mssql_migration_application_deletion_exceeds_old_ten_minute_boundary_but_succeeds(self):
-        """Named regression test for the exact real VDR incident that motivated this fix: a live environment-wide Deploy exercising the gg-mssql-repltest-01 -> gg-mssql-repltest-001 migration correctly deleted the OLD ApplicationSet first, then the OLD Application deletion (under the OLD `--wait=true --timeout=10m` contract) failed with "timed out waiting for the condition" even though the Application/StatefulSet/all OLD compute finished deleting normally moments later, and a retry then completed the migration correctly with the retained PVC (gg-mssql-repltest-01-u02)/PV (pvc-2ddd0407-f776-4870-aa50-674dfc55faee)/EFS access point (fsap-0a804c4697816195b) unchanged. This test makes it impossible for a future change to restore that brittle behavior: OLD AppSet deletion succeeds, the Application delete request is accepted, the Application GET reports it still exists for a simulated >600 seconds (comfortably past the OLD 10-minute/600-second boundary), then reports NotFound comfortably before the NEW ~20-minute bound -- cmd_migration_remove_old must succeed."""
-        self._set_state()
-        still_exists_polls = 41  # 41 * 15s = 615s -- exceeds the OLD 600s (--timeout=10m) boundary that failed live, well inside the NEW 1200s bound.
-        poll_calls = {"n": 0}
-
-        def _application_get_response(argv):
-            poll_calls["n"] += 1
-            return _argo_app_exists_proc() if poll_calls["n"] <= still_exists_polls else _argo_app_notfound_proc(phase5_runtime._canonical_argocd_app_name(MIGRATION_ENVIRONMENT, MIGRATION_OLD_ID))
-
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "application"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "get", "application"), _application_get_response)
-
-        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep") as sleep_mock, self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)  # must NOT raise
-
-        self.assertEqual(poll_calls["n"], still_exists_polls + 1)
-        self.assertEqual(sleep_mock.call_count, still_exists_polls)
-        appset_delete_calls = [c for c in scripted.calls if c["argv"][:3] == ["kubectl", "delete", "applicationset"]]
-        self.assertEqual(len(appset_delete_calls), 1, "the OLD ApplicationSet must still be deleted first, exactly as in the real incident")
-
-
-class MigrationVerifyOldAbsentTests(MigrationTempStateCase):
-    def _set_state(self, **overrides):
-        phase5_runtime.update_state(self.state_path, _migration_state_fixture(**overrides), phase5_runtime.MIGRATION_ALLOWED_STATE_KEYS)
-
-    def test_noop_when_bridge_not_required_zero_calls(self):
-        self._set_state(bridge_required=False, old_application_found=False, old_applicationset_found=False)
-        scripted = ScriptedRun()
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_verify_old_absent, self.args)
-        self.assertEqual(scripted.calls, [])
-
-    def _run(self, classifier_result=None, pvc_proc=None, pv_proc=None):
-        self._set_state()
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)),
-                      FakeProc(0, json.dumps(classifier_result if classifier_result is not None else _classifier_result("OWNED", False, False, pvc=True))))
-        scripted.when(_starts_with("kubectl", "get", "persistentvolumeclaim", MIGRATION_OLD_PVC_NAME), pvc_proc or _migration_pvc_proc())
-        scripted.when(_starts_with("kubectl", "get", "persistentvolume", MIGRATION_OLD_PV_NAME), pv_proc or _migration_pv_proc())
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_verify_old_absent, self.args)
-        return scripted
-
-    def test_success_when_old_compute_absent_and_storage_identity_unchanged(self):
-        self._run()  # must not raise
-
-    def test_fails_when_old_applicationset_still_present(self):
-        with self.assertRaises(phase5_runtime.Phase5Error):
-            self._run(classifier_result=_classifier_result("OWNED", False, True, pvc=True))
-
-    def test_fails_when_old_application_still_present(self):
-        with self.assertRaises(phase5_runtime.Phase5Error):
-            self._run(classifier_result=_classifier_result("OWNED", True, False, pvc=True))
-
-    def test_fails_when_classifier_reports_broken(self):
-        with self.assertRaises(phase5_runtime.Phase5Error):
-            self._run(classifier_result=_classifier_result("BROKEN", False, False, pvc=True))
-
-    def test_fails_when_retained_pvc_now_bound_to_a_different_pv(self):
-        with self.assertRaises(phase5_runtime.Phase5Error):
-            self._run(pvc_proc=_migration_pvc_proc(volume_name="pv-some-other-volume"))
-
-    def test_fails_when_pv_volume_handle_changed_since_preflight(self):
-        with self.assertRaises(phase5_runtime.Phase5Error):
-            self._run(pv_proc=_migration_pv_proc(volume_handle="fs-0123456789abcdef0::fsap-0different000000001"))
-
-    def test_fails_when_retained_pvc_no_longer_exists(self):
-        with self.assertRaises(phase5_runtime.Phase5Error):
-            self._run(pvc_proc=FakeProc(1, "", "persistentvolumeclaims \"x\" not found (NotFound)"))
-
-    def test_fails_when_retained_pv_no_longer_exists(self):
-        with self.assertRaises(phase5_runtime.Phase5Error):
-            self._run(pv_proc=FakeProc(1, "", "persistentvolumes \"x\" not found (NotFound)"))
-
-    def test_skips_storage_reverification_when_no_expected_filesystem_id_was_captured(self):
-        self._set_state(expected_efs_file_system_id="")
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps(_classifier_result("OWNED", False, False, pvc=True))))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_verify_old_absent, self.args)
-        self.assertFalse(any("persistentvolumeclaim" in c["argv"] or "persistentvolume" in c["argv"] for c in scripted.calls))
-
-
-class MigrationNeverConcurrentComputeTests(MigrationTempStateCase):
-    """End-to-end proof, across all three subcommands in their real workflow order, that OLD and NEW runtime compute can never operate concurrently against the same /u02: OLD compute is torn down and POSITIVELY confirmed absent using the same storage identity captured at preflight before this bridge is ever considered complete -- reconcile-runtime for the NEW identity only ever runs after this whole sequence succeeds (see .github/workflows/50-phase-goldengate-runtimes.yaml step ordering), and any failure at any stage raises before that can happen."""
-
-    def test_full_bridge_sequence_preflight_then_remove_then_verify_succeeds_with_expected_call_shape(self):
-        self._write_reconcile_state()
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps(_classifier_result("OWNED", True, True))))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.DEPLOYMENT_MODEL_TOOL)), FakeProc(0, json.dumps(_migration_descriptor())))
-        scripted.when(_starts_with("kubectl", "get", "persistentvolumeclaim", MIGRATION_OLD_PVC_NAME), _migration_pvc_proc())
-        scripted.when(_starts_with("kubectl", "get", "persistentvolume", MIGRATION_OLD_PV_NAME), _migration_pv_proc())
-        scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "patch", "application"), FakeProc(0, ""))
-        _register_default_argo_app_scripted_responses(scripted, phase5_runtime._canonical_argocd_app_name(MIGRATION_ENVIRONMENT, MIGRATION_OLD_ID))
-
-        with mock.patch.object(phase5_runtime, "run", scripted), mock.patch.object(phase5_runtime.time, "sleep"), self._migration_env_patch():
-            _run_quiet(phase5_runtime.cmd_migration_preflight, self.args)
-            preflight_state = phase5_runtime.load_state(self.state_path)
-            self.assertIs(preflight_state["bridge_required"], True)
-
-            # After preflight, re-script the classifier to reflect OLD compute now being gone (removal happens between these two calls in the real workflow).
-            scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps(_classifier_result("OWNED", True, True))))
-            _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
-
-            scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps(_classifier_result("OWNED", False, False, pvc=True))))
-            _run_quiet(phase5_runtime.cmd_migration_verify_old_absent, self.args)
-
-        mutating_kinds = [(c["argv"][1], c["argv"][2]) for c in scripted.calls if c["argv"][0] == "kubectl" and c["argv"][1] in ("delete", "patch")]
-        self.assertEqual(mutating_kinds, [("delete", "applicationset"), ("patch", "application"), ("delete", "application")])
-        self.assertFalse(any("persistentvolumeclaim" in k or "persistentvolume" in k for pair in mutating_kinds for k in pair))
-
-    def test_new_reconciliation_is_never_reached_when_migration_remove_old_fails(self):
-        phase5_runtime.update_state(self.state_path, _migration_state_fixture(), phase5_runtime.MIGRATION_ALLOWED_STATE_KEYS)
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with("kubectl", "delete", "applicationset"), FakeProc(1, "", "Forbidden"))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_remove_old, self.args)
-        # Real workflow ordering: reconcile-runtime is a separate, LATER step gated on this one succeeding -- a raised Phase5Error here stops the job before that step ever runs.
-
-    def test_new_reconciliation_is_never_reached_when_migration_verify_old_absent_fails(self):
-        phase5_runtime.update_state(self.state_path, _migration_state_fixture(), phase5_runtime.MIGRATION_ALLOWED_STATE_KEYS)
-        scripted = ScriptedRun()
-        scripted.when(_starts_with("aws", "eks", "update-kubeconfig"), FakeProc(0, ""))
-        scripted.when(_starts_with(sys.executable, str(phase5_runtime.RUNTIME_STATE_TOOL)), FakeProc(0, json.dumps(_classifier_result("OWNED", False, True, pvc=True))))
-        with mock.patch.object(phase5_runtime, "run", scripted), self._migration_env_patch():
-            with self.assertRaises(phase5_runtime.Phase5Error):
-                _run_quiet(phase5_runtime.cmd_migration_verify_old_absent, self.args)
 
 
 if __name__ == "__main__":

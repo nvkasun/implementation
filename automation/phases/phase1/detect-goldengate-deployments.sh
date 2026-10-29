@@ -467,14 +467,6 @@ if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000
   BEFORE_SHA="$EMPTY_TREE_SHA"
 fi
 
-# Pipeline-Aware Descriptor Hierarchy Migration (CRITICAL, explicitly modeled -- never relies on Git rename detection alone): these exactly four intentional deployment-ID renames are the one-time source-tree identity migration this task performs. If Git's own similarity heuristic detects a rename (R<score>) with a high enough score, the old path is skipped entirely below (its OLD deployment ID never enters deletion-candidate evaluation as a rename source) and the NEW path is picked up as a completely normal ACTIVE candidate through the exact same path every future onboarded runtime uses. If Git instead reports the old path as a plain deletion (D) -- e.g. because the content similarity ended up below Git's detection threshold -- the OLD deployment ID is explicitly recognized as "migrated, not physically removed" here (provided its mapped NEW deployment ID is genuinely present as an active candidate in this SAME push) and is excluded from the deletion matrix outright, rather than being routed through physical-removal (which the existing managed-EFS guard would refuse anyway for efs_mode=managed, but that is a safe FAILURE, not the successful migration this task requires). This map is intentionally bounded to exactly these four known (old -> new) pairs -- it is never consulted for any other deployment ID, and no future rename may be added to it; it exists solely to bridge this one historical migration.
-declare -A KNOWN_DEPLOYMENT_ID_MIGRATIONS=(
-  ["gg-postgresql-repltest-01"]="gg-postgresql-repltest-001"
-  ["gg-mssql-repltest-01"]="gg-mssql-repltest-001"
-  ["gg-oracle-repltest-01"]="gg-oracle-repltest-002"
-  ["gg-postgresql-repltest-02"]="gg-postgresql-repltest-002"
-)
-
 CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- 'envs/dev/**' 'helm/goldengate/**' || true)"
 
 echo "Changed files under envs/dev/ and helm/goldengate/:"
@@ -588,13 +580,6 @@ CHANGED_VALUES_IDS="$(echo "$CHANGED_FILES" \
 DELETION_CANDIDATE_IDS="$(printf '%s\n%s\n' "$REMOVED_PATH_IDS" "$CHANGED_VALUES_IDS" | sed '/^$/d' | sort -u || true)"
 
 for CANDIDATE_ID in $DELETION_CANDIDATE_IDS; do
-  # Pipeline-Aware Descriptor Hierarchy Migration (CRITICAL): a candidate whose OLD deployment ID is a known intentional migration source, and whose mapped NEW deployment ID genuinely entered the build/update matrix as an active candidate in this SAME push, is a migration -- never physical removal, and never even deployment-disabled. It is excluded from deletion evaluation entirely here (before ever resolving a values file for it, working-tree or historical), relying solely on this explicit, bounded, four-pair map -- never on Git's own rename-similarity heuristic, which this push's content edits (deployment.pipeline, deployment ID correlation) could plausibly push below the default detection threshold.
-  MIGRATED_TO="${KNOWN_DEPLOYMENT_ID_MIGRATIONS[$CANDIDATE_ID]:-}"
-  if [ -n "$MIGRATED_TO" ] && echo "$DEPLOYMENT_CANDIDATE_IDS" | grep -qxF "$MIGRATED_TO"; then
-    echo "Migrated (not a deletion): ${CANDIDATE_ID} -> ${MIGRATED_TO} is present as an active build/update candidate in this same push -- explicit intentional-migration mapping, never physical removal."
-    continue
-  fi
-
   # Classify from the working tree if the file still exists there under its OWN (possibly different) current pipeline folder, otherwise from its content at BEFORE_SHA; fails closed either way, never defaults to a model.
   if VALUES_FILE="$(resolve_current_values_file "dev" "$CANDIDATE_ID")"; then
     GG_SOURCE="working tree"
@@ -702,7 +687,7 @@ echo "Checking changed-and-still-present descriptors for unsafe storage-identity
 TRANSITION_VIOLATIONS="[]"
 
 for CHANGED_ID in $CHANGED_VALUES_IDS; do
-  # Only a still-present descriptor can undergo a "transition" -- a removed/emptied file is a deletion, already handled by the deletion matrix, not a storage-identity mutation of a still-existing runtime. A renamed-away descriptor (this task's own four migrations included) resolves to no CURRENT path under its OLD ID at all -- correctly skipped here, never mistaken for a transition of the SAME runtime.
+  # Only a still-present descriptor can undergo a "transition" -- a removed/emptied file is a deletion, already handled by the deletion matrix.
   if ! CHANGED_VALUES_FILE="$(resolve_current_values_file "dev" "$CHANGED_ID")" || [ ! -s "$CHANGED_VALUES_FILE" ]; then
     continue
   fi

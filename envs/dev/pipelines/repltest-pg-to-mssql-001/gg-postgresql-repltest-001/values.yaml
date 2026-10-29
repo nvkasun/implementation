@@ -1,4 +1,4 @@
-# PostgreSQL GoldenGate runtime, single-runtime deployment model; runtime identity derives from Release.Name (see helm/goldengate/templates/_helpers.tpl). SOURCE side of the logical PostgreSQL -> MSSQL pipeline repltest-pg-to-mssql-001, paired with gg-mssql-repltest-001. Platform/runtime deployment (this Helm release, its EFS storage, its Admin/TLS secrets) is fully automated by GitHub Actions/Argo CD/Helm; GoldenGate database connections, credentials, Extract, trails, Distribution Path, and process starts are NOT automated here -- they are configured MANUALLY by an operator/DBA through the GoldenGate UI after this runtime is deployed and healthy. deployment.pipeline below is logical topology metadata only (identity/monitor-grouping/UI-topology), never declarative replication desired state. Pipeline-Aware Descriptor Hierarchy: this descriptor's canonical path is envs/dev/pipelines/repltest-pg-to-mssql-001/gg-postgresql-repltest-001/values.yaml; the deployment ID was renamed from the pre-migration gg-postgresql-repltest-01 to carry the 3-digit pipeline correlation suffix -001, matching this pipeline's own suffix. Its pre-existing managed EFS filesystem's identity/state is explicitly preserved across this rename -- see automation/goldengate-deployment-model.py's LEGACY_MANAGED_EFS_CREATION_TOKENS.
+# PostgreSQL GoldenGate runtime: SOURCE side of the PostgreSQL -> MSSQL pipeline repltest-pg-to-mssql-001, paired with gg-mssql-repltest-001. Its folder name is the runtime identity (Helm release, Kubernetes resources, PVC, EFS creation token, GoldenGate registration). Database connections, credentials and replication processes are configured manually through the GoldenGate UI; deployment.pipeline is topology metadata only.
 deployment:
   enabled: true
   pipeline: repltest-pg-to-mssql-001
@@ -48,7 +48,7 @@ runtime:
     enabled: true
     mode: "0770"
 
-  # SOURCE-side service contract: Distribution Server exposed (dist), Receiver unused until this runtime is paired with the gg-mssql-repltest-01 target on the same pipeline.
+  # SOURCE-side service contract: Distribution Server exposed (dist), Receiver unused until this runtime is paired with the gg-mssql-repltest-001 target on the same pipeline.
   service:
     type: ClusterIP
     ports:
@@ -60,8 +60,7 @@ runtime:
   storage:
     u02:
       type: efs
-      # Runtime Identity Migration (u02 storage-preserving bridge): this deployment's OLD identity (gg-postgresql-repltest-01) still physically owns the durable /u02 PersistentVolumeClaim/EFS access-point directory -- a PVC cannot be renamed in place, and recreating a same-named PVC would legitimately provision a DIFFERENT EFS access-point directory (helm/goldengate/templates/runtime-pvc.yaml's own documented contract), so this retained claim intentionally keeps its OLD physical name permanently rather than being silently renamed/recreated. helm/goldengate/templates/runtime-pvc.yaml never creates a NEW PVC while existingClaim is set (this is the chart's own normal, pre-existing existingClaim contract, never a new descriptor field); automation/phases/phase5/phase5_runtime.py's RUNTIME_IDENTITY_MIGRATIONS is what tears down the OLD gg-postgresql-repltest-01 runtime COMPUTE (never this retained PVC) before this NEW identity is ever reconciled against it.
-      existingClaim: gg-postgresql-repltest-01-u02
+      existingClaim: ""
       claimName: ""
       size: 20Gi
       accessModes:
@@ -109,7 +108,7 @@ tolerations: []
 
 affinity: {}
 
-# reclaimPolicy: Retain -- GoldenGate storage holds trail/checkpoint/recovery state and must survive PVC deletion. mode: managed -- the FIRST real managed-EFS runtime: fileSystemId is intentionally absent (forbidden by the deployment model when mode=managed) since Terraform's generic module.goldengate_runtime_efs[each.key] (envs/dev/efs.tf, driven by local.goldengate_managed_efs_deployments) provisions and the workflow resolves the filesystem by its deterministic creation token, never a value committed here.
+# reclaimPolicy: Retain keeps /u02 data when the PVC is deleted. mode: managed -- Terraform (envs/dev/efs.tf) creates this runtime's EFS filesystem with creation token <environment>-<runtime>-efs and the workflow resolves its fileSystemId; it is never committed here.
 persistence:
   enabled: true
   provider: efs

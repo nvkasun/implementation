@@ -38,27 +38,6 @@ resource "terraform_data" "goldengate_managed_efs_decommission_contract" {
   }
 }
 
-# moved blocks preserve Terraform state identity across the four id renames -- for_each does NOT correlate addresses by matching creation_token, so without this Terraform would destroy/recreate the EFS. Equal creation_token is necessary but not sufficient; complementary to LEGACY_MANAGED_EFS_CREATION_TOKENS. Never remove one without the other, never add a new one for a genuinely new runtime.
-moved {
-  from = module.goldengate_runtime_efs["gg-postgresql-repltest-01"]
-  to   = module.goldengate_runtime_efs["gg-postgresql-repltest-001"]
-}
-
-moved {
-  from = module.goldengate_runtime_efs["gg-mssql-repltest-01"]
-  to   = module.goldengate_runtime_efs["gg-mssql-repltest-001"]
-}
-
-moved {
-  from = module.goldengate_runtime_efs["gg-oracle-repltest-01"]
-  to   = module.goldengate_runtime_efs["gg-oracle-repltest-002"]
-}
-
-moved {
-  from = module.goldengate_runtime_efs["gg-postgresql-repltest-02"]
-  to   = module.goldengate_runtime_efs["gg-postgresql-repltest-002"]
-}
-
 # One module instance per desired managed deployment; `name` is the deterministic creation token. v1.0.0's verified resource code: `throughput_mode = (var.throughput_mode == "enhanced" ? "elastic" : "bursting")` -- do not pass "elastic"/"provisioned" directly.
 module "goldengate_runtime_efs" {
   for_each = local.goldengate_managed_efs_desired_deployments

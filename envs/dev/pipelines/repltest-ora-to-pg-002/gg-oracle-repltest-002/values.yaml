@@ -1,4 +1,4 @@
-# Oracle GoldenGate runtime, single-runtime deployment model. SOURCE side of the logical Oracle -> PostgreSQL pipeline repltest-ora-to-pg-002, paired with gg-postgresql-repltest-002. Platform/runtime deployment is automated by GitHub Actions/Argo CD/Helm. Database connections, credentials, Extract, trails, Distribution Path, and process starts are configured MANUALLY through the GoldenGate UI. deployment.pipeline is logical topology metadata only. Pipeline-Aware Descriptor Hierarchy: this descriptor's canonical path is envs/dev/pipelines/repltest-ora-to-pg-002/gg-oracle-repltest-002/values.yaml; both the pipeline ID (repltest-ora-to-pg-001 -> repltest-ora-to-pg-002) and the deployment ID (gg-oracle-repltest-01 -> gg-oracle-repltest-002) were renamed together to carry the matching 3-digit pipeline correlation suffix -002. Its pre-existing managed EFS filesystem's identity/state is explicitly preserved across this rename -- see automation/goldengate-deployment-model.py's LEGACY_MANAGED_EFS_CREATION_TOKENS.
+# Oracle GoldenGate runtime: SOURCE side of the Oracle -> PostgreSQL pipeline repltest-ora-to-pg-002, paired with gg-postgresql-repltest-002. Its folder name is the runtime identity (Helm release, Kubernetes resources, PVC, EFS creation token, GoldenGate registration). Database connections, credentials and replication processes are configured manually through the GoldenGate UI; deployment.pipeline is topology metadata only.
 
 deployment:
   enabled: true
@@ -59,8 +59,7 @@ runtime:
   storage:
     u02:
       type: efs
-      # Runtime Identity Migration (u02 storage-preserving bridge): this deployment's OLD identity (gg-oracle-repltest-01) still physically owns the durable /u02 PersistentVolumeClaim/EFS access-point directory -- a PVC cannot be renamed in place, and recreating a same-named PVC would legitimately provision a DIFFERENT EFS access-point directory (helm/goldengate/templates/runtime-pvc.yaml's own documented contract), so this retained claim intentionally keeps its OLD physical name permanently rather than being silently renamed/recreated. helm/goldengate/templates/runtime-pvc.yaml never creates a NEW PVC while existingClaim is set (this is the chart's own normal, pre-existing existingClaim contract, never a new descriptor field); automation/phases/phase5/phase5_runtime.py's RUNTIME_IDENTITY_MIGRATIONS is what tears down the OLD gg-oracle-repltest-01 runtime COMPUTE (never this retained PVC) before this NEW identity is ever reconciled against it.
-      existingClaim: gg-oracle-repltest-01-u02
+      existingClaim: ""
       claimName: ""
       size: 20Gi
       accessModes:

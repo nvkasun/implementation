@@ -73,14 +73,6 @@ def _three_digit_suffix(value):
     return match.group(1) if match else None
 
 
-# Pipeline-Aware Descriptor Hierarchy Migration: exactly four intentional deployment-ID renames (the folder migration to envs/<environment>/pipelines/<pipeline-id>/<deployment-id>/ with 3-digit pipeline/runtime correlation suffixes) must NOT change the underlying managed EFS filesystem's immutable creation_token -- creation_token is a ForceNew argument on the real aws_efs_file_system resource (envs/dev/efs.tf, via the approved aws-tf-module-efs), so changing it would destroy and recreate the filesystem. This is a narrowly scoped, explicit, auditable mapping of (environment, NEW deployment ID) -> the EXACT creation token the existing AWS filesystem was already created with under its OLD deployment ID -- it is NOT a general runtime-identity override: any (environment, deployment_id) pair absent from this map always derives its token normally via the formula below. Never add a future entry here for a genuinely new runtime -- this exists ONLY to bridge these four specific pre-existing managed EFS filesystems across this one intentional rename. Mirrored (never imported) by automation/phases/phase1/managed_efs_inventory_guard.py's own copy (its derive_expected_creation_token(), which derives from an ACTUAL AWS filesystem's own tags) and by envs/dev/efs.tf's own goldengate_legacy_managed_efs_creation_tokens local -- a dedicated drift test proves all three agree.
-LEGACY_MANAGED_EFS_CREATION_TOKENS = {
-    ("dev", "gg-postgresql-repltest-001"): "dev-gg-postgresql-repltest-01-efs",
-    ("dev", "gg-mssql-repltest-001"): "dev-gg-mssql-repltest-01-efs",
-    ("dev", "gg-oracle-repltest-002"): "dev-gg-oracle-repltest-01-efs",
-    ("dev", "gg-postgresql-repltest-002"): "dev-gg-postgresql-repltest-02-efs",
-}
-
 _CREDENTIAL_KEY_FRAGMENTS = (
     "password", "passwd", "pwd", "secretvalue", "connectionstring", "conn_str",
     "username", "token", "apikey", "api_key", "dburl", "database_url", "databaseurl",
@@ -307,10 +299,7 @@ def _parse_csi_structure(runtime):
 
 
 def derive_efs_creation_token(environment, deployment_id):
-    """Deterministic managed-EFS identity; fails closed rather than silently truncating or hashing the deployment ID. Checks LEGACY_MANAGED_EFS_CREATION_TOKENS FIRST -- exactly four current (environment, deployment_id) pairs must keep their pre-existing AWS filesystem's immutable creation_token across this task's intentional deployment-ID rename; every other pair (including any future deployment ID) always derives the normal deterministic formula below."""
-    legacy_token = LEGACY_MANAGED_EFS_CREATION_TOKENS.get((environment, deployment_id))
-    if legacy_token is not None:
-        return legacy_token
+    """Deterministic managed-EFS identity "<environment>-<deployment_id>-efs"; fails closed rather than silently truncating or hashing the deployment ID."""
     token = f"{environment}-{deployment_id}-efs"
     if len(token) > _EFS_CREATION_TOKEN_MAX_LENGTH:
         raise DescriptorError(f"invalid persistence configuration: derived EFS creation token exceeds the {_EFS_CREATION_TOKEN_MAX_LENGTH}-character AWS limit")

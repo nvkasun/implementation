@@ -82,18 +82,11 @@ locals {
     for id, doc in local.goldengate_runtime_documents : id => try(doc.runtime.storage.u02.type, "")
   }
 
-  # Four bounded id renames must not change the EFS creation_token (ForceNew) -- mirrors LEGACY_MANAGED_EFS_CREATION_TOKENS in goldengate-deployment-model.py. Never add an entry for a genuinely new runtime.
-  goldengate_legacy_managed_efs_creation_tokens = {
-    "gg-postgresql-repltest-001" = "dev-gg-postgresql-repltest-01-efs"
-    "gg-mssql-repltest-001"      = "dev-gg-mssql-repltest-01-efs"
-    "gg-oracle-repltest-002"     = "dev-gg-oracle-repltest-01-efs"
-    "gg-postgresql-repltest-002" = "dev-gg-postgresql-repltest-02-efs"
-  }
-
   # Keyed by every folder-driven document, not just enabled ones -- this must never disappear from this map merely because a deployment is temporarily disabled. Deletion is guarded upstream by managed_efs_deletion_guard.
   goldengate_managed_efs_deployments = {
     for id, doc in local.goldengate_runtime_documents : id => {
-      creation_token = lookup(local.goldengate_legacy_managed_efs_creation_tokens, id, "${var.environment}-${id}-efs")
+      # Mirrors derive_efs_creation_token() in automation/goldengate-deployment-model.py.
+      creation_token = "${var.environment}-${id}-efs"
     }
     if local.goldengate_persistence_efs_declared[id] && local.goldengate_persistence_efs_mode_raw[id] == "managed"
   }
