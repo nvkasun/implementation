@@ -176,7 +176,7 @@ finalizers.
 Re-run the preflight. Expected: no runtime pods, no `gg-efs-dev-*` StorageClass,
 and the old PVCs and PVs still present.
 
-### 2. Remove Kubernetes storage and access points (approved)
+### 2. Remove the PVCs and PVs (approved)
 
 Confirm that no pod mounts the claim:
 `kubectl -n goldengate-dev get pods -o jsonpath='{..claimName}'`. Then, for each
@@ -185,22 +185,63 @@ PVC from step 0:
 ```bash
 kubectl -n goldengate-dev delete pvc <pvc>          # PV turns Released (Retain)
 kubectl delete pv <pv>                              # no CSI delete; access point remains
-aws efs delete-access-point --region eu-west-1 --access-point-id <fsap from the PV volumeHandle>
 ```
 
-Delete any other access point the preflight lists on these filesystems. Delete
-the process `STATE#…` rows under the runtime IDs, if the preflight reports any.
-The monitor never deletes rows, so they would surface as stale processes. Keep
-`CONFIG` and `LEASE` items: CONFIG is Terraform-owned.
+Record each access point ID from the PV `volumeHandle` (`fs-…::fsap-…`) before
+deleting the PV. Delete the process `STATE#…` rows under the runtime IDs, if the
+preflight reports any. The monitor never deletes rows, so they would surface as
+stale processes. Keep `CONFIG` and `LEASE` items: CONFIG is Terraform-owned.
 
-Re-run the preflight. Expected: zero access points on every filesystem being reset.
+### 2a. Grant the access-point delete permission (corporate IAM, once)
+
+The generated `GoldenGateEKSDeployRole-<env>` policy
+(`envs/<env>/policies/goldengate-eks-deploy-<env>/policies/policies_1.json`)
+contains the statement `AllowDeleteGoldenGateCsiEfsAccessPoints`:
+`elasticfilesystem:DeleteAccessPoint` on `access-point/*` in the workload account
+and region, only when the access point carries `efs.csi.aws.com/cluster=true`.
+This repository's Terraform applies that policy, but Terraform cannot run while
+the stale filesystems exist. The IAM owner therefore applies the committed policy
+document to the role through the corporate IAM change process. It must be
+identical to the committed file, so the later Terraform apply shows no IAM change.
+
+### 2b. Authorized access-point cleanup dispatch (approved)
+
+Dispatch `00 | MAIN | GoldenGate EKS End-to-End Deployment` with:
+
+- `environment=dev`, `action=efs-access-point-cleanup`;
+- `efs_replacement_authorized_ids=<the filesystem IDs from step 0>`;
+- `efs_access_point_cleanup_ids=<the access point IDs from step 2>`.
+
+Phase 1 then runs, with the normal role chain (build role, then the EKS deploy role):
+
+1. Re-validate the scope. The filesystems must pass the replacement authorization
+   checks, and the inventory may contain no orphan.
+2. Read Kubernetes cluster-wide. It refuses if any Argo CD Application or
+   ApplicationSet, pod, StatefulSet, StorageClass, PVC or PV still references
+   these filesystems, their access points or their runtimes.
+3. List the access points of each filesystem. It refuses if any access point is
+   not named, belongs to another filesystem or account, lacks the CSI tag, exposes
+   the filesystem root, or is in an unexpected state.
+4. Delete only the named access points. Filesystems are never deleted.
+5. Re-query until every named filesystem has zero access points (at most 30
+   checks, 10 seconds apart), then run the normal inventory verification.
+
+The run stays in Validate mode: Terraform and runtime deployment never run.
+Push, `validate`, `deploy` and standalone `10 | SUB` runs reject the cleanup input.
+A re-run after a partial failure skips access points that are already gone.
 
 ### 3. Single authorized dispatch (approved)
+
+**Prerequisite:** the Terraform owner confirms in writing that the corporate
+`aws-terraform-apply.yaml` workflow shows the plan and waits for approval before
+apply, for this repository and environment. This repository cannot verify that
+external workflow. Without that confirmation, do not dispatch; stop here.
 
 Dispatch `00 | MAIN | GoldenGate EKS End-to-End Deployment` with:
 
 - `environment=dev`, `action=deploy`, `deployment_id` left blank;
-- `efs_replacement_authorized_ids=<the filesystem IDs from step 0>`, comma-separated.
+- `efs_replacement_authorized_ids=<the filesystem IDs from step 0>`, comma-separated;
+- `efs_access_point_cleanup_ids` left empty.
 
 The run:
 
@@ -243,8 +284,12 @@ Normal push runs resume.
 
 ### Recovery
 
+- **Step 2b fails:** read the Phase 1 message. A Kubernetes reference or an
+  unknown access point stops the run before any deletion. `AccessDeniedException`
+  means step 2a is missing. After a partial deletion, dispatch step 2b again with
+  the same inputs.
 - **Step 3 Phase 1 fails:** read the guard message. Typical causes are an access
-  point that still exists (finish step 2), a mistyped ID, or a filesystem that was
+  point that still exists (repeat step 2b), a mistyped ID, or a filesystem that was
   not named. Nothing has changed yet; fix and dispatch again.
 - **Terraform fails part-way:** the replaced filesystems now carry canonical
   tokens. Dispatch again naming only the remaining stale IDs. Naming an ID that no

@@ -22,6 +22,7 @@ on:
         options:
           - validate
           - deploy
+          - efs-access-point-cleanup
 
       deployment_id:
         description: "Optional GoldenGate runtime deployment ID. Leave blank to converge the complete selected environment and all enabled GoldenGate runtimes."
@@ -49,6 +50,14 @@ on:
         description: >
           One-time, operator-approved DEV storage reset only: comma-separated EFS filesystem IDs whose stale
           creation tokens Terraform may replace in this run. Leave empty for every normal run.
+        required: false
+        type: string
+        default: ""
+
+      efs_access_point_cleanup_ids:
+        description: >
+          action=efs-access-point-cleanup only: comma-separated EFS access point IDs on the filesystems named in
+          efs_replacement_authorized_ids. Deletes only these access points, never a filesystem; no Terraform runs.
         required: false
         type: string
         default: ""
@@ -148,6 +157,8 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_ACTION: ${{ inputs.action }}
+          INPUT_EFS_REPLACEMENT_AUTHORIZED_IDS: ${{ inputs.efs_replacement_authorized_ids }}
+          INPUT_EFS_ACCESS_POINT_CLEANUP_IDS: ${{ inputs.efs_access_point_cleanup_ids }}
         run: |
           set -euo pipefail
           python3 automation/phases/phase1/phase1_readiness.py effective-deploy
@@ -165,7 +176,7 @@ jobs:
       # Deploy-mode-only from here: a recreated EKS cluster keeps the SAME name but gets a DIFFERENT OIDC issuer, and every generated IRSA trust policy in envs/<environment>/policies/** is only valid for the issuer envs/<environment>/environment.yaml declares -- this must run, and must succeed, before Terraform (which owns applying those trust policies) or any deployment can proceed. Skipped entirely for Validate mode so that purely local/offline run never requires live AWS/Kubernetes access. id-token: write assumes RUNNER_ROLE_ARN once here; output-env-credentials: false keeps the assumed build-account credentials off this job's process-wide environment -- output-credentials: true exposes them ONLY as this step's own outputs, explicitly passed via step-local env: to the two steps that genuinely need live AWS access below, never to the local detection/guard steps that share this one visible job.
       - name: Configure AWS credentials (build account)
         id: aws_build_credentials
-        if: ${{ steps.compute_effective_deploy.outputs.effective_deploy == 'true' }}
+        if: ${{ steps.compute_effective_deploy.outputs.effective_deploy == 'true' || steps.compute_effective_deploy.outputs.efs_access_point_cleanup == 'true' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
@@ -174,7 +185,7 @@ jobs:
           output-env-credentials: false
 
       - name: Verify live EKS cluster + OIDC + Kubernetes API access (read-only)
-        if: ${{ steps.compute_effective_deploy.outputs.effective_deploy == 'true' }}
+        if: ${{ steps.compute_effective_deploy.outputs.effective_deploy == 'true' || steps.compute_effective_deploy.outputs.efs_access_point_cleanup == 'true' }}
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
@@ -209,9 +220,26 @@ jobs:
           set -euo pipefail
           python3 automation/phases/phase1/phase1_readiness.py storage-transition-guard
 
+      # Authorized DEV storage reset only (action=efs-access-point-cleanup): deletes the named CSI access points of the authorized stale filesystems. The run stays in Validate mode, so Terraform never runs.
+      - name: Remove authorized EFS access points (DEV storage reset only)
+        id: efs_access_point_cleanup
+        if: ${{ steps.compute_effective_deploy.outputs.efs_access_point_cleanup == 'true' }}
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ACTION: ${{ inputs.action }}
+          INPUT_EFS_REPLACEMENT_AUTHORIZED_IDS: ${{ inputs.efs_replacement_authorized_ids }}
+          INPUT_EFS_ACCESS_POINT_CLEANUP_IDS: ${{ inputs.efs_access_point_cleanup_ids }}
+          AWS_ACCESS_KEY_ID: ${{ steps.aws_build_credentials.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_build_credentials.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws_build_credentials.outputs.aws-session-token }}
+        run: |
+          set -euo pipefail
+          python3 automation/phases/phase1/phase1_readiness.py efs-access-point-cleanup
+
       - name: Verify AWS-side managed-EFS inventory (read-only)
         id: managed_efs_inventory
-        if: ${{ steps.compute_effective_deploy.outputs.effective_deploy == 'true' }}
+        if: ${{ steps.compute_effective_deploy.outputs.effective_deploy == 'true' || steps.compute_effective_deploy.outputs.efs_access_point_cleanup == 'true' }}
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}

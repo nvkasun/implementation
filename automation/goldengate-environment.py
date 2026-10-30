@@ -547,6 +547,14 @@ def _eks_deploy_policy(v):
                 "Resource": "*",
             },
             {
+                # Authorized DEV storage reset only: CSI-provisioned access points in this account and region. Filesystems are never deletable by this role.
+                "Sid": "AllowDeleteGoldenGateCsiEfsAccessPoints",
+                "Effect": "Allow",
+                "Action": ["elasticfilesystem:DeleteAccessPoint"],
+                "Resource": f"arn:aws:elasticfilesystem:{v['AWS_REGION']}:{v['WORKLOAD_ACCOUNT_ID']}:access-point/*",
+                "Condition": {"StringEquals": {"aws:ResourceTag/efs.csi.aws.com/cluster": "true"}},
+            },
+            {
                 "Sid": "AllowReadOnlyGoldenGateSharedSecretValidation",
                 "Effect": "Allow",
                 "Action": ["secretsmanager:DescribeSecret", "secretsmanager:ListSecretVersionIds"],

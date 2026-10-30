@@ -404,6 +404,269 @@ class TestEfsReplacementAuthorization(Phase1TestCase):
                 self.assertEqual(self._guard_calls(scripted), [])
 
 
+# Four DEV runtimes: runtime -> (stale-token filesystem, CSI access point). Test data only.
+CLEANUP_DEV = {
+    "gg-postgresql-repltest-001": ("fs-0d1c409669a15bc3e", "fsap-0bd59bb3c3abcd78d"),
+    "gg-mssql-repltest-001": ("fs-03eb68ea5f6317e54", "fsap-0a804c4697816195b"),
+    "gg-oracle-repltest-002": ("fs-0abbe15be0c6fb64d", "fsap-0df58f1ff6912f3f1"),
+    "gg-postgresql-repltest-002": ("fs-08505eae446b8c918", "fsap-0db2b806b3bdb6563"),
+}
+CLEANUP_FS = ",".join(fs for fs, _ap in CLEANUP_DEV.values())
+CLEANUP_APS = ",".join(ap for _fs, ap in CLEANUP_DEV.values())
+
+
+class FakeEfsCluster:
+    """Stateful stand-in for aws efs/sts and read-only kubectl during an access-point cleanup run."""
+
+    def __init__(self, kube=None, delete_error=None, stuck=()):
+        self.access_points = {fs: [ap] for fs, ap in CLEANUP_DEV.values()}
+        self.extra = {}
+        self.kube = kube or {}
+        self.delete_error = delete_error
+        self.stuck = set(stuck)
+        self.deleted = []
+        self.scripted = (
+            ScriptedSubprocess()
+            .on(lambda argv: "managed-efs-inventory" in argv, _ok(json.dumps([{"deploymentId": rt, "efsCreationToken": f"dev-{rt}-efs"} for rt in CLEANUP_DEV])))
+            .on(lambda argv: argv[:3] == ["aws", "sts", "assume-role"], _assume_role_ok())
+            .on(lambda argv: argv[:3] == ["aws", "sts", "get-caller-identity"], _ok(WORKLOAD_ACCOUNT_ID + "\n"))
+            .on(lambda argv: argv[:3] == ["aws", "efs", "describe-file-systems"], _ok(json.dumps({"FileSystems": [self._fs(rt, fs) for rt, (fs, _ap) in CLEANUP_DEV.items()]})))
+            .on(lambda argv: argv[:3] == ["aws", "efs", "describe-access-points"], self._describe)
+            .on(lambda argv: argv[:3] == ["aws", "efs", "delete-access-point"], self._delete)
+            .on(lambda argv: argv[:2] == ["kubectl", "get"], self._kubectl)
+        )
+
+    @staticmethod
+    def _fs(rt, fs):
+        tags = {"ManagedBy": "goldengate-eks-app", "GoldenGateDeploymentId": rt, "GoldenGateEnvironment": "dev", "GoldenGateStorage": "u02", "Name": "legacy"}
+        return {"FileSystemId": fs, "CreationToken": f"dev-{rt}-legacy-efs", "LifeCycleState": "available", "Tags": [{"Key": k, "Value": v} for k, v in tags.items()]}
+
+    def _ap(self, fs, ap):
+        return {"AccessPointId": ap, "FileSystemId": fs, "OwnerId": WORKLOAD_ACCOUNT_ID, "LifeCycleState": "available",
+                "RootDirectory": {"Path": f"/old/{ap}"}, "Tags": [{"Key": "efs.csi.aws.com/cluster", "Value": "true"}]}
+
+    def _describe(self, argv, env):
+        if "--file-system-id" in argv:
+            fs = argv[argv.index("--file-system-id") + 1]
+            items = [self._ap(fs, ap) for ap in self.access_points.get(fs, [])] + self.extra.get(fs, [])
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"AccessPoints": items}), "")
+        ap = argv[argv.index("--access-point-id") + 1]
+        return subprocess.CompletedProcess(argv, 254, "", "An error occurred (AccessPointNotFound) when calling the DescribeAccessPoints operation")
+
+    def _delete(self, argv, env):
+        ap = argv[argv.index("--access-point-id") + 1]
+        if self.delete_error:
+            return subprocess.CompletedProcess(argv, 254, "", f"An error occurred ({self.delete_error}) when calling the DeleteAccessPoint operation")
+        self.deleted.append(ap)
+        if ap not in self.stuck:
+            for aps in self.access_points.values():
+                if ap in aps:
+                    aps.remove(ap)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def _kubectl(self, argv, env):
+        kind = argv[2]
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"items": self.kube.get(kind, [])}), "")
+
+
+class TestEfsAccessPointCleanup(Phase1TestCase):
+    """action=efs-access-point-cleanup: separate manual DEV-only run; deletes named CSI access points only, never a filesystem, never reaches Terraform."""
+
+    def _env(self, **overrides):
+        env = {"AWS_REGION": "eu-west-1", "EKS_DEPLOY_ROLE_ARN": EKS_DEPLOY_ROLE_ARN, "RUNTIME_NAMESPACE": "goldengate-dev", "ARGOCD_NAMESPACE": "argocd",
+               "EVENT_NAME": "workflow_dispatch", "INPUT_ACTION": "efs-access-point-cleanup",
+               "INPUT_EFS_REPLACEMENT_AUTHORIZED_IDS": CLEANUP_FS, "INPUT_EFS_ACCESS_POINT_CLEANUP_IDS": CLEANUP_APS}
+        env.update(overrides)
+        return env
+
+    def _ready_state(self):
+        p1.update_state(self.state_path, {"effective_deploy": "false", "efs_access_point_cleanup": "true", "selected_environment": "dev", "eks_preflight_completed": "true"})
+
+    def _run(self, fake, **env):
+        with mock.patch.object(p1.time, "sleep"):
+            self.run_subcommand(p1.cmd_efs_access_point_cleanup, scripted=fake.scripted, env_overrides=self._env(**env))
+
+    def _mutations(self, fake):
+        return [c for c in fake.scripted.calls if c[:2] == ["aws", "efs"] and not c[2].startswith("describe")]
+
+    def test_effective_deploy_enters_cleanup_mode_only_for_the_manual_action(self):
+        p1.update_state(self.state_path, {"selected_environment": "dev"})
+        self.run_subcommand(p1.cmd_effective_deploy, env_overrides=self._env())
+        self.assertEqual(self.read_state()["effective_deploy"], "false")
+        self.assertEqual(self.read_outputs()["efs_access_point_cleanup"], "true")
+
+    def test_cleanup_inputs_are_rejected_in_every_other_mode(self):
+        p1.update_state(self.state_path, {"selected_environment": "dev"})
+        for event, action in (("push", ""), ("workflow_dispatch", "deploy"), ("workflow_dispatch", "validate")):
+            with self.subTest(event=event, action=action), self.assertRaises(p1.Phase1Error):
+                self.run_subcommand(p1.cmd_effective_deploy, env_overrides=self._env(EVENT_NAME=event, INPUT_ACTION=action))
+
+    def test_cleanup_action_requires_scope_and_dev(self):
+        for state_env, overrides in (("dev", {"INPUT_EFS_ACCESS_POINT_CLEANUP_IDS": ""}), ("dev", {"INPUT_EFS_REPLACEMENT_AUTHORIZED_IDS": ""}),
+                                     ("dev", {"INPUT_EFS_ACCESS_POINT_CLEANUP_IDS": "fsap-bad"}), ("sit", {})):
+            p1.update_state(self.state_path, {"selected_environment": state_env})
+            with self.subTest(env=state_env, overrides=overrides), self.assertRaises(p1.Phase1Error):
+                self.run_subcommand(p1.cmd_effective_deploy, env_overrides=self._env(**overrides))
+
+    def test_other_modes_keep_the_cleanup_flag_false(self):
+        self.run_subcommand(p1.cmd_effective_deploy, env_overrides={"EVENT_NAME": "push", "INPUT_ACTION": ""})
+        self.assertEqual(self.read_outputs()["efs_access_point_cleanup"], "false")
+
+    def test_cleanup_deletes_only_the_four_access_points_and_never_a_filesystem(self):
+        self._ready_state()
+        fake = FakeEfsCluster()
+        self._run(fake)
+        self.assertEqual(sorted(fake.deleted), sorted(CLEANUP_APS.split(",")))
+        self.assertEqual({c[2] for c in self._mutations(fake)}, {"delete-access-point"})
+        self.assertEqual(self.read_state()["efs_access_point_cleanup_completed"], "true")
+
+    def test_retry_after_partial_deletion_is_idempotent(self):
+        self._ready_state()
+        fake = FakeEfsCluster()
+        first_fs, first_ap = CLEANUP_DEV["gg-postgresql-repltest-001"]
+        fake.access_points[first_fs] = []
+        self._run(fake)
+        self.assertNotIn(first_ap, fake.deleted)
+        self.assertEqual(len(fake.deleted), 3)
+        fake2 = FakeEfsCluster()
+        fake2.access_points = {fs: [] for fs in fake2.access_points}
+        self._run(fake2)
+        self.assertEqual(fake2.deleted, [])
+
+    def test_unknown_access_point_blocks_before_any_deletion(self):
+        self._ready_state()
+        fake = FakeEfsCluster()
+        fs = CLEANUP_DEV["gg-oracle-repltest-002"][0]
+        fake.access_points[fs].append("fsap-0000000000000000a")
+        with self.assertRaises(p1.Phase1Error):
+            self._run(fake)
+        self.assertEqual(self._mutations(fake), [])
+
+    def test_kubernetes_reference_blocks_before_any_aws_access_point_call(self):
+        self._ready_state()
+        fs, ap = CLEANUP_DEV["gg-mssql-repltest-001"]
+        fake = FakeEfsCluster(kube={"pv": [{"metadata": {"name": "pv-1"}, "spec": {"csi": {"driver": "efs.csi.aws.com", "volumeHandle": f"{fs}::{ap}"}}}]})
+        with self.assertRaises(p1.Phase1Error) as ctx:
+            self._run(fake)
+        self.assertIn("pv-1", str(ctx.exception))
+        self.assertFalse(any(c[:3] in (["aws", "efs", "describe-access-points"], ["aws", "efs", "delete-access-point"]) for c in fake.scripted.calls))
+
+    def test_kubectl_failure_is_never_read_as_no_references(self):
+        self._ready_state()
+        fake = FakeEfsCluster()
+        fake.scripted._handlers.insert(0, (lambda argv: argv[:3] == ["kubectl", "get", "pods"], _fail(stderr="Forbidden")))
+        with self.assertRaises(p1.Phase1Error):
+            self._run(fake)
+        self.assertEqual(self._mutations(fake), [])
+
+    def test_canonical_or_unauthorized_filesystem_scope_is_rejected(self):
+        self._ready_state()
+        for fs_raw in ("fs-0123456789abcdef0", CLEANUP_FS + ",fs-0123456789abcdef0"):
+            fake = FakeEfsCluster()
+            with self.subTest(fs=fs_raw), self.assertRaises(p1.Phase1Error):
+                self._run(fake, INPUT_EFS_REPLACEMENT_AUTHORIZED_IDS=fs_raw)
+            self.assertEqual(self._mutations(fake), [])
+
+    def test_denied_delete_stops_the_run(self):
+        self._ready_state()
+        fake = FakeEfsCluster(delete_error="AccessDeniedException")
+        with self.assertRaises(p1.Phase1Error) as ctx:
+            self._run(fake)
+        self.assertIn("AccessDeniedException", str(ctx.exception))
+        self.assertNotIn("efs_access_point_cleanup_completed", self.read_state())
+
+    def test_access_points_that_never_disappear_fail_after_bounded_polling(self):
+        self._ready_state()
+        fake = FakeEfsCluster(stuck=CLEANUP_APS.split(",")[:1])
+        with self.assertRaises(p1.Phase1Error):
+            self._run(fake)
+        polls = [c for c in fake.scripted.calls if c[:3] == ["aws", "efs", "describe-access-points"] and "--file-system-id" in c]
+        self.assertEqual(len(polls), 4 * (1 + p1.EFS_ACCESS_POINT_CLEANUP_ATTEMPTS))
+
+    def test_new_unauthorized_access_point_during_polling_fails(self):
+        self._ready_state()
+        fake = FakeEfsCluster()
+        fs = CLEANUP_DEV["gg-postgresql-repltest-002"][0]
+        original = fake._delete
+
+        def delete_then_reprovision(argv, env):
+            result = original(argv, env)
+            fake.extra[fs] = [fake._ap(fs, "fsap-0000000000000000b")]
+            return result
+        fake.scripted._handlers.insert(0, (lambda argv: argv[:3] == ["aws", "efs", "delete-access-point"], delete_then_reprovision))
+        with self.assertRaises(p1.Phase1Error):
+            self._run(fake)
+
+    def test_command_refuses_outside_cleanup_mode(self):
+        for state in ({"effective_deploy": "true", "efs_access_point_cleanup": "true"}, {"effective_deploy": "false", "efs_access_point_cleanup": "false"},
+                      {"effective_deploy": "false", "efs_access_point_cleanup": "true", "eks_preflight_completed": "false"}):
+            p1.save_state(self.state_path, {"selected_environment": "dev", "eks_preflight_completed": "true", **state})
+            fake = FakeEfsCluster()
+            with self.subTest(state=state), self.assertRaises(p1.Phase1Error):
+                self._run(fake)
+            self.assertEqual(fake.scripted.calls, [])
+
+    def test_acceptance_requires_cleanup_and_post_cleanup_inventory(self):
+        base = {"selected_environment": "dev", "effective_deploy": "false", "efs_access_point_cleanup": "true", "has_active_deployments": "true", "has_changes": "false",
+                "has_deletions": "false", "terraform_governance_override": "false", "active_runtime_matrix": "[]", "deployment_matrix": "[]", "deletion_matrix": "[]",
+                "has_storage_transition_violations": "false", "storage_transition_violations": "[]", "eks_preflight_completed": "true"}
+        p1.save_state(self.state_path, {**base, "efs_access_point_cleanup_completed": "true"})
+        with self.assertRaises(p1.Phase1Error):
+            p1.cmd_acceptance(self.args)
+        p1.save_state(self.state_path, {**base, "efs_access_point_cleanup_completed": "true", "managed_efs_inventory_completed": "true"})
+        p1.cmd_acceptance(self.args)
+        p1.save_state(self.state_path, {**base, "efs_access_point_cleanup": "false", "efs_access_point_cleanup_completed": "true"})
+        with self.assertRaises(p1.Phase1Error):
+            p1.cmd_acceptance(self.args)
+
+
+class TestEfsAccessPointCleanupWiring(unittest.TestCase):
+    """The cleanup step exists only in MAIN's Phase 1, only for the manual cleanup action, before the inventory verification; Terraform can never follow it."""
+
+    WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+
+    def _load(self, name):
+        import yaml
+        return yaml.safe_load((self.WORKFLOWS / name).read_text(encoding="utf-8"))
+
+    def test_main_dispatch_inputs(self):
+        inputs = (self._load("00-main-goldengate-orchestrator.yaml").get(True) or {})["workflow_dispatch"]["inputs"]
+        self.assertIn(p1.EFS_ACCESS_POINT_CLEANUP_ACTION, inputs["action"]["options"])
+        self.assertEqual(inputs["action"]["default"], "validate")
+        self.assertEqual(inputs["efs_access_point_cleanup_ids"]["default"], "")
+
+    def test_cleanup_step_is_gated_and_ordered_before_the_inventory_verification(self):
+        jobs = self._load("00-main-goldengate-orchestrator.yaml")["jobs"]
+        steps = jobs["validate_model"]["steps"]
+        ids = [s.get("id") for s in steps]
+        cleanup = steps[ids.index("efs_access_point_cleanup")]
+        self.assertEqual(cleanup["if"], "${{ steps.compute_effective_deploy.outputs.efs_access_point_cleanup == 'true' }}")
+        self.assertIn("phase1_readiness.py efs-access-point-cleanup", cleanup["run"])
+        self.assertNotIn("continue-on-error", cleanup)
+        self.assertLess(ids.index("efs_access_point_cleanup"), ids.index("managed_efs_inventory"))
+        names = [s.get("name") for s in steps]
+        self.assertLess(names.index("Verify live EKS cluster + OIDC + Kubernetes API access (read-only)"), ids.index("efs_access_point_cleanup"))
+        tf = jobs["terraform_sync_once"]
+        self.assertIn("needs.validate_model.outputs.effective_deploy == 'true'", tf["if"])
+        self.assertIn("needs.validate_model.result == 'success'", tf["if"])
+
+    def test_no_other_workflow_can_run_the_cleanup(self):
+        for path in sorted(self.WORKFLOWS.glob("*.y*ml")):
+            text = path.read_text(encoding="utf-8")
+            if path.name != "00-main-goldengate-orchestrator.yaml":
+                with self.subTest(workflow=path.name):
+                    self.assertNotIn("efs-access-point-cleanup", text)
+                    self.assertNotIn("efs_access_point_cleanup", text)
+
+    def test_deploy_role_may_delete_only_csi_access_points(self):
+        policy = json.loads((REPO_ROOT / "envs" / "dev" / "policies" / "goldengate-eks-deploy-dev" / "policies" / "policies_1.json").read_text())
+        efs_writes = [(s, a) for s in policy["Statement"] for a in s["Action"] if a.startswith("elasticfilesystem:") and not a.split(":")[1].startswith("Describe")]
+        self.assertEqual([a for _s, a in efs_writes], ["elasticfilesystem:DeleteAccessPoint"])
+        statement = efs_writes[0][0]
+        self.assertRegex(statement["Resource"], r"^arn:aws:elasticfilesystem:[a-z0-9-]+:[0-9]{12}:access-point/\*$")
+        self.assertEqual(statement["Condition"], {"StringEquals": {"aws:ResourceTag/efs.csi.aws.com/cluster": "true"}})
+
+
 class TestShellInjectionSafety(Phase1TestCase):
     def test_is_safe_token_rejects_shell_metacharacters(self):
         for bad in ("dev; rm -rf /", "dev`whoami`", "dev$(id)", "../../etc/passwd", "dev && echo pwned", "dev|nc", "", None, 123):

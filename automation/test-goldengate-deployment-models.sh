@@ -4557,8 +4557,8 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-w
   # 18: Fresh-EKS Phase A superseded the narrower "these specific IAM files never change" narrative from an earlier phase -- the OIDC rebind legitimately regenerates every assume_role_policy/sts.json (all 6 role folders), which the dedicated "render-iam-policies --check" and trust-subject-exactness checks elsewhere in this suite already verify are byte-for-byte the deterministic output of automation/goldengate-environment.py, not an unreviewed edit. This check's remaining job is narrower and permanent: no policies_1.json PERMISSION-content file may change unless account/region/cluster identity in environment.yaml itself changed (proven separately by render-iam-policies --check being a no-op today), and no file outside envs/dev/policies/**, envs/dev/iam.tf, envs/dev/environment.tf, or envs/dev/goldengate_inventory.tf may be touched by an IAM-labeled diff.
   IAM_DIFF_STAT="$(git -C "$REPO_ROOT" diff --stat=300 --ignore-all-space -- envs/dev/policies envs/dev/iam.tf envs/dev/environment.tf envs/dev/goldengate_inventory.tf 2>/dev/null || true)"
   IAM_DIFF_FILES="$(echo "$IAM_DIFF_STAT" | grep -oE '\S+\.(json|tf)' | sort -u || true)"
-  # Phase 3 ECR IAM least-privilege correction: envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json is a reviewed, intentional, fully-documented content change (removing the stale helm/gg-monitor repository-read statement -- no operational helm/gg-monitor chart exists; the current monitor chart is helm/goldengate-monitor), independently re-verified elsewhere in this suite ("Phase 3 ECR IAM least-privilege correction" section) to be byte-for-byte the exact output of automation/goldengate-environment.py's generator -- excluded from this generic "unreviewed content drift" guard the same way assume_role_policy/sts.json's OIDC rebind already is, never a general weakening of this check for any other policies_1.json file.
-  POLICY_CONTENT_DIFF_FILES="$(echo "$IAM_DIFF_FILES" | grep -F 'policies_1.json' | grep -vF 'argocd-ecr-oci-read-dev/policies/policies_1.json' || true)"
+  # Phase 3 ECR IAM least-privilege correction: envs/dev/policies/argocd-ecr-oci-read-dev/policies/policies_1.json is a reviewed, intentional, fully-documented content change (removing the stale helm/gg-monitor repository-read statement -- no operational helm/gg-monitor chart exists; the current monitor chart is helm/goldengate-monitor), independently re-verified elsewhere in this suite ("Phase 3 ECR IAM least-privilege correction" section) to be byte-for-byte the exact output of automation/goldengate-environment.py's generator -- excluded from this generic "unreviewed content drift" guard the same way assume_role_policy/sts.json's OIDC rebind already is, never a general weakening of this check for any other policies_1.json file. goldengate-eks-deploy-dev is likewise an intentional change (tag-scoped DeleteAccessPoint for the authorized DEV storage reset), scoped by the EFS action check below.
+  POLICY_CONTENT_DIFF_FILES="$(echo "$IAM_DIFF_FILES" | grep -F 'policies_1.json' | grep -vF 'argocd-ecr-oci-read-dev/policies/policies_1.json' | grep -vF 'goldengate-eks-deploy-dev/policies/policies_1.json' || true)"
   if [ -z "$POLICY_CONTENT_DIFF_FILES" ]; then
     pass "18: no envs/dev/policies/**/policies_1.json permission-content file changed (account/region/cluster identity in environment.yaml is unchanged, confirmed separately by render-iam-policies --check); only assume_role_policy/sts.json (OIDC rebind, verified elsewhere) and/or envs/dev/iam.tf, envs/dev/environment.tf, envs/dev/goldengate_inventory.tf may legitimately differ"
   else
@@ -7421,7 +7421,12 @@ with open("envs/dev/policies/goldengate-eks-deploy-dev/policies/policies_1.json"
 for stmt in doc["Statement"]:
     actions = stmt.get("Action", [])
     for action in actions:
-        if action.startswith("elasticfilesystem:") and action.split(":", 1)[1] not in ("DescribeAccessPoints", "DescribeFileSystems"):
+        if not action.startswith("elasticfilesystem:") or action.split(":", 1)[1] in ("DescribeAccessPoints", "DescribeFileSystems"):
+            continue
+        # The only write: DeleteAccessPoint on access points carrying the EFS CSI ownership tag.
+        scoped = actions == ["elasticfilesystem:DeleteAccessPoint"] and stmt.get("Resource", "").endswith(":access-point/*") \
+            and stmt.get("Condition") == {"StringEquals": {"aws:ResourceTag/efs.csi.aws.com/cluster": "true"}}
+        if not scoped:
             print(f"unexpected EFS action granted: {action}")
             raise SystemExit(1)
 print("OK")
@@ -7429,7 +7434,7 @@ print("OK")
   POLICY_CHECK_STATUS=$?
   set -e
   if [ "$POLICY_CHECK_STATUS" -eq 0 ]; then
-    pass "the workload-account read role is granted only read-only EFS actions (DescribeAccessPoints/DescribeFileSystems) -- no ListTagsForResource, no create/update/delete permission"
+    pass "the workload-account role is granted only read-only EFS actions plus a CSI-tag-scoped DeleteAccessPoint -- no ListTagsForResource, no filesystem or mount-target create/update/delete permission"
   else
     fail "the workload-account read role's EFS policy grants an unexpected action: ${POLICY_CHECK_OUT}"
   fi
@@ -8890,7 +8895,7 @@ if action_input is not None:
     results.append(("A2: action type is choice", action_input.get("type") == "choice"))
     results.append(("A3: action is required", action_input.get("required") is True))
     results.append(("A4: action default is validate", action_input.get("default") == "validate"))
-    results.append(("A5: action options are exactly [validate, deploy]", action_input.get("options") == ["validate", "deploy"]))
+    results.append(("A5: action options are exactly [validate, deploy, efs-access-point-cleanup]", action_input.get("options") == ["validate", "deploy", "efs-access-point-cleanup"]))
 
 all_options = []
 for spec in wd_inputs.values():
@@ -9514,7 +9519,7 @@ on_block = doc.get(True, doc.get("on", {}))
 wd_inputs = (on_block.get("workflow_dispatch") or {}).get("inputs") or {}
 
 action_input = wd_inputs.get("action")
-results.append(("action input is a required choice of [validate, deploy] defaulting to validate", action_input is not None and action_input.get("type") == "choice" and action_input.get("required") is True and action_input.get("default") == "validate" and action_input.get("options") == ["validate", "deploy"]))
+results.append(("action input is a required choice of [validate, deploy, efs-access-point-cleanup] defaulting to validate", action_input is not None and action_input.get("type") == "choice" and action_input.get("required") is True and action_input.get("default") == "validate" and action_input.get("options") == ["validate", "deploy", "efs-access-point-cleanup"]))
 
 deployment_id_input = wd_inputs.get("deployment_id")
 results.append(("deployment_id input is optional with an empty default", deployment_id_input is not None and deployment_id_input.get("required") is False and deployment_id_input.get("default") == ""))
@@ -10071,7 +10076,7 @@ wd_inputs = (doc.get(True, doc.get("on", {})).get("workflow_dispatch") or {}).ge
 results = []
 
 action_input = wd_inputs.get("action")
-results.append(("R: the action input is unchanged -- required choice of [validate, deploy] defaulting to validate", action_input is not None and action_input.get("type") == "choice" and action_input.get("required") is True and action_input.get("default") == "validate" and action_input.get("options") == ["validate", "deploy"]))
+results.append(("R: the action input is a required choice of [validate, deploy, efs-access-point-cleanup] defaulting to validate", action_input is not None and action_input.get("type") == "choice" and action_input.get("required") is True and action_input.get("default") == "validate" and action_input.get("options") == ["validate", "deploy", "efs-access-point-cleanup"]))
 
 deployment_id_input = wd_inputs.get("deployment_id")
 results.append(("S: the deployment_id input is unchanged -- optional with an empty default (environment-wide semantics preserved)", deployment_id_input is not None and deployment_id_input.get("required") is False and deployment_id_input.get("default") == ""))
@@ -15014,6 +15019,7 @@ EXPECTED_STEPS = [
     "Detect changed GoldenGate deployments",
     "Guard against destroying a managed GoldenGate EFS filesystem",
     "Guard against unsafe persistence.efs storage-identity transitions",
+    "Remove authorized EFS access points (DEV storage reset only)",
     "Verify AWS-side managed-EFS inventory (read-only)",
     "Publish canonical Phase 1 outputs",
     "Phase 1 acceptance",
@@ -15039,8 +15045,8 @@ for removed in REMOVED_JOBS:
 steps = vm.get("steps", []) if isinstance(vm, dict) else []
 names = [s.get("name") for s in steps]
 
-# C: the expected 17-step sequence, in order.
-check("C: validate_model has exactly the expected 17-step sequence in order", names == EXPECTED_STEPS)
+# C: the expected 18-step sequence, in order.
+check("C: validate_model has exactly the expected 18-step sequence in order", names == EXPECTED_STEPS)
 
 # D: the guard steps are unconditional (no continue-on-error) -- a failure anywhere fails validate_model as a whole, collapsing the former cross-job ordering/needs-chain into GitHub's own default step-continuation semantics.
 by_name = {s.get("name"): s for s in steps}

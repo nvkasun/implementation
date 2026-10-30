@@ -10,6 +10,7 @@ import re
 import secrets
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -18,6 +19,13 @@ DEPLOYMENT_MODEL_TOOL = REPO_ROOT / "automation" / "goldengate-deployment-model.
 ENVIRONMENT_TOOL = REPO_ROOT / "automation" / "goldengate-environment.py"
 DETECT_SCRIPT = REPO_ROOT / "automation" / "phases" / "phase1" / "detect-goldengate-deployments.sh"
 EFS_INVENTORY_GUARD_TOOL = REPO_ROOT / "automation" / "phases" / "phase1" / "managed_efs_inventory_guard.py"
+EFS_ACCESS_POINT_CLEANUP_TOOL = REPO_ROOT / "automation" / "phases" / "phase1" / "efs_access_point_cleanup.py"
+
+# One-time storage reset: a separate manual action that never reaches Terraform, allowed only in disposable environments.
+EFS_ACCESS_POINT_CLEANUP_ACTION = "efs-access-point-cleanup"
+EFS_ACCESS_POINT_CLEANUP_ENVIRONMENTS = ("dev",)
+EFS_ACCESS_POINT_CLEANUP_ATTEMPTS = 30
+EFS_ACCESS_POINT_CLEANUP_INTERVAL_SECONDS = 10
 
 # Mirrors automation/goldengate-deployment-model.py's own _TOKEN_RE / automation/phases/phase1/managed_efs_inventory_guard.py's _SAFE_ENVIRONMENT_RE -- each tool in this repository intentionally keeps its own local copy of this grammar rather than importing it across modules; used here only for defense-in-depth path-safety before an environment name is ever interpolated into a filesystem path, never as the canonical acceptance/rejection of an environment (that remains automation/goldengate-environment.py's own concern).
 _SAFE_TOKEN_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
@@ -326,6 +334,7 @@ def cmd_active_runtime_state(args):
 def cmd_effective_deploy(args):
     event_name = os.environ.get("EVENT_NAME", "")
     input_action = os.environ.get("INPUT_ACTION", "")
+    cleanup = "false"
 
     # A push event carries no workflow_dispatch inputs and always implies deploy=true, matching the existing detect-goldengate-deployments.sh push-path contract.
     if event_name != "workflow_dispatch":
@@ -334,15 +343,33 @@ def cmd_effective_deploy(args):
         effective_deploy = "true"
     elif input_action == "validate":
         effective_deploy = "false"
+    elif input_action == EFS_ACCESS_POINT_CLEANUP_ACTION:
+        # Not a deploy: Terraform and every later phase stay in Validate mode.
+        effective_deploy, cleanup = "false", "true"
     else:
         raise Phase1Error(
-            f"unrecognized workflow_dispatch action {input_action!r} -- expected exactly 'validate' or 'deploy'. "
-            "Refusing to guess which lifecycle contract applies."
+            f"unrecognized workflow_dispatch action {input_action!r} -- expected exactly 'validate', 'deploy' or "
+            f"'{EFS_ACCESS_POINT_CLEANUP_ACTION}'. Refusing to guess which lifecycle contract applies."
         )
 
-    update_state(args.state_path, {"effective_deploy": effective_deploy})
-    write_github_output([("effective_deploy", effective_deploy)])
+    if cleanup == "true":
+        state = load_state(args.state_path)
+        parse_efs_access_point_cleanup_scope(require_state_value(state, "selected_environment"), event_name, input_action)
+    elif os.environ.get("INPUT_EFS_ACCESS_POINT_CLEANUP_IDS", "").strip():
+        raise Phase1Error(f"efs_access_point_cleanup_ids is only accepted with action={EFS_ACCESS_POINT_CLEANUP_ACTION} on a manual workflow_dispatch run.")
+
+    update_state(args.state_path, {"effective_deploy": effective_deploy, "efs_access_point_cleanup": cleanup})
+    write_github_output([("effective_deploy", effective_deploy), ("efs_access_point_cleanup", cleanup)])
     print(f"OK: effective_deploy={effective_deploy}.")
+    if cleanup == "true":
+        print("OK: authorized EFS access-point cleanup run; Terraform and runtime deployment will not run.")
+
+
+def _requires_live_aws(state, command):
+    """Deploy mode, or the authorized access-point cleanup run; never Validate mode."""
+    if require_state_value(state, "effective_deploy") == "true" or state.get("efs_access_point_cleanup") == "true":
+        return
+    raise Phase1Error(f"{command} was invoked outside Deploy mode; refusing to touch live AWS.")
 
 
 def cmd_terraform_governance(args):
@@ -393,9 +420,7 @@ def _assume_role_env(role_arn, session_name):
 
 def cmd_eks_preflight(args):
     state = load_state(args.state_path)
-    effective_deploy = require_state_value(state, "effective_deploy")
-    if effective_deploy != "true":
-        raise Phase1Error("eks-preflight was invoked outside Deploy mode; refusing to touch live AWS/EKS.")
+    _requires_live_aws(state, "eks-preflight")
 
     aws_region = os.environ["AWS_REGION"]
     eks_cluster_name = os.environ["EKS_CLUSTER_NAME"]
@@ -651,9 +676,7 @@ def verify_managed_efs_inventory(selected_environment, aws_region, eks_deploy_ro
 
 def cmd_managed_efs_inventory(args):
     state = load_state(args.state_path)
-    effective_deploy = require_state_value(state, "effective_deploy")
-    if effective_deploy != "true":
-        raise Phase1Error("managed-efs-inventory was invoked outside Deploy mode; refusing to touch live AWS.")
+    _requires_live_aws(state, "managed-efs-inventory")
     selected_environment = require_state_value(state, "selected_environment")
 
     authorized = parse_efs_replacement_authorization(os.environ.get("INPUT_EFS_REPLACEMENT_AUTHORIZED_IDS", ""), os.environ.get("EVENT_NAME", ""))
@@ -662,6 +685,176 @@ def cmd_managed_efs_inventory(args):
     write_github_output([("efs_replacement_authorized_ids", ",".join(authorized))])
     update_state(args.state_path, {"managed_efs_inventory_completed": "true"})
     print("OK: managed-EFS inventory matches the deployment model; no orphan detected.")
+
+
+def _load_access_point_cleanup():
+    spec = importlib.util.spec_from_file_location("efs_access_point_cleanup", EFS_ACCESS_POINT_CLEANUP_TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def parse_efs_access_point_cleanup_scope(selected_environment, event_name, input_action):
+    """Filesystem scope from the replacement authorization, plus the exact access point IDs. Manual dispatch of the cleanup action in an allowed environment only."""
+    if event_name != "workflow_dispatch" or input_action != EFS_ACCESS_POINT_CLEANUP_ACTION:
+        raise Phase1Error(f"EFS access-point cleanup requires a manual workflow_dispatch with action={EFS_ACCESS_POINT_CLEANUP_ACTION}.")
+    if selected_environment not in EFS_ACCESS_POINT_CLEANUP_ENVIRONMENTS:
+        raise Phase1Error(f"EFS access-point cleanup is not permitted in environment {selected_environment!r}.")
+    filesystem_ids = parse_efs_replacement_authorization(os.environ.get("INPUT_EFS_REPLACEMENT_AUTHORIZED_IDS", ""), event_name)
+    cleanup = _load_access_point_cleanup()
+    try:
+        access_point_ids = cleanup.parse_access_point_ids(os.environ.get("INPUT_EFS_ACCESS_POINT_CLEANUP_IDS", ""))
+    except cleanup.CleanupError as exc:
+        raise Phase1Error(f"invalid efs_access_point_cleanup_ids: {exc}") from exc
+    if not filesystem_ids or not access_point_ids:
+        raise Phase1Error("EFS access-point cleanup requires both efs_replacement_authorized_ids and efs_access_point_cleanup_ids.")
+    return filesystem_ids, access_point_ids
+
+
+def _aws_error_code(stderr):
+    match = re.search(r"\(([A-Za-z]+)\)", stderr or "")
+    return match.group(1) if match else "unknown"
+
+
+def _describe_access_points(argv_tail, aws_region, role_env):
+    proc = run(["aws", "efs", "describe-access-points", "--region", aws_region, *argv_tail, "--output", "json"], env=role_env, check=False)
+    if proc.returncode != 0:
+        return None, _aws_error_code(proc.stderr)
+    try:
+        access_points = json.loads(proc.stdout).get("AccessPoints")
+    except (json.JSONDecodeError, AttributeError) as exc:
+        raise Phase1Error(f"aws efs describe-access-points {' '.join(argv_tail)} returned a malformed response.") from exc
+    if not isinstance(access_points, list) or not all(isinstance(ap, dict) for ap in access_points):
+        raise Phase1Error(f"aws efs describe-access-points {' '.join(argv_tail)} returned no AccessPoints list.")
+    return access_points, None
+
+
+def _access_points_by_filesystem(filesystem_ids, aws_region, role_env):
+    result = {}
+    for filesystem_id in filesystem_ids:
+        access_points, error = _describe_access_points(["--file-system-id", filesystem_id], aws_region, role_env)
+        if error:
+            raise Phase1Error(f"could not list access points of {filesystem_id} ({error}); refusing to treat them as absent.")
+        result[filesystem_id] = access_points
+    return result
+
+
+def _read_kubernetes_objects(runtime_namespace, argocd_namespace):
+    """Read-only, cluster-wide where a reference could hide; any failure is fatal, never an empty list."""
+    queries = {
+        "pv": ["pv"],
+        "pvc": ["pvc", "--all-namespaces"],
+        "pods": ["pods", "--all-namespaces"],
+        "statefulsets": ["statefulsets", "-n", runtime_namespace],
+        "storageclasses": ["storageclass"],
+        "applications": ["applications.argoproj.io", "-n", argocd_namespace],
+        "applicationsets": ["applicationsets.argoproj.io", "-n", argocd_namespace],
+    }
+    objects = {}
+    for kind, query in queries.items():
+        proc = run(["kubectl", "get", *query, "-o", "json", "--request-timeout=60s"], check=False)
+        if proc.returncode != 0:
+            raise Phase1Error(f"kubectl get {' '.join(query)} failed (exit {proc.returncode}); refusing to assume no references.")
+        try:
+            items = json.loads(proc.stdout).get("items")
+        except (json.JSONDecodeError, AttributeError) as exc:
+            raise Phase1Error(f"kubectl get {' '.join(query)} returned malformed JSON.") from exc
+        if not isinstance(items, list):
+            raise Phase1Error(f"kubectl get {' '.join(query)} returned no items list.")
+        objects[kind] = items
+    return objects
+
+
+def cmd_efs_access_point_cleanup(args):
+    """Deletes only the named, CSI-provisioned access points of authorized stale filesystems, then waits until those filesystems have none. Never deletes a filesystem."""
+    state = load_state(args.state_path)
+    if state.get("efs_access_point_cleanup") != "true" or require_state_value(state, "effective_deploy") != "false":
+        raise Phase1Error(f"efs-access-point-cleanup runs only in an authorized action={EFS_ACCESS_POINT_CLEANUP_ACTION} run.")
+    if state.get("eks_preflight_completed") != "true":
+        raise Phase1Error("efs-access-point-cleanup requires the EKS preflight to have completed.")
+    selected_environment = require_state_value(state, "selected_environment")
+    filesystem_ids, access_point_ids = parse_efs_access_point_cleanup_scope(selected_environment, os.environ.get("EVENT_NAME", ""), os.environ.get("INPUT_ACTION", ""))
+    aws_region = os.environ["AWS_REGION"]
+    match = re.match(r"^arn:aws:iam::([0-9]{12}):role/.*$", os.environ.get("EKS_DEPLOY_ROLE_ARN", ""))
+    if not match:
+        raise Phase1Error("could not extract a 12-digit account ID from EKS_DEPLOY_ROLE_ARN.")
+    workload_account_id = match.group(1)
+    guard, cleanup = _load_inventory_guard(), _load_access_point_cleanup()
+    print(f"Authorized scope: filesystems {filesystem_ids}; access points {access_point_ids}.")
+
+    try:
+        expected = json.loads(run_tool(DEPLOYMENT_MODEL_TOOL, ["--environment", selected_environment, "managed-efs-inventory"]).stdout)
+    except json.JSONDecodeError as exc:
+        raise Phase1Error("the deployment model returned a malformed managed-EFS inventory.") from exc
+    try:
+        role_env = _assume_role_env(os.environ["EKS_DEPLOY_ROLE_ARN"], f"gg-efs-ap-cleanup-{os.environ.get('GITHUB_RUN_ID', 'local')}-{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise Phase1Error(f"aws sts assume-role returned an unexpected response ({type(exc).__name__}).") from exc
+    actual_account = run(["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text", "--region", aws_region], env=role_env).stdout.strip()
+    if actual_account != workload_account_id:
+        raise Phase1Error(f"assumed role resolved to account {actual_account}, expected the GoldenGate workload account {workload_account_id}.")
+
+    describe = run(["aws", "efs", "describe-file-systems", "--region", aws_region, "--output", "json"], env=role_env)
+    sanitized = sanitize_efs_filesystems(_parse_describe_file_systems(describe.stdout))
+    try:
+        orphans = guard.check_managed_efs_inventory(expected, sanitized, selected_environment, filesystem_ids)
+        runtimes = cleanup.runtime_ids_by_filesystem(filesystem_ids, sanitized)
+    except (guard.InventoryGuardError, cleanup.CleanupError) as exc:
+        raise Phase1Error(f"filesystem scope rejected: {exc}") from exc
+    if orphans:
+        raise Phase1Error(f"orphaned GoldenGate filesystems exist ({[o['deploymentId'] for o in orphans]}); refusing to clean up.")
+    print(f"OK: filesystem scope is GoldenGate-owned, stale-token and tied to runtimes {sorted(runtimes.values())}.")
+
+    problems = cleanup.find_kubernetes_references(
+        _read_kubernetes_objects(os.environ["RUNTIME_NAMESPACE"], os.environ["ARGOCD_NAMESPACE"]),
+        filesystem_ids, access_point_ids, runtimes.values(), selected_environment, os.environ["RUNTIME_NAMESPACE"])
+    if problems:
+        raise Phase1Error("Kubernetes still references the selected storage: " + "; ".join(problems))
+    print("OK: no Argo CD Application/ApplicationSet, pod, StatefulSet, StorageClass, PVC or PV references the selected filesystems.")
+
+    by_filesystem = _access_points_by_filesystem(filesystem_ids, aws_region, role_env)
+    found = {ap.get("AccessPointId") for aps in by_filesystem.values() for ap in aps}
+    for ap_id in sorted(set(access_point_ids) - found):
+        access_points, error = _describe_access_points(["--access-point-id", ap_id], aws_region, role_env)
+        if error == "AccessPointNotFound":
+            print(f"OK: {ap_id} is already removed (retry).")
+        elif error:
+            raise Phase1Error(f"could not look up authorized access point {ap_id} ({error}).")
+        else:
+            owners = sorted({ap.get("FileSystemId") for ap in access_points})
+            raise Phase1Error(f"authorized access point {ap_id} belongs to {owners}, outside the authorized filesystems.")
+    try:
+        to_delete, in_progress = cleanup.plan_access_point_deletions(by_filesystem, access_point_ids, workload_account_id)
+    except cleanup.CleanupError as exc:
+        raise Phase1Error(f"access point scope rejected: {exc}") from exc
+
+    for ap_id in to_delete:
+        proc = run(["aws", "efs", "delete-access-point", "--region", aws_region, "--access-point-id", ap_id], env=role_env, check=False)
+        if proc.returncode == 0:
+            print(f"DELETED: access point {ap_id}")
+        elif _aws_error_code(proc.stderr) == "AccessPointNotFound":
+            print(f"OK: {ap_id} was already removed.")
+        else:
+            raise Phase1Error(f"delete-access-point {ap_id} failed ({_aws_error_code(proc.stderr)}); no filesystem was changed.")
+    for ap_id in in_progress:
+        print(f"WAIT: access point {ap_id} is already deleting.")
+
+    for attempt in range(1, EFS_ACCESS_POINT_CLEANUP_ATTEMPTS + 1):
+        by_filesystem = _access_points_by_filesystem(filesystem_ids, aws_region, role_env)
+        try:
+            cleanup.plan_access_point_deletions(by_filesystem, access_point_ids, workload_account_id)
+        except cleanup.CleanupError as exc:
+            raise Phase1Error(f"access point scope changed during cleanup: {exc}") from exc
+        remaining = sorted(ap.get("AccessPointId") for aps in by_filesystem.values() for ap in aps)
+        if not remaining:
+            break
+        print(f"WAIT: {len(remaining)} access point(s) remain (attempt {attempt}/{EFS_ACCESS_POINT_CLEANUP_ATTEMPTS}).")
+        if attempt == EFS_ACCESS_POINT_CLEANUP_ATTEMPTS:
+            raise Phase1Error(f"access points {remaining} still exist after {attempt} checks; re-run the cleanup.")
+        time.sleep(EFS_ACCESS_POINT_CLEANUP_INTERVAL_SECONDS)
+
+    update_state(args.state_path, {"efs_access_point_cleanup_completed": "true"})
+    print(f"OK: the authorized filesystems {filesystem_ids} have zero access points. No filesystem was modified.")
 
 
 def cmd_publish_outputs(args):
@@ -695,7 +888,18 @@ def cmd_acceptance(args):
     require_literal_bool("has_storage_transition_violations", require_state_value(state, "has_storage_transition_violations"))
     storage_transition_violations = require_json_array("storage_transition_violations", require_state_value(state, "storage_transition_violations"))
 
-    if effective_deploy == "true":
+    cleanup = state.get("efs_access_point_cleanup", "false")
+    if cleanup == "true":
+        if effective_deploy != "false":
+            raise Phase1Error("an EFS access-point cleanup run must never be a Deploy run.")
+        for key in ("eks_preflight_completed", "efs_access_point_cleanup_completed", "managed_efs_inventory_completed"):
+            if state.get(key) != "true":
+                raise Phase1Error(f"EFS access-point cleanup mode requires {key} before acceptance.")
+        eks_status = "validated"
+        efs_inventory_status = "passed (authorized filesystems have zero access points)"
+    elif state.get("efs_access_point_cleanup_completed") == "true":
+        raise Phase1Error("EFS access-point cleanup ran outside its authorized mode.")
+    elif effective_deploy == "true":
         if state.get("eks_preflight_completed") != "true":
             raise Phase1Error("Deploy mode requires the live EKS/OIDC/Kubernetes-API prerequisite to have completed successfully before acceptance.")
         if state.get("managed_efs_inventory_completed") != "true":
@@ -712,7 +916,7 @@ def cmd_acceptance(args):
         "## Phase 1 | Validate Folder-Driven Deployment Model",
         "",
         f"- Environment: {selected_environment}",
-        f"- Mode: {'Deploy' if effective_deploy == 'true' else 'Validate'}",
+        f"- Mode: {'EFS access-point cleanup' if cleanup == 'true' else 'Deploy' if effective_deploy == 'true' else 'Validate'}",
         f"- Active runtimes: {len(active_runtime_matrix)}",
         f"- Selected runtime changes: {'yes' if has_changes == 'true' else 'none'} ({len(deployment_matrix)} deployment(s))",
         f"- Runtime removals: {'yes' if has_deletions == 'true' else 'none'} ({len(deletion_matrix)} deletion(s))",
@@ -742,6 +946,7 @@ _SUBCOMMANDS = {
     "detect-deployments": cmd_detect_deployments,
     "managed-efs-deletion-guard": cmd_managed_efs_deletion_guard,
     "storage-transition-guard": cmd_storage_transition_guard,
+    "efs-access-point-cleanup": cmd_efs_access_point_cleanup,
     "managed-efs-inventory": cmd_managed_efs_inventory,
     "publish-outputs": cmd_publish_outputs,
     "acceptance": cmd_acceptance,

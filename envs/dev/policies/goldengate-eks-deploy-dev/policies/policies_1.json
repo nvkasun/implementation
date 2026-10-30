@@ -27,6 +27,19 @@
       "Resource": "*"
     },
     {
+      "Sid": "AllowDeleteGoldenGateCsiEfsAccessPoints",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:DeleteAccessPoint"
+      ],
+      "Resource": "arn:aws:elasticfilesystem:eu-west-1:668311715351:access-point/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/efs.csi.aws.com/cluster": "true"
+        }
+      }
+    },
+    {
       "Sid": "AllowReadOnlyGoldenGateSharedSecretValidation",
       "Effect": "Allow",
       "Action": [
