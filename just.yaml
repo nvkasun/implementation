@@ -3,35 +3,34 @@ set -euo pipefail
 
 NS="argocd"
 
-APPSETS=(
-  goldengate-dev-mssql-repltest-001-appset
-  goldengate-dev-oracle-repltest-002-appset
-  goldengate-dev-postgresql-repltest-001-appset
-  goldengate-dev-postgresql-repltest-002-appset
+APPS=(
+  goldengate-dev-mssql-repltest-001
+  goldengate-dev-oracle-repltest-002
+  goldengate-dev-postgresql-repltest-001
+  goldengate-dev-postgresql-repltest-002
 )
 
-echo "=== VERIFY EXACT APPLICATIONSETS ==="
+echo "=== GOLDENGATE RUNTIME APPLICATION STATUS ==="
 
-for appset in "${APPSETS[@]}"; do
-  kubectl -n "$NS" get applicationset "$appset" \
-    -o custom-columns='NAME:.metadata.name'
+for app in "${APPS[@]}"; do
+  echo
+  echo "APPLICATION: $app"
+
+  kubectl -n "$NS" get application "$app" \
+    -o jsonpath='Name: {.metadata.name}{"\n"}Deletion timestamp: {.metadata.deletionTimestamp}{"\n"}Finalizers: {.metadata.finalizers}{"\n"}Owner references: {.metadata.ownerReferences[*].name}{"\n"}Sync status: {.status.sync.status}{"\n"}Health status: {.status.health.status}{"\n"}' \
+    2>&1 || true
 done
 
 echo
-echo "=== DELETE OLD GOLDENGATE RUNTIME APPLICATIONSETS ==="
+echo "=== REMAINING RUNTIME RESOURCES ==="
 
-for appset in "${APPSETS[@]}"; do
-  kubectl -n "$NS" delete applicationset "$appset" \
-    --wait=true
-done
-
-echo
-echo "=== VERIFY REMAINING APPLICATIONS ==="
-
-kubectl -n "$NS" get applicationsets
-kubectl -n "$NS" get applications
-kubectl -n goldengate-dev get statefulsets
-kubectl -n goldengate-dev get pods
+kubectl -n goldengate-dev get \
+  statefulsets,pods,services,ingresses \
+  --ignore-not-found
 
 echo
-echo "=== RUNTIME REMOVAL STAGE COMPLETED ==="
+echo "=== PVCs ==="
+kubectl -n goldengate-dev get pvc
+
+echo
+echo "=== APPLICATION CHECK COMPLETE ==="
