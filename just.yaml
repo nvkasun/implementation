@@ -4,31 +4,89 @@ set -euo pipefail
 
 NS="goldengate-dev"
 
-echo "========== GOLDENGATE STORAGE PRE-DELETE CHECK =========="
+PVCS=(
+  gg-mssql-repltest-01-u02
+  gg-oracle-repltest-01-u02
+  gg-postgresql-repltest-01-u02
+  gg-postgresql-repltest-02-u02
+)
 
-echo
-echo "1. Remaining GoldenGate runtime resources"
-kubectl -n "$NS" get sts,svc,ingress \
-  --ignore-not-found
+PVS=(
+  pvc-2ddd0407-f776-4870-aa50-674dfc55faee
+  pvc-430982c7-68b3-4c87-9598-0cf8fcf66c41
+  pvc-54114071-9885-4486-b146-555638da2f73
+  pvc-5cccdddb-b288-46ca-b8f5-a91f1bdd08de
+)
 
-echo
-echo "2. Current pods and PVC references"
-kubectl -n "$NS" get pods \
-  -o custom-columns='POD:.metadata.name,PVC:.spec.volumes[*].persistentVolumeClaim.claimName'
+HANDLES=(
+  fs-03eb68ea5f6317e54::fsap-0a804c4697816195b
+  fs-0abbe15be0c6fb64d::fsap-0df58f1ff6912f3f1
+  fs-0d1c409669a15bc3e::fsap-0bd59bb3c3abcd78d
+  fs-08505eae446b8c918::fsap-0db2b806b3bdb6563
+)
 
-echo
-echo "3. Existing old PVCs"
+echo "=== 1. VERIFY NO RUNTIME PODS ==="
+if kubectl -n "$NS" get pods -o name |
+   grep -E '^pod/gg-(mssql|oracle|postgresql)-repltest-'; then
+  echo "BLOCKED: Runtime pods still exist"
+  exit 1
+fi
+
+echo "=== 2. VERIFY PVC/PV OWNERSHIP ==="
+for i in "${!PVCS[@]}"; do
+  pvc="${PVCS[$i]}"
+  pv="${PVS[$i]}"
+  handle="${HANDLES[$i]}"
+
+  actual_pv=$(kubectl -n "$NS" get pvc "$pvc" \
+    -o jsonpath='{.spec.volumeName}')
+
+  actual_claim=$(kubectl get pv "$pv" \
+    -o jsonpath='{.spec.claimRef.name}')
+
+  actual_ns=$(kubectl get pv "$pv" \
+    -o jsonpath='{.spec.claimRef.namespace}')
+
+  actual_handle=$(kubectl get pv "$pv" \
+    -o jsonpath='{.spec.csi.volumeHandle}')
+
+  reclaim=$(kubectl get pv "$pv" \
+    -o jsonpath='{.spec.persistentVolumeReclaimPolicy}')
+
+  if [[ "$actual_pv" != "$pv" ||
+        "$actual_claim" != "$pvc" ||
+        "$actual_ns" != "$NS" ||
+        "$actual_handle" != "$handle" ||
+        "$reclaim" != "Retain" ]]; then
+    echo "BLOCKED: Mapping mismatch for $pvc"
+    exit 1
+  fi
+
+  echo "VERIFIED: $pvc -> $pv"
+done
+
+echo "=== 3. VERIFY NO POD USES THESE CLAIMS ==="
+for pvc in "${PVCS[@]}"; do
+  if kubectl -n "$NS" get pods \
+      -o jsonpath='{range .items[*]}{.spec.volumes[*].persistentVolumeClaim.claimName}{"\n"}{end}' |
+      tr ' ' '\n' | grep -Fxq "$pvc"; then
+    echo "BLOCKED: PVC still used: $pvc"
+    exit 1
+  fi
+done
+
+echo "=== 4. DELETE FOUR OLD PVCs ==="
+for pvc in "${PVCS[@]}"; do
+  kubectl -n "$NS" delete pvc "$pvc" --wait=true
+done
+
+echo "=== 5. DELETE FOUR RETAINED PVs ==="
+for pv in "${PVS[@]}"; do
+  kubectl delete pv "$pv" --wait=true
+done
+
+echo "=== 6. FINAL CHECK ==="
 kubectl -n "$NS" get pvc
+kubectl get pv
 
-echo
-echo "4. PV ownership, reclaim policy and EFS handles"
-kubectl get pv \
-  -o custom-columns='PV:.metadata.name,NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,RECLAIM:.spec.persistentVolumeReclaimPolicy,EFS_HANDLE:.spec.csi.volumeHandle'
-
-echo
-echo "5. Remaining runtime EFS StorageClasses"
-kubectl get storageclass \
-  | grep -E 'NAME|gg-efs-dev' || true
-
-echo
-echo "========== STORAGE CHECK COMPLETE =========="
+echo "=== PVC/PV CLEANUP COMPLETE ==="
