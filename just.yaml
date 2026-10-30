@@ -1,52 +1,34 @@
 
-set -u
+#!/usr/bin/env bash
+set -euo pipefail
 
-NS="argocd"
+NS="goldengate-dev"
 
-APPS=(
-  goldengate-dev-mssql-repltest-001
-  goldengate-dev-oracle-repltest-002
-  goldengate-dev-postgresql-repltest-001
-  goldengate-dev-postgresql-repltest-002
-)
-
-echo "========== ARGO CD FINALIZER DIAGNOSTIC =========="
-
-for app in "${APPS[@]}"; do
-  echo
-  echo "===== $app ====="
-
-  kubectl -n "$NS" get application "$app" \
-    -o jsonpath='Deletion: {.metadata.deletionTimestamp}{"\n"}Finalizers: {.metadata.finalizers}{"\n"}Operation: {.status.operationState.phase}{"\n"}'
-
-  echo
-  echo "Resource status:"
-  kubectl -n "$NS" get application "$app" \
-    -o jsonpath='{range .status.resources[*]}{.kind}{" | "}{.namespace}{" | "}{.name}{" | "}{.status}{" | "}{.health.status}{"\n"}{end}'
-
-done
+echo "========== GOLDENGATE STORAGE PRE-DELETE CHECK =========="
 
 echo
-echo "========== REMAINING GOLDENGATE RESOURCES =========="
-
-kubectl -n goldengate-dev get \
-  statefulsets,services,ingresses,pods,secretproviderclasses \
+echo "1. Remaining GoldenGate runtime resources"
+kubectl -n "$NS" get sts,svc,ingress \
   --ignore-not-found
 
 echo
-echo "========== ARGO CD CONTROLLER PODS =========="
-
-kubectl -n argocd get pods \
-  -l app.kubernetes.io/name=argocd-application-controller
-
-echo
-echo "========== APPLICATION EVENTS =========="
-
-for app in "${APPS[@]}"; do
-  echo "--- $app ---"
-  kubectl -n argocd describe application "$app" 2>&1 |
-    tail -35
-done
+echo "2. Current pods and PVC references"
+kubectl -n "$NS" get pods \
+  -o custom-columns='POD:.metadata.name,PVC:.spec.volumes[*].persistentVolumeClaim.claimName'
 
 echo
-echo "========== DIAGNOSTIC COMPLETE =========="
+echo "3. Existing old PVCs"
+kubectl -n "$NS" get pvc
+
+echo
+echo "4. PV ownership, reclaim policy and EFS handles"
+kubectl get pv \
+  -o custom-columns='PV:.metadata.name,NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,RECLAIM:.spec.persistentVolumeReclaimPolicy,EFS_HANDLE:.spec.csi.volumeHandle'
+
+echo
+echo "5. Remaining runtime EFS StorageClasses"
+kubectl get storageclass \
+  | grep -E 'NAME|gg-efs-dev' || true
+
+echo
+echo "========== STORAGE CHECK COMPLETE =========="
