@@ -1,5 +1,5 @@
 
-set -euo pipefail
+set -u
 
 NS="argocd"
 
@@ -10,27 +10,43 @@ APPS=(
   goldengate-dev-postgresql-repltest-002
 )
 
-echo "=== GOLDENGATE RUNTIME APPLICATION STATUS ==="
+echo "========== ARGO CD FINALIZER DIAGNOSTIC =========="
 
 for app in "${APPS[@]}"; do
   echo
-  echo "APPLICATION: $app"
+  echo "===== $app ====="
 
   kubectl -n "$NS" get application "$app" \
-    -o jsonpath='Name: {.metadata.name}{"\n"}Deletion timestamp: {.metadata.deletionTimestamp}{"\n"}Finalizers: {.metadata.finalizers}{"\n"}Owner references: {.metadata.ownerReferences[*].name}{"\n"}Sync status: {.status.sync.status}{"\n"}Health status: {.status.health.status}{"\n"}' \
-    2>&1 || true
+    -o jsonpath='Deletion: {.metadata.deletionTimestamp}{"\n"}Finalizers: {.metadata.finalizers}{"\n"}Operation: {.status.operationState.phase}{"\n"}'
+
+  echo
+  echo "Resource status:"
+  kubectl -n "$NS" get application "$app" \
+    -o jsonpath='{range .status.resources[*]}{.kind}{" | "}{.namespace}{" | "}{.name}{" | "}{.status}{" | "}{.health.status}{"\n"}{end}'
+
 done
 
 echo
-echo "=== REMAINING RUNTIME RESOURCES ==="
+echo "========== REMAINING GOLDENGATE RESOURCES =========="
 
 kubectl -n goldengate-dev get \
-  statefulsets,pods,services,ingresses \
+  statefulsets,services,ingresses,pods,secretproviderclasses \
   --ignore-not-found
 
 echo
-echo "=== PVCs ==="
-kubectl -n goldengate-dev get pvc
+echo "========== ARGO CD CONTROLLER PODS =========="
+
+kubectl -n argocd get pods \
+  -l app.kubernetes.io/name=argocd-application-controller
 
 echo
-echo "=== APPLICATION CHECK COMPLETE ==="
+echo "========== APPLICATION EVENTS =========="
+
+for app in "${APPS[@]}"; do
+  echo "--- $app ---"
+  kubectl -n argocd describe application "$app" 2>&1 |
+    tail -35
+done
+
+echo
+echo "========== DIAGNOSTIC COMPLETE =========="
