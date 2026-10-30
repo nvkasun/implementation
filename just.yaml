@@ -1,92 +1,75 @@
 
-#!/usr/bin/env bash
-set -euo pipefail
-
-NS="goldengate-dev"
-
-PVCS=(
-  gg-mssql-repltest-01-u02
-  gg-oracle-repltest-01-u02
-  gg-postgresql-repltest-01-u02
-  gg-postgresql-repltest-02-u02
-)
-
-PVS=(
-  pvc-2ddd0407-f776-4870-aa50-674dfc55faee
-  pvc-430982c7-68b3-4c87-9598-0cf8fcf66c41
-  pvc-54114071-9885-4486-b146-555638da2f73
-  pvc-5cccdddb-b288-46ca-b8f5-a91f1bdd08de
-)
-
-HANDLES=(
-  fs-03eb68ea5f6317e54::fsap-0a804c4697816195b
-  fs-0abbe15be0c6fb64d::fsap-0df58f1ff6912f3f1
-  fs-0d1c409669a15bc3e::fsap-0bd59bb3c3abcd78d
-  fs-08505eae446b8c918::fsap-0db2b806b3bdb6563
-)
-
-echo "=== 1. VERIFY NO RUNTIME PODS ==="
-if kubectl -n "$NS" get pods -o name |
-   grep -E '^pod/gg-(mssql|oracle|postgresql)-repltest-'; then
-  echo "BLOCKED: Runtime pods still exist"
-  exit 1
-fi
-
-echo "=== 2. VERIFY PVC/PV OWNERSHIP ==="
-for i in "${!PVCS[@]}"; do
-  pvc="${PVCS[$i]}"
-  pv="${PVS[$i]}"
-  handle="${HANDLES[$i]}"
-
-  actual_pv=$(kubectl -n "$NS" get pvc "$pvc" \
-    -o jsonpath='{.spec.volumeName}')
-
-  actual_claim=$(kubectl get pv "$pv" \
-    -o jsonpath='{.spec.claimRef.name}')
-
-  actual_ns=$(kubectl get pv "$pv" \
-    -o jsonpath='{.spec.claimRef.namespace}')
-
-  actual_handle=$(kubectl get pv "$pv" \
-    -o jsonpath='{.spec.csi.volumeHandle}')
-
-  reclaim=$(kubectl get pv "$pv" \
-    -o jsonpath='{.spec.persistentVolumeReclaimPolicy}')
-
-  if [[ "$actual_pv" != "$pv" ||
-        "$actual_claim" != "$pvc" ||
-        "$actual_ns" != "$NS" ||
-        "$actual_handle" != "$handle" ||
-        "$reclaim" != "Retain" ]]; then
-    echo "BLOCKED: Mapping mismatch for $pvc"
-    exit 1
-  fi
-
-  echo "VERIFIED: $pvc -> $pv"
-done
-
-echo "=== 3. VERIFY NO POD USES THESE CLAIMS ==="
-for pvc in "${PVCS[@]}"; do
-  if kubectl -n "$NS" get pods \
-      -o jsonpath='{range .items[*]}{.spec.volumes[*].persistentVolumeClaim.claimName}{"\n"}{end}' |
-      tr ' ' '\n' | grep -Fxq "$pvc"; then
-    echo "BLOCKED: PVC still used: $pvc"
-    exit 1
-  fi
-done
-
-echo "=== 4. DELETE FOUR OLD PVCs ==="
-for pvc in "${PVCS[@]}"; do
-  kubectl -n "$NS" delete pvc "$pvc" --wait=true
-done
-
-echo "=== 5. DELETE FOUR RETAINED PVs ==="
-for pv in "${PVS[@]}"; do
-  kubectl delete pv "$pv" --wait=true
-done
-
-echo "=== 6. FINAL CHECK ==="
-kubectl -n "$NS" get pvc
-kubectl get pv
-
-echo "=== PVC/PV CLEANUP COMPLETE ==="
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GoldenGateMonitorEcrAuthorization",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "GoldenGateMonitorEcrBuildAndPublish",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:DescribeRepositories",
+        "ecr:DescribeImages",
+        "ecr:GetRepositoryPolicy",
+        "ecr:SetRepositoryPolicy",
+        "ecr:CreateRepository",
+        "ecr:TagResource",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage"
+      ],
+      "Resource": [
+        "arn:aws:ecr:eu-west-1:229410149234:repository/goldengate-monitor",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-monitor",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/argocd",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate-platform",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/goldengate"
+      ]
+    },
+    {
+      "Sid": "GoldenGateArtifactRead",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:DescribeRepositories",
+        "ecr:DescribeImages",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
+      "Resource": [
+        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-fluent-bit",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/helm/amazon-cloudwatch-observability",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-cloudwatch-agent-operator",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-cloudwatch-agent",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-kube-state-metrics",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/aws-cloud-factory-node-exporter",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/ogg-oracle",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/ogg-postgresql",
+        "arn:aws:ecr:eu-west-1:229410149234:repository/ogg-sqlserver"
+      ]
+    },
+    {
+      "Sid": "AllowDeleteGoldenGateCsiEfsAccessPoints",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:DeleteAccessPoint"
+      ],
+      "Resource": "arn:aws:elasticfilesystem:eu-west-1:668311715351:access-point/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/efs.csi.aws.com/cluster": "true"
+        }
+      }
+    }
+  ]
+}
