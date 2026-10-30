@@ -1,33 +1,37 @@
 
-echo "========== GOLDENGATE DEV RESET INVENTORY =========="
+set -euo pipefail
+
+NS="argocd"
+
+APPSETS=(
+  goldengate-dev-mssql-repltest-001-appset
+  goldengate-dev-oracle-repltest-002-appset
+  goldengate-dev-postgresql-repltest-001-appset
+  goldengate-dev-postgresql-repltest-002-appset
+)
+
+echo "=== VERIFY EXACT APPLICATIONSETS ==="
+
+for appset in "${APPSETS[@]}"; do
+  kubectl -n "$NS" get applicationset "$appset" \
+    -o custom-columns='NAME:.metadata.name'
+done
 
 echo
-echo "1. Argo CD ApplicationSets"
-kubectl -n argocd get applicationsets | grep -E 'NAME|goldengate-dev'
+echo "=== DELETE OLD GOLDENGATE RUNTIME APPLICATIONSETS ==="
+
+for appset in "${APPSETS[@]}"; do
+  kubectl -n "$NS" delete applicationset "$appset" \
+    --wait=true
+done
 
 echo
-echo "2. Argo CD Applications"
-kubectl -n argocd get applications | grep -E 'NAME|goldengate-dev'
+echo "=== VERIFY REMAINING APPLICATIONS ==="
 
-echo
-echo "3. GoldenGate StatefulSets"
+kubectl -n "$NS" get applicationsets
+kubectl -n "$NS" get applications
 kubectl -n goldengate-dev get statefulsets
+kubectl -n goldengate-dev get pods
 
 echo
-echo "4. GoldenGate Pods"
-kubectl -n goldengate-dev get pods -o wide
-
-echo
-echo "5. GoldenGate PVCs"
-kubectl -n goldengate-dev get pvc -o wide
-
-echo
-echo "6. GoldenGate EFS StorageClasses"
-kubectl get storageclass | grep -E 'NAME|gg-efs-dev'
-
-echo
-echo "7. GoldenGate Persistent Volumes"
-kubectl get pv -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,CLAIM:.spec.claimRef.name,EFS_HANDLE:.spec.csi.volumeHandle'
-
-echo
-echo "========== INVENTORY COMPLETE =========="
+echo "=== RUNTIME REMOVAL STAGE COMPLETED ==="
