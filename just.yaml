@@ -1,1 +1,33 @@
-fs-0d1c409669a15bc3e,fs-03eb68ea5f6317e54,fs-0abbe15be0c6fb64d,fs-08505eae446b8c918
+
+echo "========== GOLDENGATE DEV RESET INVENTORY =========="
+
+echo
+echo "1. Argo CD ApplicationSets"
+kubectl -n argocd get applicationsets | grep -E 'NAME|goldengate-dev'
+
+echo
+echo "2. Argo CD Applications"
+kubectl -n argocd get applications | grep -E 'NAME|goldengate-dev'
+
+echo
+echo "3. GoldenGate StatefulSets"
+kubectl -n goldengate-dev get statefulsets
+
+echo
+echo "4. GoldenGate Pods"
+kubectl -n goldengate-dev get pods -o wide
+
+echo
+echo "5. GoldenGate PVCs"
+kubectl -n goldengate-dev get pvc -o wide
+
+echo
+echo "6. GoldenGate EFS StorageClasses"
+kubectl get storageclass | grep -E 'NAME|gg-efs-dev'
+
+echo
+echo "7. GoldenGate Persistent Volumes"
+kubectl get pv -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,CLAIM:.spec.claimRef.name,EFS_HANDLE:.spec.csi.volumeHandle'
+
+echo
+echo "========== INVENTORY COMPLETE =========="
